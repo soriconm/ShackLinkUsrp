@@ -27,5 +27,12 @@
     <!-- The sibling checkout of ShackLink (C:\Dev\ShackLink). Override with -p:ShackLinkDir=... -->
     <ShackLinkDir Condition="'$(ShackLinkDir)' == ''">$(MSBuildThisFileDirectory)..\ShackLink\</ShackLinkDir>
     <UsrpProtocolProject>$(ShackLinkDir)ShackLinkUsrp.Protocol\ShackLinkUsrp.Protocol.csproj</UsrpProtocolProject>
+    <!-- That library is not in this solution, and when a solution is built MSBuild strips Configuration
+         and Platform from a reference it does not list, so the reference builds in its DEFAULT
+         configuration: every Release sidecar shipped the Debug library, JIT optimizer off (ShackLink
+         docs/usrp_b210_support.md 9.11 item 8). Keeping them makes it the parent's configuration; its
+         platform is pinned to AnyCPU on the reference itself, so it lands in the same
+         bin\(cfg)\netstandard2.0\ as ShackLink's own build. The gate reads both DebuggableAttributes. -->
+    <ShouldUnsetParentConfigurationAndPlatform>false</ShouldUnsetParentConfigurationAndPlatform>
   </PropertyGroup>
 </Project>

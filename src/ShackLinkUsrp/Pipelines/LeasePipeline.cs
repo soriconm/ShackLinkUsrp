@@ -82,6 +82,13 @@ internal sealed class LeasePipeline : ILeasePipeline, IRadioListener
     // The server ends every lease BEFORE a rate change (section 9.4), so a lease never re-plans.
     public void OnRateChanged(double wideRateHz, long position) { }
 
+    // A gain, AGC, antenna, bandwidth or setting change reaches a lease as what it is: a level step in
+    // a continuous stream. Nothing in a lease is integrated across it, and an IQ block states no gain,
+    // so no sample can be mislabelled by it - while skipping the settle would cut a hole into the one
+    // product that promises continuity (a demodulator copes with a step, not with a gap). So a lease is
+    // not told (ShackLink docs/usrp_b210_support.md 9.15); the event stream's state says the gain moved.
+    public void OnFrontEndChanged(long position) { }
+
     public void Dispose()
     {
         _stop = true;
@@ -127,7 +134,10 @@ internal sealed class LeasePipeline : ILeasePipeline, IRadioListener
         IqFlags nextFlags = IqFlags.None;
         long droppedWide = 0;            // wide samples missed, not yet charged to a block
         long lastOverflows = _ctx.Overflows;
-        long pos = ring.Written;
+        // Never earlier than the last change the radio announced: a lease opened inside a retune's settle
+        // (ShackLink's radio slot closes, moves and reopens its own channel 0 around one) would otherwise
+        // mix samples still in flight at the old LO with the new LO's shift (CRTU200's A2 F1).
+        long pos = Math.Max(ring.Written, _ctx.SettledFrom);
         long ncoCenter = long.MinValue, ncoLo = long.MinValue;
         bool ok = true;
 

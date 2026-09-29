@@ -15,8 +15,14 @@ namespace ShackLinkUsrp.Pipelines;
 /// wide samples it missed into the next row's <c>dropped</c>, and integrates fewer FFTs (the row's
 /// <c>ffts</c> says how many) - it never slows the radio. "sample" integration computes only the
 /// last frame before each row, which is what makes it the cheap mode.
-/// <para>The accumulator and the geometry it was built for are ONE pair, guarded by
-/// <see cref="AccLock"/>: a pull take on another thread reads them together or not at all.</para>
+/// <para>The accumulator, the geometry it was built for and the gain its frames were taken at are ONE
+/// set, guarded by <see cref="AccLock"/>: a pull take on another thread reads them together or not at
+/// all.</para>
+/// <para>A ROW NEVER SPANS A RADIO CHANGE (CRTU200's A2). Every change the radio announces restarts
+/// the accumulator at the change's boundary: a new pipeline starts no earlier than the last boundary
+/// announced (F1); a take waits until a change announced before it has reached the accumulator (F2);
+/// a gain, AGC, antenna, bandwidth or setting change is announced like a retune (F3); and a frame read
+/// while a change is pending is not integrated, because a frame longer than the settle straddles it.</para>
 /// </summary>
 internal abstract class SpectrumWorker : IRadioListener, IDisposable
 {
@@ -29,11 +35,18 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
     private PanoramaGeometry _latest;
     private bool _regeometry;
     private long _skipTo = -1;
+    /// <summary>Changes told to this worker (under <c>_pendingLock</c>) and the last one its accumulator
+    /// has taken in (under <see cref="AccLock"/>): unequal = a change is on its way to the accumulator.</summary>
+    private long _changesRequested, _changesApplied;
 
     /// <summary>Guarded by <see cref="AccLock"/>.</summary>
     protected SpectrumAccumulator Acc;
     /// <summary>The geometry <see cref="Acc"/> was built for; guarded by <see cref="AccLock"/>.</summary>
     protected PanoramaGeometry AccGeometry;
+    /// <summary>The gain every frame in <see cref="Acc"/> was taken at (NaN = AGC), captured when it last
+    /// restarted - never read as a row goes out, when the radio may already have moved on; guarded by
+    /// <see cref="AccLock"/>. Sound because every gain change restarts the accumulator.</summary>
+    protected float AccGainDb;
 
     protected SpectrumWorker(IRadioContext ctx, PanoramaRequest request)
     {
@@ -41,6 +54,7 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
         _request = request;
         _latest = PanoramaGeometry.Compute(request, ctx.LoHz, ctx.WideRateHz, ctx.MaxFftSize);
         AccGeometry = _latest;
+        AccGainDb = ctx.RowGainDb;
         Acc = new SpectrumAccumulator(_latest.FftSize, _latest.Window, _latest.Integration);
     }
 
@@ -70,6 +84,7 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
             _request = request;
             _latest = g;
             _regeometry = true;
+            _changesRequested++;
         }
         return g;
     }
@@ -77,6 +92,8 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
     public void OnRadioRetuned(long loHz, long position) => Resync(position);
 
     public void OnRateChanged(double wideRateHz, long position) => Resync(position);
+
+    public void OnFrontEndChanged(long position) => Resync(position);
 
     private void Resync(long position)
     {
@@ -93,8 +110,18 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
                 Ctx.Log("panorama geometry kept after a radio change: " + ex.Message);
             }
             _regeometry = true;
-            _skipTo = position;
+            if (position > _skipTo) _skipTo = position;
+            _changesRequested++;
         }
+    }
+
+    /// <summary>True while a change told to this worker has not reached its accumulator. Read under
+    /// <see cref="AccLock"/> (the side <c>_changesApplied</c> is written on).</summary>
+    protected bool ChangePending => Volatile.Read(ref _changesRequested) != _changesApplied;
+
+    private bool ChangeArrived()
+    {
+        lock (_pendingLock) return _regeometry;
     }
 
     /// <summary>Called on the worker thread after each frame is integrated. Return true when the
@@ -125,7 +152,9 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
         PanoramaGeometry g;
         lock (AccLock) g = AccGeometry;
         var raw = new short[g.FftSize * 2];
-        long pos = ring.Written;
+        // Never earlier than the last change the radio announced: a pipeline created inside a retune's
+        // settle would otherwise integrate samples still in flight at the old LO under the new one (F1).
+        long pos = Math.Max(ring.Written, Ctx.SettledFrom);
         long droppedWide = 0;
 
         while (!Stopping)
@@ -133,19 +162,21 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
             if (Paused)
             {
                 Thread.Sleep(100);
-                pos = ring.Written;
+                pos = Math.Max(ring.Written, Ctx.SettledFrom);
                 droppedWide = 0;
                 lock (AccLock) Acc.Reset();
                 continue;
             }
 
             PanoramaGeometry? changed = null;
+            long generation = 0;
             lock (_pendingLock)
             {
                 if (_regeometry)
                 {
                     _regeometry = false;
                     changed = _latest;
+                    generation = _changesRequested;
                     if (_skipTo > pos) pos = _skipTo;
                     _skipTo = -1;
                 }
@@ -159,6 +190,10 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
                     else
                         Acc.Reset();
                     AccGeometry = changed;
+                    // The state was written before the change was announced, so this is the gain every
+                    // frame from pos on is taken at.
+                    AccGainDb = Ctx.RowGainDb;
+                    _changesApplied = generation;
                 }
                 g = changed;
                 if (raw.Length != g.FftSize * 2) raw = new short[g.FftSize * 2];
@@ -183,6 +218,10 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
                 }
                 continue;
             }
+            // A change announced while this frame filled may have its boundary INSIDE it - a frame longer
+            // than the settle straddles it (a 2^20-point frame at 10 MS/s is 105 ms, UHD's settle 5 ms).
+            // It is not integrated: the loop's top restarts the accumulator and moves past the boundary.
+            if (ChangeArrived()) continue;
             pos += g.FftSize;
             lock (AccLock) Acc.AddFrame(raw);
             if (OnFrameIntegrated(pos, droppedWide)) droppedWide = 0;
@@ -197,7 +236,7 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
         if (_thread != null && Thread.CurrentThread != _thread) _thread.Join(2000);
     }
 
-    protected RowHeader MakeHeader(ulong seq, PanoramaGeometry g, uint ffts, uint overflows, long droppedWide) => new()
+    protected RowHeader MakeHeader(ulong seq, PanoramaGeometry g, float gainDb, uint ffts, uint overflows, long droppedWide) => new()
     {
         Seq = seq,
         CenterHz = g.CenterHz,
@@ -208,7 +247,7 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
         Integration = (IntegrationKind)(int)g.Integration,
         Ffts = ffts,
         EnbwBins = (float)g.EnbwBins,
-        GainDb = Ctx.RowGainDb,
+        GainDb = gainDb,
         Overflows = overflows,
         Dropped = (uint)Math.Clamp(droppedWide, 0, uint.MaxValue),
         TimeTicks = SidecarClock.Ticks,
@@ -274,7 +313,7 @@ internal sealed class PanoramaPipeline : SpectrumWorker, IPanoramaPipeline
             uint ffts = (uint)Acc.FramesIntegrated;
             Acc.TakeRow(g.CropStart, g.Bins, _row);
             long ov = Ctx.Overflows;
-            var header = MakeHeader(_seq++, g, ffts, (uint)Math.Clamp(ov - _lastOverflows, 0, uint.MaxValue), droppedWide);
+            var header = MakeHeader(_seq++, g, AccGainDb, ffts, (uint)Math.Clamp(ov - _lastOverflows, 0, uint.MaxValue), droppedWide);
             _lastOverflows = ov;
             frame = RowHeader.ComposeFrame(_streamId, header, _row);
         }
@@ -295,7 +334,8 @@ internal sealed class PanoramaPipeline : SpectrumWorker, IPanoramaPipeline
 /// client that stopped sweeping does not cost a core forever; the next take restarts it.</summary>
 internal sealed class SweepWorker : SpectrumWorker
 {
-    private const int IdleStopMs = 30_000;
+    /// <summary>30 s in service; a gate shortens it to reach an idle accumulator without waiting.</summary>
+    internal static int IdleStopMs = 30_000;
     private long _dropped;
     private ulong _seq;
     private long _lastOverflows;
@@ -321,14 +361,17 @@ internal sealed class SweepWorker : SpectrumWorker
     }
 
     /// <summary>Everything integrated since the previous take, as one row. Waits for at least one
-    /// frame (the first take after a new geometry costs one FFT interval).</summary>
+    /// frame (the first take after a new geometry costs one FFT interval) - and, when a radio change was
+    /// announced before this take, for that change to reach the accumulator first: the reply to set_lo
+    /// or set_gain went out before this sweep came in, so the accumulator from before it is not an
+    /// answer (A2 F2). After a change the take costs its settle and one FFT interval.</summary>
     public SweepResult Take(int timeoutMs)
     {
         Volatile.Write(ref _lastTakeTicks, Environment.TickCount64);
         long deadline = Environment.TickCount64 + timeoutMs;
         lock (AccLock)
         {
-            while (Acc.FramesIntegrated == 0 && !Stopping)
+            while ((ChangePending || Acc.FramesIntegrated == 0) && !Stopping)
             {
                 long left = deadline - Environment.TickCount64;
                 if (left <= 0)
@@ -340,7 +383,7 @@ internal sealed class SweepWorker : SpectrumWorker
             uint ffts = (uint)Acc.FramesIntegrated;
             Acc.TakeRow(g.CropStart, g.Bins, _row);
             long ov = Ctx.Overflows;
-            var header = MakeHeader(++_seq, g, ffts, (uint)Math.Clamp(ov - _lastOverflows, 0, uint.MaxValue), _dropped);
+            var header = MakeHeader(++_seq, g, AccGainDb, ffts, (uint)Math.Clamp(ov - _lastOverflows, 0, uint.MaxValue), _dropped);
             _lastOverflows = ov;
             _dropped = 0;
             return new SweepResult { Header = header, Bins = (short[])_row.Clone() };

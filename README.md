@@ -40,14 +40,21 @@ dotnet build ShackLinkUsrp.sln -c Release
 
 ```
 ShackLinkUsrp.exe --serial <serial> [--uhd <dir>] [--rate 10e6] [--linger 10]
-ShackLinkUsrp.exe --sim [--sim-name <name>] [--sim-fault-after <ms>]
+ShackLinkUsrp.exe --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>]
 ShackLinkUsrp.exe --list
 ```
 
 A sidecar lives as long as its clients: it exits `--linger` seconds after the last one leaves, at once
 when its radio is in a fault (a fault is terminal; only a fresh sidecar opens the radio again), and
 never with `--persist`. `--sim-fault-after` makes the synthetic radio fault on cue, for tests of those
-paths.
+paths. `--sim-settle-ms` makes each synthetic radio change take effect that long after it is asked for
+(the samples between still carry the old settings, like a real radio's in-flight USB buffers) and
+announces exactly where: it is how the gate reaches the settle paths, which UHD's 5 ms hides.
+
+A row never spans a radio change: every change the LO owner makes (LO, rate, gain, AGC, antenna,
+bandwidth, a setting) restarts the panoramas and sweeps at its settle boundary, a pipeline created
+inside a settle starts at its boundary, a `sweep` sent after a change waits for it, and a row's gain is
+the gain all its FFTs were taken at (ShackLink `docs/usrp_b210_support.md` §9.15).
 
 UHD is not bundled. By default the Ettus install (`C:\Program Files\UHD\bin`) is used; `--uhd <dir>`
 loads `uhd.dll` from another directory.

@@ -24,6 +24,8 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     private readonly Dictionary<int, SweepWorker> _sweeps = new();
     private readonly ManualResetEventSlim _settled = new(false);
     private readonly RadioState _state = new();
+    private RadioCaps _caps = null!;      // set through Caps, which stamps it
+    private long _settledFrom;              // written under _listenersLock, read without it
     private long _overflows;
     private volatile bool _disposed;
 
@@ -41,9 +43,22 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
 
     protected SidecarLog LogBook { get; }
     public RadioInfo Info { get; protected set; }
-    public RadioCaps Caps { get; protected set; }
+
+    /// <summary>What the radio can do. Every caps a backend states carries THIS sidecar's FFT ceiling,
+    /// stamped here - the number a client plans with (<c>max_fft_size</c>, CRTU200's A3) is the number
+    /// <see cref="PanoramaGeometry.Compute"/> refuses a geometry at, by construction.</summary>
+    public RadioCaps Caps
+    {
+        get => _caps;
+        protected set
+        {
+            value.MaxFftSize = MaxFftSize;
+            _caps = value;
+        }
+    }
+
     public WideRing Ring { get; }
-    public int MaxFftSize { get; protected set; } = 1 << 20;
+    public int MaxFftSize { get; } = 1 << 20;
 
     public event Action? StateChanged;
     public event Action<string>? Faulted;
@@ -68,6 +83,11 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     {
         get { lock (_stateLock) return _state.Agc ? float.NaN : (float)_state.GainDb; }
     }
+
+    /// <summary>Read WITHOUT the listener lock: a sweep worker being replaced is disposed - its thread
+    /// joined - under that lock, and an idle worker reads this every 100 ms, so a locked read made every
+    /// replacement of an idle accumulator wait out the 2 s join. The write stays under the lock.</summary>
+    public long SettledFrom => Volatile.Read(ref _settledFrom);
 
     protected void AddOverflows(long n) => Interlocked.Add(ref _overflows, n);
 
@@ -128,9 +148,40 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     protected abstract string ApplySetting(string key, string value);
     protected abstract JsonObject RadioTelemetry();
 
-    /// <summary>Samples a pipeline must skip after a retune because they were already in flight
-    /// at the old frequency (USB transport buffers). 0 for a source that retunes at a block edge.</summary>
-    protected virtual long RetuneSettleSamples => 0;
+    /// <summary>Samples a pipeline must skip after ANY radio change - a retune, a rate, a gain, AGC,
+    /// antenna, bandwidth or setting - because they were already in flight at the old settings (USB
+    /// transport buffers). 0 for a source that changes at a sample it knows.</summary>
+    protected virtual long SettleSamples => 0;
+
+    /// <summary>The first ring position taken at the settings just applied, asked right after the
+    /// Apply that changed them. A real radio answers "now plus what was in flight"; a source that
+    /// knows exactly where its change took effect (the synthetic radio) answers that position.</summary>
+    protected virtual long ChangeBoundary() => Ring.Written + SettleSamples;
+
+    /// <summary>
+    /// EVERY radio change ends here (CRTU200's A2). The boundary is remembered, so a pipeline created
+    /// later starts no earlier (F1), and every pipeline alive now is told it - never earlier than a
+    /// boundary already announced, or a rate's shorter settle could undo a retune's longer one. The
+    /// remembering and the listener snapshot are ONE critical section with a pipeline's registration:
+    /// a pipeline is either in the snapshot, and told, or registered after it, and reads the new
+    /// <see cref="SettledFrom"/> when it starts. Called AFTER the state is written, so a pipeline that
+    /// applies the change reads the settings its next frame is taken at (the gain its rows state).
+    /// </summary>
+    private void Announce(Action<IRadioListener, long> tell)
+    {
+        long boundary = ChangeBoundary();
+        List<IRadioListener> all;
+        lock (_listenersLock)
+        {
+            if (boundary > _settledFrom) Volatile.Write(ref _settledFrom, boundary);
+            boundary = _settledFrom;
+            all = _listeners.ToList();
+        }
+        foreach (var l in all) tell(l, boundary);
+    }
+
+    /// <summary>A change to the receive chain that leaves the LO and the rate alone (A2 F3).</summary>
+    private void AnnounceFrontEnd() => Announce((l, at) => l.OnFrontEndChanged(at));
 
     // ------------------------------------------------------------ IRadioBackend
 
@@ -149,8 +200,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     {
         long eff = ApplyLo(hz);
         lock (_stateLock) _state.LoHz = eff;
-        long boundary = Ring.Written + RetuneSettleSamples;
-        foreach (var l in Listeners()) l.OnRadioRetuned(eff, boundary);
+        Announce((l, at) => l.OnRadioRetuned(eff, at));
         Log($"LO {eff} Hz" + (eff != hz ? $" (asked {hz})" : ""));
     }
 
@@ -158,10 +208,12 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     {
         double eff = ApplyRate(hz);
         lock (_stateLock) _state.WideRateHz = eff;
-        long boundary = Ring.Written + RetuneSettleSamples;
-        foreach (var l in Listeners()) l.OnRateChanged(eff, boundary);
+        Announce((l, at) => l.OnRateChanged(eff, at));
         Log($"wide rate {eff:0} S/s" + (Math.Abs(eff - hz) > 0.5 ? $" (asked {hz:0})" : ""));
     }
+
+    // A2 F3: these four, and a setting, told no pipeline, so the next row integrated FFTs from both
+    // sides of the change and stated the new gain. Each announces now, as a retune does.
 
     public void SetGain(double db)
     {
@@ -171,29 +223,41 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
             _state.GainDb = eff;
             _state.Agc = false;
         }
+        AnnounceFrontEnd();
     }
 
     public void SetAgc(bool on)
     {
         ApplyAgc(on);
         lock (_stateLock) _state.Agc = on;
+        AnnounceFrontEnd();
     }
 
     public void SetAntenna(string name)
     {
         string eff = ApplyAntenna(name);
         lock (_stateLock) _state.Antenna = eff;
+        AnnounceFrontEnd();
     }
 
     public void SetBandwidth(double hz)
     {
         double eff = ApplyBandwidth(hz);
         lock (_stateLock) _state.BandwidthHz = eff;
+        AnnounceFrontEnd();
     }
 
     public JsonArray GetSettings() => RadioSettings();
 
-    public string SetSetting(string key, string value) => ApplySetting(key, value);
+    /// <summary>A named setting (UHD's clock source, DC and IQ correction) changes what the radio
+    /// delivers as surely as a gain does, so it is announced too - after it applied; a refused one
+    /// changed nothing. (dc_offset_hz retunes through <see cref="SetLo"/> and is announced there as well.)</summary>
+    public string SetSetting(string key, string value)
+    {
+        string eff = ApplySetting(key, value);
+        AnnounceFrontEnd();
+        return eff;
+    }
 
     /// <summary>For a subclass that learns a state value from the radio itself (open, AGC).</summary>
     protected void UpdateState(Action<RadioState> change, bool announce)

@@ -46,7 +46,7 @@ internal sealed class UhdBackend : RadioBackendBase
 
     public UhdBackend(SidecarLog log, UhdBackendOptions opt)
         : base(log,
-               new RadioInfo { Serial = opt.Serial, Product = "B2xx", Name = "", Source = RadioSources.Uhd },
+               InfoFor(opt, opt.Serial, "B2xx", ""),
                InitialCaps(opt),
                ringSamples: 1 << 24,
                initialLoHz: opt.LoHz,
@@ -85,8 +85,21 @@ internal sealed class UhdBackend : RadioBackendBase
         BandwidthMaxHz = 56e6,
     };
 
-    // The samples UHD already had in flight when a retune returned were taken at the old frequency.
-    protected override long RetuneSettleSamples => (long)(WideRateHz * 0.005);
+    /// <summary>Who the radio is, as every hello and wait_ready states it - before the open and after it.
+    /// <c>known_codec_fault</c> is this sidecar's command line (CRTU200's A3): a client that joined a
+    /// sidecar somebody else started has no other way to learn that its levels are untrustworthy.</summary>
+    private static RadioInfo InfoFor(UhdBackendOptions opt, string serial, string product, string name) => new()
+    {
+        Serial = serial,
+        Product = product,
+        Name = name,
+        Source = RadioSources.Uhd,
+        KnownCodecFault = opt.AllowKnownCodecFault,
+    };
+
+    // The samples UHD already had in flight when a setter returned were taken at the old settings - a
+    // retune's frequency, a gain, an antenna alike.
+    protected override long SettleSamples => (long)(WideRateHz * 0.005);
 
     protected override void OpenRadio()
     {
@@ -120,13 +133,10 @@ internal sealed class UhdBackend : RadioBackendBase
         Log($"opened in {sw.Elapsed.TotalSeconds:0.0} s: {found[0]}");
 
         var info = usrp.GetRxInfo();
-        Info = new RadioInfo
-        {
-            Serial = string.IsNullOrEmpty(info.MboardSerial) ? _opt.Serial : info.MboardSerial,
-            Product = string.IsNullOrEmpty(info.MboardId) ? "B2xx" : info.MboardId,
-            Name = info.MboardName,
-            Source = RadioSources.Uhd,
-        };
+        Info = InfoFor(_opt,
+                       string.IsNullOrEmpty(info.MboardSerial) ? _opt.Serial : info.MboardSerial,
+                       string.IsNullOrEmpty(info.MboardId) ? "B2xx" : info.MboardId,
+                       info.MboardName);
         var freq = usrp.GetRxFrequencyRange();
         var gain = usrp.GetRxGainRange();
         var bw = usrp.GetRxBandwidthRange();
