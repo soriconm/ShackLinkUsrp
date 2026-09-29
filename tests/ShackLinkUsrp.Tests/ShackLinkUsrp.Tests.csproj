@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The sidecar's gate: exit 0 = all pass, 1 = a failure. Drives the DSP against reference
+       implementations and the real host over loopback with the synthetic source. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <RootNamespace>ShackLinkUsrp.Tests</RootNamespace>
+    <!-- The sidecar runs culture-invariant; its gate runs under de-DE so a culture-sensitive
+         number anywhere in the code it drives fails here. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(UsrpProtocolProject)" />
+    <ProjectReference Include="..\..\src\ShackLinkUsrp.Dsp\ShackLinkUsrp.Dsp.csproj" />
+    <ProjectReference Include="..\..\src\ShackLinkUsrp\ShackLinkUsrp.csproj" />
+  </ItemGroup>
+</Project>

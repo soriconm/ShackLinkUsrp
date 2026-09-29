@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The sidecar executable: the protocol server (from the MIT library in ShackLink) hosting a
+       radio backend (UHD or synthetic) and the DSP pipelines. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <RootNamespace>ShackLinkUsrp</RootNamespace>
+    <AssemblyName>ShackLinkUsrp</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="ShackLinkUsrp.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(UsrpProtocolProject)" />
+    <ProjectReference Include="..\ShackLinkUsrp.Uhd\ShackLinkUsrp.Uhd.csproj" />
+    <ProjectReference Include="..\ShackLinkUsrp.Dsp\ShackLinkUsrp.Dsp.csproj" />
+  </ItemGroup>
+</Project>

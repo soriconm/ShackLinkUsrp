@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The UHD C API binding (uhd.h). Loaded from an explicit directory (the uhd option) or the
+       operator's Ettus install, never from PATH first. GPL-3.0-or-later: the half that links libuhd. -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ShackLinkUsrp.Uhd</RootNamespace>
+  </PropertyGroup>
+</Project>

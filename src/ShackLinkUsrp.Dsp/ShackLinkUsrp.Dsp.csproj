@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The wide-stream ring, the panorama FFT and the DDC leases. Pure managed, radio-agnostic:
+       fed by the UHD source or the synthetic one. -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>ShackLinkUsrp.Dsp</RootNamespace>
+  </PropertyGroup>
+</Project>

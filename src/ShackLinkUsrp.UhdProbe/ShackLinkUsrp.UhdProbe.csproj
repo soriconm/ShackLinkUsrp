@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- An instrument, never a gate: drives ShackLinkUsrp.Uhd against a real radio and prints what
+       it measured (identity, ranges, delivered rate against the clock, overflows, DC). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <RootNamespace>ShackLinkUsrp.UhdProbe</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ShackLinkUsrp.Uhd\ShackLinkUsrp.Uhd.csproj" />
+  </ItemGroup>
+</Project>

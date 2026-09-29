@@ -1,0 +1,31 @@
+<Project>
+  <!-- ShackLinkUsrp — a USRP B2xx streaming server for ShackLink and the RF Bench Analyser.
+       Copyright (C) 2026 Sorin Marghitoiu. GPL-3.0-or-later (LICENSE): it links libuhd.
+       The wire and the module split are specified in ShackLink's docs/usrp_b210_support.md §9;
+       the protocol library (MIT) lives in that repository and is referenced by relative path. -->
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Deterministic>true</Deterministic>
+    <Copyright>Copyright (C) 2026 Sorin Marghitoiu</Copyright>
+    <Product>ShackLinkUsrp</Product>
+    <Version>0.1.0</Version>
+    <!-- Server GC as in ShackLinkServer: throughput over pause length on the capture threads. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Output goes to bin/(cfg)/net9.0/win-x64/, never bin/x64/(cfg)/...: the client library looks
+         for the sidecar at exactly that development path (ShackLink docs/usrp_b210_support.md 9.5). -->
+    <AppendPlatformToOutputPath>false</AppendPlatformToOutputPath>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- The sibling checkout of ShackLink (C:\Dev\ShackLink). Override with -p:ShackLinkDir=... -->
+    <ShackLinkDir Condition="'$(ShackLinkDir)' == ''">$(MSBuildThisFileDirectory)..\ShackLink\</ShackLinkDir>
+    <UsrpProtocolProject>$(ShackLinkDir)ShackLinkUsrp.Protocol\ShackLinkUsrp.Protocol.csproj</UsrpProtocolProject>
+  </PropertyGroup>
+</Project>
