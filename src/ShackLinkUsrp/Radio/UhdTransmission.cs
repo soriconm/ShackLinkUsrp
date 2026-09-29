@@ -14,6 +14,15 @@ namespace ShackLinkUsrp.Radio;
 /// BURST_ACK and UNDERFLOW, the end-of-burst and the free - because the C API writes the streamer's
 /// error string on every call. The first send carries start-of-burst; every way out sends end-of-burst
 /// once anything was sent; <c>acked</c> is BURST_ACK and nothing else.
+/// <para>
+/// A stepped source (section 9.18 P4b2) is counted in the samples this thread hands UHD. A baseband step
+/// moved inside the generator at its sample, and is announced with the key-up's instant plus that count
+/// (<c>timing</c> = sample: exact against the DAC, relative to step 0). A tuned step is a frequency write
+/// made here once the previous step's last sample has been handed over; UHD applies it when it arrives,
+/// not at a sample, so it is announced with the instant the write returned (<c>timing</c> = bound). A
+/// sweep that does not repeat ends once its last sample is handed over, with the end-of-burst and the
+/// radio's acknowledgement like a drain.
+/// </para>
 /// </summary>
 internal sealed class UhdTransmission : RadioTransmission
 {
@@ -21,14 +30,18 @@ internal sealed class UhdTransmission : RadioTransmission
     /// streamer is freed regardless.</summary>
     public const int AbortAckMs = 250;
 
+    /// <summary>After a sweep's last sample was handed over, how long UHD's own buffers (up to 16 frames,
+    /// 163 ms at 200 kS/s) are given to play out and the radio to acknowledge the end-of-burst.</summary>
+    public const int CompletionAckMs = 2000;
+
     private readonly UhdTxStreamer _streamer;
     private readonly Action<UhdAsyncEventCode> _asyncSeen;
     private readonly Thread _sender;
     private long _abortTs;
 
-    public UhdTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, UhdTxStreamer streamer,
+    public UhdTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, UhdTxStreamer streamer,
                            Action<UhdAsyncEventCode> asyncSeen)
-        : base(backend, request, grant)
+        : base(backend, request, grant, plan)
     {
         _streamer = streamer;
         _asyncSeen = asyncSeen;
@@ -49,18 +62,37 @@ internal sealed class UhdTransmission : RadioTransmission
         var buf = new short[chunk * 2];
         bool started = false;
         bool acked = false;
+        bool completed = false;
+        long handed = 0;   // TX samples UHD has taken, counted from the key-up
         string text = "";
         try
         {
             while (!AbortRequested)
             {
                 int n;
-                if (Tone != null)
+                if (Generator != null)
                 {
-                    // Nothing of a tone is queued host-side: a drain ends it at once.
+                    // Nothing generated is queued host-side: a drain ends it at once.
                     if (DrainRequested) break;
-                    Tone.Fill(buf, chunk);
                     n = chunk;
+                    if (Plan != null)
+                    {
+                        if (handed >= Plan.EndSample)
+                        {
+                            completed = true;
+                            break;
+                        }
+                        if (NextStep >= 1 && NextStep < Plan.StepCount && handed >= Plan.StartSample(NextStep))
+                        {
+                            TakeStep();
+                            continue;
+                        }
+                        // Never hand over past the next step's first sample, or past the sweep's end.
+                        long next = Math.Max(1, NextStep);
+                        if (next < Plan.StepCount) n = (int)Math.Min(n, Plan.StartSample(next) - handed);
+                        if (!Plan.Repeat) n = (int)Math.Min(n, Plan.EndSample - handed);
+                    }
+                    Generator.Fill(buf, n);
                 }
                 else
                 {
@@ -83,8 +115,11 @@ internal sealed class UhdTransmission : RadioTransmission
                         {
                             started = true;
                             NoteKeyed(null);
+                            // A stepped source's step 0 is the key-up itself.
+                            if (Plan != null) NoteStep(KeyedTicks, TxStepPlan.TimingSample);
                         }
                         off += sent;
+                        handed += sent;
                         NoteSamples(sent);
                     }
                     Poll(0.0, ref acked);
@@ -97,7 +132,10 @@ internal sealed class UhdTransmission : RadioTransmission
             else
             {
                 s.SendEndOfBurst(0.5);
-                long deadline = DrainRequested && !AbortRequested ? DrainDeadlineTs : Stopwatch.GetTimestamp() + MsToTicks(AbortAckMs);
+                long now0 = Stopwatch.GetTimestamp();
+                long deadline = completed ? now0 + MsToTicks(CompletionAckMs)
+                              : DrainRequested && !AbortRequested ? DrainDeadlineTs
+                              : now0 + MsToTicks(AbortAckMs);
                 while (!acked)
                 {
                     long now = Stopwatch.GetTimestamp();
@@ -111,6 +149,7 @@ internal sealed class UhdTransmission : RadioTransmission
         }
         catch (Exception ex)
         {
+            completed = false;
             text = ex is UhdException ? "the radio failed under the transmission: " + ex.Message
                                       : $"the transmit thread failed: {ex.GetType().Name}: {ex.Message}";
             EndedByRadio(EndReasons.RadioFault, text);
@@ -121,7 +160,25 @@ internal sealed class UhdTransmission : RadioTransmission
         {
             try { s.Dispose(); } catch { }
             Finish(acked, text, null);
+            if (completed) EndedBySource(SweepCompletedText());
         }
+    }
+
+    /// <summary>The samples before step <see cref="RadioTransmission.NextStep"/> have all been handed over.</summary>
+    private void TakeStep()
+    {
+        var plan = Plan!;
+        if (plan.Baseband)
+        {
+            // The generator moved the carrier at exactly this sample: its instant is counted, not measured.
+            NoteStep(TicksOfStep(NextStep), TxStepPlan.TimingSample);
+            return;
+        }
+        // A frequency write, untimed: it lands when it arrives, so the instant it returned is an upper bound.
+        int index = plan.IndexOf(NextStep);
+        long lo = plan.LoHz[index];
+        var r = Backend.StepTune(plan.FrequencyHz[index], lo, moveLo: lo != StepLoHz);
+        NoteStep(SidecarClock.Ticks, TxStepPlan.TimingBound, r.CenterHz, r.LoHz);
     }
 
     /// <summary>Read what the async channel holds, waiting at most <paramref name="timeoutSeconds"/> for

@@ -44,7 +44,12 @@ internal interface IRadioListener
 /// <summary>The sidecar's one monotonic clock for time_ticks (100 ns units).</summary>
 internal static class SidecarClock
 {
-    private static readonly Stopwatch Sw = Stopwatch.StartNew();
+    private static readonly long Origin = Stopwatch.GetTimestamp();
 
-    public static long Ticks => (long)(Sw.ElapsedTicks * (10_000_000.0 / Stopwatch.Frequency));
+    public static long Ticks => FromTimestamp(Stopwatch.GetTimestamp());
+
+    /// <summary>A <see cref="Stopwatch.GetTimestamp"/> value on this clock - how the synthetic radio stamps the
+    /// instant its own clock gives a ring position.</summary>
+    public static long FromTimestamp(long stopwatchTimestamp) =>
+        (long)((stopwatchTimestamp - Origin) * (10_000_000.0 / Stopwatch.Frequency));
 }

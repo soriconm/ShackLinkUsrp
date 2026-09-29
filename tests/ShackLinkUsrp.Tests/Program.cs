@@ -67,6 +67,17 @@ internal static partial class Program
         Run("P4b: what the running gates cannot reach, pinned in the source", TxSourceRules);
         Run("command line: the transmitter's options", TxOptions);
         Run("spawned: the real executable transmits into itself, and loaded no UHD", SpawnTxLoopback);
+        Run("P4b2: the AM / FM generator", ModGeneratorCases);
+        Run("P4b2: the stepped sweep's plan", TxStepPlanCases);
+        Run("P4b2: the stepped carrier moves at its samples", SteppedCarrierCases);
+        Run("P4b2: AM and FM land in the synthetic radio's own panorama", SimModLoopback);
+        Run("P4b2: a stepped sweep, step by step, heard where each step said", SimStepLoopback);
+        Run("P4b2: a baseband sweep's dwell, measured in what the radio received", SimStepDwellBaseband);
+        Run("P4b2: a tuned sweep's dwell, measured in what the radio received", SimStepDwellTuned);
+        Run("P4b2: the DUC inside its reach, the synthesizer beyond it", SimStepRetunes);
+        Run("P4b2: steps before anyone listened are not lost", StepEventsBeforeSubscribers);
+        Run("P4b2: repeat and bounce", SimStepSequences);
+        Run("P4b2: what the running gates cannot reach, pinned in the source", TxGeneratedSourceRules);
 
         try { Directory.Delete(_temp, true); } catch { }
         Console.WriteLine();
@@ -883,7 +894,8 @@ internal static partial class Program
             ? $"caps.tx: none - {tel0?.GetString("tx_why_not", "")}"
             : $"caps.tx: {ct.FreqMinHz}-{ct.FreqMaxHz} Hz, gain {ct.GainMinDb}-{ct.GainMaxDb} step {ct.GainStepDb}, " +
               $"rates {string.Join("/", ct.RatesHz.Select(r => (r / 1e3).ToString("0.###", CultureInfo.InvariantCulture)))} kS/s, " +
-              $"antennas {string.Join(",", ct.Antennas)}, quantum {ct.QuantumSamples}, max LO offset {ct.MaxLoOffsetHz} Hz, sources {string.Join(",", ct.Sources)}");
+              $"antennas {string.Join(",", ct.Antennas)}, quantum {ct.QuantumSamples}, max LO offset {ct.MaxLoOffsetHz} Hz, sources {string.Join(",", ct.Sources)}, " +
+              $"modulations {string.Join(",", ct.Modulations)} ({string.Join(",", ct.ModulatingWaveforms)}), dwell >= {ct.MinDwellMs} ms, <= {ct.MaxStepPoints} points");
         if (st.Tx != null)
             Console.WriteLine($"state.tx: {st.Tx.CenterHz} Hz (LO {st.Tx.LoHz}), {st.Tx.RateHz} S/s, {st.Tx.GainDb} dB, {st.Tx.Antenna}, keyed {st.Tx.Keyed}");
 

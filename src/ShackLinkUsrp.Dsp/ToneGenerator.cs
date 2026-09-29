@@ -8,16 +8,17 @@ namespace ShackLinkUsrp.Dsp;
 /// W9): one unmodulated carrier at <see cref="OffsetHz"/> from the TX centre, as interleaved sc16 at the
 /// TX rate. Its level is the CARRIER's against the DAC's full scale: a complex exponential of amplitude
 /// A has |I + jQ| = A, and 0 dBFS is A = 32767, where I and Q each just reach full scale - the same
-/// convention the panorama reads a -20 dBFS carrier by. Phase-continuous across every call.
+/// convention the panorama reads a -20 dBFS carrier by. Phase-continuous across every call, and across
+/// a <see cref="Retune"/>: a stepped source's baseband step is this carrier moving at one sample.
 /// </summary>
-public sealed class ToneGenerator
+public sealed class ToneGenerator : IIqGenerator
 {
     private readonly double _amplitude;
-    private readonly double _stepRe, _stepIm;
+    private double _stepRe, _stepIm;
     private double _re = 1.0, _im = 0.0;
     private int _sinceRenorm;
 
-    public double OffsetHz { get; }
+    public double OffsetHz { get; private set; }
     public double RateHz { get; }
     public double LevelDbfs { get; }
 
@@ -25,12 +26,20 @@ public sealed class ToneGenerator
     {
         if (!(rateHz > 0)) throw new ArgumentOutOfRangeException(nameof(rateHz));
         if (!(levelDbfs <= 0)) throw new ArgumentOutOfRangeException(nameof(levelDbfs), "a carrier above digital full scale is refused, never clipped");
-        if (Math.Abs(offsetHz) >= rateHz / 2) throw new ArgumentOutOfRangeException(nameof(offsetHz), "the carrier must lie inside the TX rate's Nyquist band");
-        OffsetHz = offsetHz;
         RateHz = rateHz;
         LevelDbfs = levelDbfs;
         _amplitude = 32767.0 * Math.Pow(10, levelDbfs / 20.0);
-        double w = 2.0 * Math.PI * offsetHz / rateHz;
+        Retune(offsetHz);
+    }
+
+    /// <summary>Move the carrier to <paramref name="offsetHz"/> from the next sample on. The phase carries
+    /// on from where it stands - the DUC's own accumulator keeps its phase across a frequency write too
+    /// (duc_chain.v: <c>phase &lt;= phase + phase_inc</c>).</summary>
+    public void Retune(double offsetHz)
+    {
+        if (Math.Abs(offsetHz) >= RateHz / 2) throw new ArgumentOutOfRangeException(nameof(offsetHz), "the carrier must lie inside the TX rate's Nyquist band");
+        OffsetHz = offsetHz;
+        double w = 2.0 * Math.PI * offsetHz / RateHz;
         _stepRe = Math.Cos(w);
         _stepIm = Math.Sin(w);
     }

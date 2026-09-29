@@ -14,12 +14,17 @@ namespace ShackLinkUsrp.Radio;
 /// UHD sender thread, or the synthetic radio's own clock) takes samples from the source, reports what
 /// happened through the Note* calls, and calls <see cref="Finish"/> exactly once, when it has let go of
 /// the transmitter. <see cref="Stop"/> asks for a drain or an abort and waits for that - it never
-/// declares an acknowledgement the radio did not give.
+/// declares an acknowledgement the radio did not give. A <c>step</c> source's steps are announced through
+/// <see cref="NoteStep"/>, which the radio side calls at the instant it knows (section 9.18 P4b2).
 /// </summary>
 internal abstract class RadioTransmission : ITxTransmission
 {
     /// <summary>How long an abort waits for the radio to let go before it says it did not.</summary>
     public const int AbortWaitMs = 2000;
+
+    /// <summary>Steps kept for a <see cref="Step"/> handler that has not subscribed yet: the server subscribes
+    /// the moment <c>StartTx</c> returns, and step 0 may already have happened by then.</summary>
+    private const int MaxUnheardSteps = 1024;
 
     private readonly RadioBackendBase _backend;
     private readonly ManualResetEventSlim _finished = new(false);
@@ -36,26 +41,48 @@ internal abstract class RadioTransmission : ITxTransmission
     private long _finishedTs;
     private bool _acked;
     private string _finishText = "";
+    private long _keyedTicks;
 
-    protected RadioTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant)
+    private readonly object _eventGate = new();
+    private Action<JsonObject>? _stepHandlers;
+    private List<JsonObject>? _unheardSteps = new();
+    private Action<StreamEnd>? _endedHandlers;
+    private StreamEnd? _unheardEnd;
+
+    protected RadioTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan)
     {
         _backend = backend;
         Request = request;
         Grant = grant;
-        if (request.Source == TxSourceKinds.Iq)
+        switch (request.Source)
         {
-            Queue = new TxSampleQueue(grant.QueueSamples);
+            case TxSourceKinds.Iq:
+                Queue = new TxSampleQueue(grant.QueueSamples);
+                break;
+            case TxSourceKinds.Tone:
+                Generator = new ToneGenerator(request.OffsetHz, grant.RateHz, request.LevelDbfs);
+                break;
+            case TxSourceKinds.Mod:
+                Generator = request.Modulation == TxWords.Am
+                    ? ModGenerator.Am(request.OffsetHz, grant.RateHz, request.LevelDbfs, request.AfHz, request.AmDepthPercent / 100.0)
+                    : ModGenerator.Fm(request.OffsetHz, grant.RateHz, request.LevelDbfs, request.AfHz, request.FmDeviationHz);
+                break;
+            case TxSourceKinds.Step:
+                Plan = plan ?? throw new ArgumentNullException(nameof(plan), "a stepped source needs its plan");
+                Generator = new SteppedCarrier(plan, request.LevelDbfs);
+                // The plan's LO, never the read-back: whether a later step moves the synthesizer is the
+                // plan's question, and a synthesizer that lands a hertz off must not make every step "rf".
+                StepLoHz = plan.LoHz[0];
+                break;
+            default:
+                throw new RadioRefusal(ErrorCodes.Unsupported,
+                    $"this sidecar does not build a \"{request.Source}\" source; it builds {string.Join(", ", RadioBackendBase.BuiltSources)}");
         }
-        else if (request.Source == TxSourceKinds.Tone)
-        {
-            Tone = new ToneGenerator(request.OffsetHz, grant.RateHz, request.LevelDbfs);
-        }
-        else
-        {
-            throw new RadioRefusal(ErrorCodes.Unsupported,
-                $"this sidecar does not build a \"{request.Source}\" source yet; it builds {TxSourceKinds.Iq} and {TxSourceKinds.Tone}");
-        }
-        CenterHz = request.Source == TxSourceKinds.Iq ? grant.CenterHz : grant.CenterHz - request.OffsetHz;
+        // Baseband 0 Hz: an IQ transmission's centre; a tone or a modulated carrier sits offset_hz from it; a
+        // baseband sweep's steps sit (f - centre) from the parked centre; a tuned sweep's carrier IS baseband 0 Hz.
+        CenterHz = request.Source == TxSourceKinds.Iq ? grant.CenterHz
+                 : Plan != null ? (Plan.Baseband ? grant.CenterHz - (Plan.FrequencyHz[0] - Plan.CenterHz) : grant.CenterHz)
+                 : grant.CenterHz - request.OffsetHz;
     }
 
     public TxStartRequest Request { get; }
@@ -64,8 +91,23 @@ internal abstract class RadioTransmission : ITxTransmission
     /// <summary>An IQ transmission's samples; null for a generated one.</summary>
     protected TxSampleQueue? Queue { get; }
 
-    /// <summary>A tone's generator; null otherwise.</summary>
-    protected ToneGenerator? Tone { get; }
+    /// <summary>A generated source's samples (tone, mod, step); null for an IQ one.</summary>
+    protected IIqGenerator? Generator { get; }
+
+    /// <summary>A stepped source's plan; null otherwise.</summary>
+    protected TxStepPlan? Plan { get; }
+
+    /// <summary>The next step the radio side has not announced yet (0 = the key-up's own).</summary>
+    protected long NextStep { get; private set; }
+
+    /// <summary>The LO the current step stands at, as the plan placed it.</summary>
+    protected long StepLoHz { get; private set; }
+
+    /// <summary>The backend, for a radio side that moves the carrier itself (a tuned step on UHD).</summary>
+    protected RadioBackendBase Backend => _backend;
+
+    /// <summary><see cref="SidecarClock"/> at the key-up; 0 before it.</summary>
+    protected long KeyedTicks => Interlocked.Read(ref _keyedTicks);
 
     /// <summary>Where baseband 0 Hz leaves: the TX centre (a tone sits <c>offset_hz</c> from it). A park moves it.</summary>
     public long CenterHz
@@ -83,13 +125,82 @@ internal abstract class RadioTransmission : ITxTransmission
     public long Samples => Interlocked.Read(ref _samples);
     public long Underflows => Interlocked.Read(ref _underflows);
 
-    public event Action<StreamEnd>? Ended;
-#pragma warning disable CS0067 // a stepped source raises it (P4b2); none here does yet
-    public event Action<JsonObject>? Step;
-#pragma warning restore CS0067
+    /// <summary>The radio ended it on its own. A handler that subscribes after it happened is still told -
+    /// the server subscribes only once <c>StartTx</c> has returned.</summary>
+    public event Action<StreamEnd>? Ended
+    {
+        add
+        {
+            if (value == null) return;
+            StreamEnd? held;
+            lock (_eventGate)
+            {
+                _endedHandlers += value;
+                held = _unheardEnd;
+                _unheardEnd = null;
+            }
+            if (held != null) ThreadPool.QueueUserWorkItem(_ => value(held));
+        }
+        remove
+        {
+            lock (_eventGate) _endedHandlers -= value;
+        }
+    }
 
-    /// <summary>A park of a generated carrier (the server allows it for a tone only): the carrier moves
-    /// to <paramref name="centerHz"/> + its offset.</summary>
+    /// <summary>A stepped source's step: <c>{index, center_hz, retune, time_ticks, timing}</c>, in order. The
+    /// steps raised before the first handler subscribed are handed to it, in order, as it subscribes.</summary>
+    public event Action<JsonObject>? Step
+    {
+        add
+        {
+            if (value == null) return;
+            lock (_eventGate)
+            {
+                _stepHandlers += value;
+                var held = _unheardSteps;
+                _unheardSteps = null;
+                if (held != null)
+                    foreach (var b in held) value(b);
+            }
+        }
+        remove
+        {
+            lock (_eventGate) _stepHandlers -= value;
+        }
+    }
+
+    private void RaiseEnded(StreamEnd end)
+    {
+        Action<StreamEnd>? h;
+        lock (_eventGate)
+        {
+            h = _endedHandlers;
+            if (h == null)
+            {
+                _unheardEnd = end;
+                return;
+            }
+        }
+        ThreadPool.QueueUserWorkItem(_ => h(end));
+    }
+
+    /// <summary>Under the gate, so the steps reach every handler in the order they happened, and a handler
+    /// that subscribes late is handed the earlier ones first.</summary>
+    private void RaiseStep(JsonObject body)
+    {
+        lock (_eventGate)
+        {
+            if (_stepHandlers == null)
+            {
+                if (_unheardSteps != null && _unheardSteps.Count < MaxUnheardSteps) _unheardSteps.Add(body);
+                return;
+            }
+            _stepHandlers(body);
+        }
+    }
+
+    /// <summary>A park of a generated carrier - a tone or a modulated one; the server refuses it for a stepped
+    /// source, which moves its own: the carrier moves to <paramref name="centerHz"/> + its offset.</summary>
     public void Park(long centerHz)
     {
         CenterHz = centerHz;
@@ -100,16 +211,63 @@ internal abstract class RadioTransmission : ITxTransmission
 
     /// <summary>The first sample went out. <paramref name="position"/>: the ring position from which the
     /// receiver hears it, when the radio knows it exactly (the synthetic one); null = now.</summary>
-    protected void NoteKeyed(long? position)
+    protected void NoteKeyed(long? position, long? ticks = null)
     {
         if (Interlocked.CompareExchange(ref _keyedTs, Stopwatch.GetTimestamp(), 0) != 0) return;
+        Interlocked.Exchange(ref _keyedTicks, ticks ?? SidecarClock.Ticks);
         _backend.OnTransmissionEdge(this, keyed: true, position);
     }
+
+    /// <summary>
+    /// The radio side reached step <see cref="NextStep"/>: the carrier stands at its point's frequency from
+    /// <paramref name="timeTicks"/>, and <paramref name="timing"/> says how exactly that is known. A baseband
+    /// step's carrier is the parked centre plus its offset; a tuned step's is what the write read back
+    /// (<paramref name="tunedCarrierHz"/>, <paramref name="tunedLoHz"/>; the plan's values when the radio
+    /// moves exactly). Every client is told, in order, and the state follows.
+    /// </summary>
+    protected void NoteStep(long timeTicks, string timing, long? tunedCarrierHz = null, long? tunedLoHz = null)
+    {
+        var plan = Plan!;
+        long k = NextStep;
+        int index = plan.IndexOf(k);
+        long planLo = plan.LoHz[index];
+        string retune = k == 0 ? TxWords.RetuneDsp : TxStepPlan.RetuneFor(planLo, StepLoHz);
+        long carrier, lo;
+        if (plan.Baseband)
+        {
+            carrier = CenterHz + (plan.FrequencyHz[index] - plan.CenterHz);
+            lo = Grant.LoHz;
+        }
+        else
+        {
+            carrier = tunedCarrierHz ?? plan.FrequencyHz[index];
+            lo = tunedLoHz ?? planLo;
+            CenterHz = carrier;
+        }
+        StepLoHz = planLo;
+        NextStep = k + 1;
+        Grant.CenterHz = carrier;
+        _backend.OnTransmissionStep(carrier, lo);
+        RaiseStep(new JsonObject()
+            .Set("index", index)
+            .Set("center_hz", carrier)
+            .Set("retune", retune)
+            .Set("time_ticks", timeTicks)
+            .Set("timing", timing));
+    }
+
+    /// <summary>A step's instant counted from the key-up: its first sample at the TX rate after step 0's.</summary>
+    protected long TicksOfStep(long k) =>
+        KeyedTicks + (long)Math.Round(Plan!.StartSample(k) * 10_000_000.0 / Grant.RateHz);
 
     protected void NoteSamples(long n)
     {
         if (n > 0) Interlocked.Add(ref _samples, n);
     }
+
+    /// <summary>A radio that knows exactly how many samples went out (a sweep that ran to its end on the
+    /// synthetic radio) says so, rather than what its interpolator had taken ahead of the end.</summary>
+    protected void NoteSamplesSent(long exact) => Interlocked.Exchange(ref _samples, exact);
 
     /// <summary>The radio ran short mid-burst: counted, and told to the server as it happens.</summary>
     protected void NoteUnderflow()
@@ -127,9 +285,21 @@ internal abstract class RadioTransmission : ITxTransmission
         Queue?.Abort();
         if (Volatile.Read(ref _stopping) != 0) return;
         if (Interlocked.Exchange(ref _endedRaised, 1) != 0) return;
-        var end = new StreamEnd { Reason = reason, Text = text };
-        ThreadPool.QueueUserWorkItem(_ => Ended?.Invoke(end));
+        RaiseEnded(new StreamEnd { Reason = reason, Text = text });
     }
+
+    /// <summary>A source that ran to its end - a stepped sweep without <c>repeat</c> - once the radio side has
+    /// <see cref="Finish"/>ed it: the server is told it ended <c>drained</c>, in words.</summary>
+    protected void EndedBySource(string text)
+    {
+        if (Volatile.Read(ref _stopping) != 0) return;
+        if (Interlocked.Exchange(ref _endedRaised, 1) != 0) return;
+        RaiseEnded(new StreamEnd { Reason = EndReasons.Drained, Text = text });
+    }
+
+    /// <summary>The words a completed sweep ends with.</summary>
+    protected string SweepCompletedText() =>
+        $"the stepped sweep completed: {Plan!.StepCount} steps of {Plan.DwellMs} ms";
 
     /// <summary>The radio has let go of the transmitter: once. <paramref name="acked"/> is the RADIO's
     /// word that the last sample left it - nothing else may set it.</summary>

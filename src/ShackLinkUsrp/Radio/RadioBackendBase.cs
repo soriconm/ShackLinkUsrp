@@ -348,6 +348,24 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
     private double _txConfiguredRateHz;
     private RadioTransmission? _openTx;
     private long _txBursts;
+    // A stepped source moves the centre and the LO itself; what the client had set is put back when it ends.
+    private (long CenterHz, long LoOffsetHz)? _txTuneToRestore;
+
+    /// <summary>The sources a transmitter here builds (ShackLink docs/usrp_b210_support.md 9.17 P4-a', 9.18
+    /// P4b2): ShackLink's IQ, and the tone, AM / FM and stepped sweep generated in the sidecar.</summary>
+    public static readonly string[] BuiltSources = { TxSourceKinds.Iq, TxSourceKinds.Tone, TxSourceKinds.Mod, TxSourceKinds.Step };
+
+    /// <summary>What <c>caps.tx</c> says about the generated sources - the ONE place both radios state them,
+    /// so the synthetic radio cannot offer what the UHD one does not build, or the reverse.</summary>
+    protected static TxCaps StateGeneratedSources(TxCaps caps)
+    {
+        caps.Sources = (string[])BuiltSources.Clone();
+        caps.Modulations = new[] { TxWords.Am, TxWords.Fm };
+        caps.ModulatingWaveforms = new[] { TxWords.Sine };
+        caps.MinDwellMs = ProtocolConstants.TxMinDwellMs;
+        caps.MaxStepPoints = TxStepPlan.MaxPoints;
+        return caps;
+    }
 
     public event Action<long>? TxUnderflow;
 
@@ -405,8 +423,21 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
     /// (<see cref="TxWords.RetuneDsp"/>), the synthesizer beyond it (<see cref="TxWords.RetuneRf"/>).</summary>
     protected abstract (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open);
 
-    /// <summary>Open the radio's side of a transmission. An IQ one radiates nothing before its first sample.</summary>
-    protected abstract RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant);
+    /// <summary>The master clock the DUC runs at - what its reach, and so a stepped sweep's LO windows, are
+    /// computed from. UHD's read-back clock; the synthetic radio's model of it.</summary>
+    protected abstract double TxTickHz { get; }
+
+    /// <summary>Put a stepped source's carrier at <paramref name="carrierHz"/> with the LO at
+    /// <paramref name="loHz"/>: the synthesizer to that LO when <paramref name="moveLo"/>, else the DUC alone.
+    /// Returns what the radio read back.</summary>
+    protected abstract (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo);
+
+    /// <summary>For a radio side that moves a tuned step's carrier itself (UHD's sender thread).</summary>
+    internal (long CenterHz, long LoHz) StepTune(long carrierHz, long loHz, bool moveLo) => ApplyTxStepTune(carrierHz, loHz, moveLo);
+
+    /// <summary>Open the radio's side of a transmission. An IQ one radiates nothing before its first sample;
+    /// a stepped one runs by <paramref name="plan"/>.</summary>
+    protected abstract RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan);
 
     private void RequireTransmitter()
     {
@@ -482,15 +513,27 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
         var open = OpenTx;
         if (open != null && !open.IsFinished)
             throw new RadioRefusal(ErrorCodes.TxActive, "a transmission is already open in the radio");
-        if (r.Source != TxSourceKinds.Iq && r.Source != TxSourceKinds.Tone)
+        if (Array.IndexOf(BuiltSources, r.Source) < 0)
             throw new RadioRefusal(ErrorCodes.Unsupported,
-                $"this sidecar does not build a \"{r.Source}\" source yet; it builds {TxSourceKinds.Iq} and {TxSourceKinds.Tone}");
+                $"this sidecar does not build a \"{r.Source}\" source; it builds {string.Join(", ", BuiltSources)}");
         TxState st = GetTxState();
         double rate = st.RateHz;
+        TxStepPlan? plan = null;
         if (r.IsGenerated)
         {
-            // Its samples are the sidecar's own: it runs at the LOWEST admitted rate that holds it (P4-a').
-            rate = TxRules.RateFor(r, caps);
+            // Its samples are the sidecar's own: it runs at the LOWEST admitted rate that holds it (P4-a'). A
+            // stepped sweep's plan says which: the lowest that holds the whole sweep in baseband, or the lowest
+            // of all when the sweep is tuned by frequency writes.
+            if (r.Source == TxSourceKinds.Step)
+            {
+                plan = TxStepPlan.For(r, caps, TxTickHz);
+                if (plan == null) throw new RadioRefusal(ErrorCodes.OutOfRange, "no admitted TX rate can run this sweep");
+                rate = plan.RateHz;
+            }
+            else
+            {
+                rate = TxRules.RateFor(r, caps);
+            }
             if (rate <= 0) throw new RadioRefusal(ErrorCodes.OutOfRange, "no admitted TX rate holds this signal");
             if (rate != st.RateHz)
             {
@@ -503,35 +546,76 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
                 }
             }
         }
+        long center = r.IsGenerated ? st.CenterHz + r.OffsetHz : st.CenterHz;
+        long lo = st.LoHz;
+        if (plan != null)
+        {
+            // The LO parks where the sweep needs it and the first step's carrier stands there before anything
+            // is keyed (P4-a': a stepped sweep's LO sits where its steps need it; P4-3 is the tone's and the
+            // inlet's rule). What the client had set is put back when the sweep ends.
+            lock (_txLock) _txTuneToRestore = (st.CenterHz, st.LoOffsetHz);
+            try
+            {
+                var parked = plan.Baseband
+                    ? ApplyTxStepTune(plan.CenterHz, plan.LoHz[0], moveLo: true)
+                    : ApplyTxStepTune(plan.FrequencyHz[0], plan.LoHz[0], moveLo: true);
+                center = plan.Baseband ? parked.CenterHz + (plan.FrequencyHz[0] - plan.CenterHz) : parked.CenterHz;
+                lo = parked.LoHz;
+                OnTransmissionStep(center, lo);
+            }
+            catch
+            {
+                RestoreConfiguredTxRate();
+                RestoreConfiguredTxTune();
+                throw;
+            }
+        }
         var grant = new TxGrant
         {
             Source = r.Source,
-            CenterHz = r.IsGenerated ? st.CenterHz + r.OffsetHz : st.CenterHz,
-            LoHz = st.LoHz,
+            CenterHz = center,
+            LoHz = lo,
             RateHz = rate,
             GainDb = st.GainDb,
             LevelDbfs = r.IsGenerated ? r.LevelDbfs : double.NaN,
             QueueSamples = r.IsGenerated ? 0 : TxRatePlan.QueueSamplesFor(rate),
             MaxBlockSamples = ProtocolConstants.MaxIqBlockSamples,
+            StartHz = plan != null ? r.StartHz : 0,
+            StopHz = plan != null ? r.StopHz : 0,
+            Points = plan != null ? r.Points : 0,
         };
         RadioTransmission t;
         try
         {
-            t = OpenTransmission(r, grant);
+            t = OpenTransmission(r, grant, plan);
         }
         catch
         {
             if (r.IsGenerated) RestoreConfiguredTxRate();
+            if (plan != null) RestoreConfiguredTxTune();
             throw;
         }
         lock (_txLock) _openTx = t;
         Interlocked.Increment(ref _txBursts);
         Log($"transmission opened: {r.Source} at {grant.CenterHz} Hz, {rate:0} S/s, gain {st.GainDb} dB" +
-            (r.IsGenerated ? $", carrier {r.LevelDbfs} dBFS" : $", queue {grant.QueueSamples} samples"));
+            (r.IsGenerated ? $", carrier {r.LevelDbfs} dBFS" : $", queue {grant.QueueSamples} samples") +
+            (plan == null ? "" : plan.Baseband
+                ? $"; a baseband sweep of {plan.Points} points around {grant.LoHz} Hz, stepped at exact samples"
+                : $"; a tuned sweep of {plan.Points} points in {plan.Windows} LO window(s) (DUC reach {plan.ReachHz:0} Hz), the LO parked at {grant.LoHz} Hz"));
         return t;
     }
 
     internal void RaiseTxUnderflow(long n) => TxUnderflow?.Invoke(n);
+
+    /// <summary>A stepped source's carrier moved: <c>state.tx</c> follows it.</summary>
+    internal void OnTransmissionStep(long centerHz, long loHz)
+    {
+        lock (_txLock)
+        {
+            _txState.CenterHz = centerHz;
+            _txState.LoHz = loHz;
+        }
+    }
 
     /// <summary>A transmission keyed or let go. Either is a front-end change to every receive pipeline;
     /// letting go also frees the transmitter and puts back the rate a generated source moved.</summary>
@@ -546,7 +630,34 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
         lock (_txLock)
             if (_openTx == t) _openTx = null;
         if (t.Request.IsGenerated) RestoreConfiguredTxRate();
+        if (t.Request.Source == TxSourceKinds.Step) RestoreConfiguredTxTune();
         Log($"transmission let go: {t.Request.Source}, {t.Samples} samples, {t.Underflows} underflow(s)");
+    }
+
+    /// <summary>After a stepped source: the centre, LO and offset the client had set, as the rate is.</summary>
+    private void RestoreConfiguredTxTune()
+    {
+        (long CenterHz, long LoOffsetHz)? restore;
+        lock (_txLock)
+        {
+            restore = _txTuneToRestore;
+            _txTuneToRestore = null;
+        }
+        if (restore == null) return;
+        try
+        {
+            var tune = ApplyTxTune(restore.Value.CenterHz, restore.Value.LoOffsetHz);
+            lock (_txLock)
+            {
+                _txState.CenterHz = tune.CenterHz;
+                _txState.LoHz = tune.LoHz;
+                _txState.LoOffsetHz = restore.Value.LoOffsetHz;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"the TX centre {restore.Value.CenterHz} Hz could not be put back after a stepped sweep: {ex.Message}");
+        }
     }
 
     private void RestoreConfiguredTxRate()

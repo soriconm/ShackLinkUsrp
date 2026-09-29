@@ -155,7 +155,7 @@ internal sealed class SimBackend : RadioBackendBase
         double wide = WideRateHz;
         double[] rates = TxRates(wide);
         if (rates.Length == 0) return null;
-        return new TxCaps
+        return StateGeneratedSources(new TxCaps
         {
             FreqMinHz = 50_000_000,
             FreqMaxHz = 6_000_000_000,
@@ -167,10 +167,7 @@ internal sealed class SimBackend : RadioBackendBase
             MaxMs = 0,              // the server's ceiling
             QuantumSamples = 0,     // not stated: the synthetic radio has no transport packet
             MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(TxRatePlan.ModelTickHz(wide), rates),
-            Sources = new[] { TxSourceKinds.Iq, TxSourceKinds.Tone },
-            Modulations = Array.Empty<string>(),
-            ModulatingWaveforms = Array.Empty<string>(),
-        };
+        });
     }
 
     // The synthetic DUC is exact: an admitted rate is read back as asked.
@@ -194,12 +191,18 @@ internal sealed class SimBackend : RadioBackendBase
             : (centerHz, centerHz + loOffsetHz, TxWords.RetuneRf);
     }
 
-    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant)
+    protected override double TxTickHz => TxRatePlan.ModelTickHz(WideRateHz);
+
+    // The synthetic synthesizer and DUC land exactly where they are asked; a DUC-only step leaves the LO.
+    protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo) =>
+        (carrierHz, moveLo ? loHz : GetTxState().LoHz);
+
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan)
     {
         if (!TxRules.DividesWideRate(grant.RateHz, WideRateHz))
             throw new ShackLinkUsrp.Server.RadioRefusal(ErrorCodes.OutOfRange,
                 $"the TX rate {grant.RateHz:0} S/s does not divide the wide rate {WideRateHz:0} S/s");
-        var t = new SimTransmission(this, request, grant);
+        var t = new SimTransmission(this, request, grant, plan);
         Volatile.Write(ref _simTx, t);
         return t;
     }
@@ -296,6 +299,7 @@ internal sealed class SimBackend : RadioBackendBase
         var modPhase = new double[m];
         for (int k = 0; k < m; k++) pr[k] = 1.0;
         long produced = 0;               // = Ring.Written: the generator is the ring's only writer
+        long clockStartTs = Stopwatch.GetTimestamp();
         var clock = Stopwatch.StartNew();
         double rateAtStart = 0;
         long producedAtRateStart = 0;
@@ -376,7 +380,13 @@ internal sealed class SimBackend : RadioBackendBase
                 if (tx.IsFinished)
                     Interlocked.CompareExchange(ref _simTx, null, tx);
                 else
-                    tx.Mix(acc, n, lo, rate, 32767.0 * Math.Pow(10, (Volatile.Read(ref _txGainDb) + TxCouplingDb) / 20.0) * gain, produced);
+                {
+                    // Position p is due at tStart + (p - producedAtRateStart) / rate on this clock: that
+                    // instant, in the sidecar's ticks, is what a step at p is stamped with.
+                    long baseTicks = SidecarClock.FromTimestamp(clockStartTs + (long)Math.Round(tStart * Stopwatch.Frequency));
+                    tx.Mix(acc, n, lo, rate, 32767.0 * Math.Pow(10, (Volatile.Read(ref _txGainDb) + TxCouplingDb) / 20.0) * gain, produced,
+                           producedAtRateStart, baseTicks);
+                }
             }
 
             int start = (int)(Uniform() * (NoiseLen - Block)) * 2;

@@ -6,9 +6,9 @@ through UHD and serves derived products over TCP to any number of clients:
 - **panoramas** — the full instantaneous span as integrated power-spectrum rows, per-client geometry;
 - **leases** — narrow IQ channels cut out of the wide stream by a per-lease DDC;
 - **events** — state changes, dropped leases, radio faults;
-- **transmit** — IQ a client streams to it, or a tone it generates itself, under a TX owner separate
-  from the LO owner, with a cap, a starvation limit and a drain that ends on the radio's own
-  acknowledgement (ShackLink `docs/usrp_b210_support.md` §9.17–§9.18; AM / FM and a stepped sweep follow).
+- **transmit** — IQ a client streams to it, or a signal it generates itself (a tone, an AM or FM carrier,
+  a stepped sweep), under a TX owner separate from the LO owner, with a cap, a starvation limit and a
+  drain that ends on the radio's own acknowledgement (ShackLink `docs/usrp_b210_support.md` §9.17–§9.18).
 
 Clients today are ShackLink (the SDR server) and the RF Bench Analyser. They speak the protocol
 through the MIT-licensed `ShackLinkUsrp.Protocol` library, which lives in the ShackLink repository
@@ -62,6 +62,23 @@ rate (one that divides the wide rate, so a transmission never moves the master c
 is set first, and one TX streamer is made and freed to prove the chain and read UHD's quantum. Nothing is
 sent. Each transmission then gets its own streamer, driven by ONE thread — UHD's C API writes a streamer's
 error string on every call, so its sends and its acknowledgement poll must not be split across threads.
+
+**A generated source runs at the lowest admitted TX rate that holds it** and puts the client's rate back
+when it ends. AM and FM are modulated by one sine (FM's phase is the exact integral of its deviation, so
+its modulation index is the same at every rate). A **stepped sweep** runs in one of two regimes, and each
+`tx_step` event says which through `timing`:
+
+- **Baseband** — when every point fits the usable band of one admitted rate (at most 1.6 MHz at 2 MS/s):
+  the LO parks at the sweep's centre and the carrier steps inside the generated samples, at exact sample
+  counts, on either radio (`timing: sample`).
+- **Tuned** — wider: every step is a frequency write, the DUC's CORDIC inside its reach of a parked LO and
+  the synthesizer beyond it. UHD applies a write when it arrives, not at a sample, so on a real radio these
+  steps say `timing: bound`, stamped when the write returned. Timed commands (`set_command_time`) are
+  deliberately not used yet: a pending one holds the radio's whole command processor, and a late one runs
+  at once with no word to the host (ShackLink `docs/usrp_b210_support.md` §9.18 P4b2).
+
+A sweep that does not repeat ends by itself, acknowledged like a drain, and puts back the centre and LO
+the client had set. The synthetic radio steps in both regimes at the exact sample: it owns its clock.
 
 A sidecar lives as long as its clients: it exits `--linger` seconds after the last one leaves, at once
 when its radio is in a fault (a fault is terminal; only a fresh sidecar opens the radio again), and

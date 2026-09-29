@@ -268,7 +268,7 @@ internal sealed class UhdBackend : RadioBackendBase
     {
         if (_txFreqRange == null || _txGainRange == null) return;
         double[] rates = AdmittedTxRates(usrp, wideRate);
-        Volatile.Write(ref _txCaps, rates.Length == 0 ? null : new TxCaps
+        Volatile.Write(ref _txCaps, rates.Length == 0 ? null : StateGeneratedSources(new TxCaps
         {
             FreqMinHz = (long)Math.Ceiling(_txFreqRange.Start),
             FreqMaxHz = (long)Math.Floor(_txFreqRange.Stop),
@@ -280,10 +280,7 @@ internal sealed class UhdBackend : RadioBackendBase
             MaxMs = 0,               // the server's ceiling
             QuantumSamples = _txQuantum,
             MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(usrp.GetMasterClockRate(), rates),
-            Sources = new[] { TxSourceKinds.Iq, TxSourceKinds.Tone },
-            Modulations = Array.Empty<string>(),
-            ModulatingWaveforms = Array.Empty<string>(),
-        });
+        }));
         if (rates.Length == 0) _txWhyNot = $"no admitted TX rate divides the wide rate {wideRate:0} S/s";
     }
 
@@ -326,7 +323,19 @@ internal sealed class UhdBackend : RadioBackendBase
         return ((long)Math.Round(t.ReadbackHz), (long)Math.Round(t.ActualRfHz), TxWords.RetuneRf);
     }
 
-    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant)
+    protected override double TxTickHz => _masterClock;
+
+    /// <summary>A stepped source's carrier: rf MANUAL at the LO and dsp AUTO when the synthesizer moves, rf NONE
+    /// (the DUC's CORDIC alone) otherwise - the park's two shapes. Untimed: the write lands when it arrives
+    /// (section 9.18 P4b2), so the caller states an upper bound.</summary>
+    protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo)
+    {
+        var r = moveLo ? Usrp.TuneTx(carrierHz, UhdTxTunePolicy.LoOffset, loHz - carrierHz)
+                       : Usrp.TuneTx(carrierHz, UhdTxTunePolicy.KeepLo);
+        return ((long)Math.Round(r.ReadbackHz), (long)Math.Round(r.ActualRfHz));
+    }
+
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan)
     {
         var u = Usrp;
         // Its own streamer, for its life (item 7). Making it powers the TX chain, which takes the AD9361
@@ -338,7 +347,7 @@ internal sealed class UhdBackend : RadioBackendBase
                 "the full-duplex state) - its samples during the burst come from another port (section 9.17 item 3)");
         try
         {
-            return new UhdTransmission(this, request, grant, streamer, NoteTxAsync);
+            return new UhdTransmission(this, request, grant, plan, streamer, NoteTxAsync);
         }
         catch
         {

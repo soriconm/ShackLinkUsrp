@@ -249,7 +249,7 @@ internal static partial class Program
         ev = s.OpenEvents();
         ev.Connection.EventReceived += (c, n, body) =>
         {
-            if (n == EventNames.Tx || n == EventNames.TxUnderflow) lock (events) events.Add((n, body));
+            if (n == EventNames.Tx || n == EventNames.TxUnderflow || n == EventNames.TxStep) lock (events) events.Add((n, body));
         };
         ev.Connection.StartReader();
         return events;
@@ -264,8 +264,11 @@ internal static partial class Program
             s.WaitReady(5000);
             var tc = s.Caps.Tx;
             Check(s.Radio.Source == RadioSources.Sim && tc != null, $"the synthetic radio states a transmitter (caps.tx) and that it is synthetic ({s.Radio.Source})");
-            Check(tc!.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }) && tc.Modulations.Length == 0,
-                  $"it builds {string.Join(" and ", tc.Sources)} - AM / FM and the stepped sweep are P4b2's");
+            Check(tc!.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone, TxSourceKinds.Mod, TxSourceKinds.Step }) &&
+                  tc.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm }) && tc.ModulatingWaveforms.SequenceEqual(new[] { TxWords.Sine }),
+                  $"it builds {string.Join(", ", tc.Sources)}; it modulates {string.Join(" and ", tc.Modulations)} with a {string.Join("", tc.ModulatingWaveforms)}");
+            Check(tc.MinDwellMs == ProtocolConstants.TxMinDwellMs && tc.MinDwellMs == 5 && tc.MaxStepPoints == 8192,
+                  $"a step lasts at least {tc.MinDwellMs} ms and a sweep has at most {tc.MaxStepPoints} points (the RF Bench Analyser's trace budget)");
             Check(tc.RatesHz.SequenceEqual(new[] { 200e3, 250e3, 400e3, 500e3, 1e6, 2e6 }) && tc.GainMinDb == 0 && tc.GainMaxDb == 89.75 && tc.GainStepDb == 0.25,
                   $"at 2 MS/s: TX rates {string.Join("/", tc.RatesHz.Select(r => F(r / 1e3, "0")))} kS/s, gain {F(tc.GainMinDb, "0.##")}-{F(tc.GainMaxDb, "0.##")} in {F(tc.GainStepDb, "0.##")} dB (the B210's)");
             Check(tc.MaxMs == ProtocolConstants.DefaultTxMaxMs && tc.QuantumSamples == 0 && tc.MaxLoOffsetHz == (long)(0.4 * (32e6 - 2e6)),
