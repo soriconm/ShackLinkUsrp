@@ -20,7 +20,7 @@ using ShackLinkUsrp.Wire;
 
 namespace ShackLinkUsrp.Tests;
 
-internal static class Program
+internal static partial class Program
 {
     private static int _pass, _fail;
     private static string _temp = "";
@@ -54,6 +54,19 @@ internal static class Program
         Run("command line: the synthetic radio's settle hook", SettleHookOptions);
         Run("spawned: a radio in a fault ends its sidecar when its last client leaves", SpawnFaultExit);
         Run("build: the protocol library is the sidecar's own configuration (9.11 item 8)", ProtocolLibraryConfiguration);
+        Run("P4b: the tone generator", ToneGeneratorCases);
+        Run("P4b: the TX interpolator (the synthetic radio's DUC)", TxInterpolatorCases);
+        Run("P4b: the TX rate plan against the clocks 9.8 measured", TxRatePlanCases);
+        Run("P4b: the transmit queue", TxQueueCases);
+        Run("P4b: nothing here loaded UHD", NoUhdInThisProcess);
+        Run("P4b: the synthetic radio states its transmitter", SimTxCaps);
+        Run("P4b: a tone lands in the synthetic radio's own panorama, parks, and ends", SimToneLoopback);
+        Run("P4b: an IQ transmission paced by the synthetic radio's clock", SimIqLoopback);
+        Run("P4b: every other way a transmission ends", SimTxEnds);
+        Run("P4b: a UHD backend with no radio refuses in words", UhdTxWithoutRadio);
+        Run("P4b: what the running gates cannot reach, pinned in the source", TxSourceRules);
+        Run("command line: the transmitter's options", TxOptions);
+        Run("spawned: the real executable transmits into itself, and loaded no UHD", SpawnTxLoopback);
 
         try { Directory.Delete(_temp, true); } catch { }
         Console.WriteLine();
@@ -863,6 +876,16 @@ internal static class Program
                           $"antennas {string.Join(",", c.Antennas)}, bandwidth {c.BandwidthMinHz}-{c.BandwidthMaxHz}");
         var st = s.ClaimLo();
         Console.WriteLine($"state: LO {st.LoHz}, rate {st.WideRateHz}, gain {st.GainDb}, {st.Antenna}, bw {st.BandwidthHz}, owner {st.Owner?.Client}");
+        // The transmitter as the radio opened it (section 9.17 P4-b) - read, never keyed.
+        var ct = c.Tx;
+        var tel0 = s.GetTelemetry().GetObject("radio")?.GetObject("source");
+        Console.WriteLine(ct == null
+            ? $"caps.tx: none - {tel0?.GetString("tx_why_not", "")}"
+            : $"caps.tx: {ct.FreqMinHz}-{ct.FreqMaxHz} Hz, gain {ct.GainMinDb}-{ct.GainMaxDb} step {ct.GainStepDb}, " +
+              $"rates {string.Join("/", ct.RatesHz.Select(r => (r / 1e3).ToString("0.###", CultureInfo.InvariantCulture)))} kS/s, " +
+              $"antennas {string.Join(",", ct.Antennas)}, quantum {ct.QuantumSamples}, max LO offset {ct.MaxLoOffsetHz} Hz, sources {string.Join(",", ct.Sources)}");
+        if (st.Tx != null)
+            Console.WriteLine($"state.tx: {st.Tx.CenterHz} Hz (LO {st.Tx.LoHz}), {st.Tx.RateHz} S/s, {st.Tx.GainDb} dB, {st.Tx.Antenna}, keyed {st.Tx.Keyed}");
 
         using var pano = s.OpenPanorama(new PanoramaRequest { Bins = 8192, Fps = 10, Integration = IntegrationKind.Average, Window = WindowKind.Hann });
         using var lease = s.OpenLease(new LeaseRequest { CenterHz = st.LoHz + 1_000_000, Decimation = 50 });

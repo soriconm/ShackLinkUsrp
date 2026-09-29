@@ -43,6 +43,14 @@ internal sealed class UhdBackend : RadioBackendBase
     private long _dcOffsetHz;
     private long _recvCalls, _recvSamples, _timeouts, _otherErrors, _lateFirstMs;
     private double _masterClock;
+    // The transmitter (section 9.17 P4-b): UHD's ranges read at open, the caps rebuilt for every wide
+    // rate, and why there is none when there is none.
+    private TxCaps? _txCaps;
+    private string _txWhyNot = "the radio is not open";
+    private UhdMetaRange? _txFreqRange, _txGainRange;
+    private string[] _txAntennas = Array.Empty<string>();
+    private int _txQuantum;
+    private long _txAcks, _txUnderflowEvents, _txSeqErrors, _txTimeErrors;
 
     public UhdBackend(SidecarLog log, UhdBackendOptions opt)
         : base(log,
@@ -177,7 +185,178 @@ internal sealed class UhdBackend : RadioBackendBase
             s.DcOffsetHz = _dcOffsetHz;
         }, announce: false);
         Log($"rate {rate:0} S/s (master clock {_masterClock:0}), LO {tune.ReadbackHz:0} Hz, gain {g} dB, {ant}, bandwidth {bandwidth:0} Hz, otw {_opt.OtwFormat}");
+        OpenTransmitter(usrp, rate);
         StartStreaming();
+    }
+
+    // ------------------------------------------------------------ the transmitter (section 9.17 P4-b)
+
+    /// <summary>
+    /// The TX chain, set up once as the radio opens and BEFORE the receiver streams. An admitted rate is
+    /// set first, because creating a TX streamer re-applies whatever TX rate UHD holds (get_tx_stream's
+    /// rate update) and so marks it as set; then one streamer is made and freed, which proves the chain
+    /// can be driven and states UHD's own quantum - while it exists the TX chain is powered, and with no
+    /// receiver yet there is nothing for that to disturb. Nothing is sent. A failure here leaves the
+    /// radio receive-only and says why; it never fails the open.
+    /// </summary>
+    private void OpenTransmitter(UhdUsrp usrp, double wideRate)
+    {
+        try
+        {
+            if (usrp.TxChannelCount < 1)
+            {
+                NoTransmitter("UHD reports no TX channel on this radio");
+                return;
+            }
+            double[] admitted = AdmittedTxRates(usrp, wideRate);
+            if (admitted.Length == 0)
+            {
+                NoTransmitter($"no TX rate from {TxRatePlan.MinTxRateHz:0} to {TxRatePlan.MaxTxRateHz:0} S/s divides {wideRate:0} S/s exactly at a {_masterClock:0} Hz clock");
+                return;
+            }
+            double txRate = usrp.SetTxRate(admitted[0]);
+            if (txRate != admitted[0])
+            {
+                NoTransmitter($"the DUC read back {txRate} S/s for the admitted {admitted[0]} S/s");
+                return;
+            }
+            int quantum;
+            using (var probe = usrp.CreateTxStreamer()) quantum = probe.MaxSamplesPerPacket;
+            double clock = usrp.GetMasterClockRate();
+            if (clock != _masterClock)
+                Log($"UNEXPECTED: the master clock moved from {_masterClock:0} to {clock:0} Hz while the transmitter was set up");
+            _masterClock = clock;
+            var tune = usrp.TuneTx(usrp.GetTxFrequency(), UhdTxTunePolicy.LoOnTarget);
+            double gain = usrp.GetTxGain();
+            string ant = usrp.GetTxAntenna();
+            _txFreqRange = usrp.GetTxFrequencyRange();
+            _txGainRange = usrp.GetTxGainRange();
+            _txAntennas = usrp.GetTxAntennas().ToArray();
+            _txQuantum = quantum;
+            RebuildTxCaps(usrp, wideRate);
+            InitTxState(s =>
+            {
+                s.CenterHz = (long)Math.Round(tune.ReadbackHz);
+                s.LoHz = (long)Math.Round(tune.ActualRfHz);
+                s.LoOffsetHz = 0;
+                s.RateHz = txRate;
+                s.GainDb = gain;
+                s.Antenna = ant;
+            }, txRate);
+            Log($"transmitter: {_txFreqRange}, gain {_txGainRange}, {ant}, quantum {quantum} samples, TX rates " +
+                $"{string.Join("/", (_txCaps?.RatesHz ?? Array.Empty<double>()).Select(r => (r / 1e3).ToString("0.###", CultureInfo.InvariantCulture)))} kS/s " +
+                $"at a {clock:0} Hz clock; at {tune.ReadbackHz:0} Hz, {gain} dB, {txRate:0} S/s - nothing is sent until a client asks");
+        }
+        catch (Exception ex)
+        {
+            NoTransmitter($"the TX chain could not be set up: {ex.Message}");
+        }
+    }
+
+    private void NoTransmitter(string why)
+    {
+        Volatile.Write(ref _txCaps, null);
+        _txWhyNot = why;
+        Log("this radio will not transmit: " + why);
+    }
+
+    /// <summary>UHD's DUC host rates at the clock it reads back, through the rules both radios share.</summary>
+    private double[] AdmittedTxRates(UhdUsrp usrp, double wideRate) =>
+        TxRatePlan.Admitted(usrp.GetTxRates().Ranges.Select(r => r.Start), usrp.GetMasterClockRate(), wideRate);
+
+    private void RebuildTxCaps(UhdUsrp usrp, double wideRate)
+    {
+        if (_txFreqRange == null || _txGainRange == null) return;
+        double[] rates = AdmittedTxRates(usrp, wideRate);
+        Volatile.Write(ref _txCaps, rates.Length == 0 ? null : new TxCaps
+        {
+            FreqMinHz = (long)Math.Ceiling(_txFreqRange.Start),
+            FreqMaxHz = (long)Math.Floor(_txFreqRange.Stop),
+            GainMinDb = _txGainRange.Start,
+            GainMaxDb = _txGainRange.Stop,
+            GainStepDb = _txGainRange.Step,
+            RatesHz = rates,
+            Antennas = _txAntennas,
+            MaxMs = 0,               // the server's ceiling
+            QuantumSamples = _txQuantum,
+            MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(usrp.GetMasterClockRate(), rates),
+            Sources = new[] { TxSourceKinds.Iq, TxSourceKinds.Tone },
+            Modulations = Array.Empty<string>(),
+            ModulatingWaveforms = Array.Empty<string>(),
+        });
+        if (rates.Length == 0) _txWhyNot = $"no admitted TX rate divides the wide rate {wideRate:0} S/s";
+    }
+
+    protected override TxCaps? RadioTxCaps() => Volatile.Read(ref _txCaps);
+
+    protected override double ApplyTxRate(double hz)
+    {
+        var u = Usrp;
+        double before = u.GetMasterClockRate();
+        double eff = u.SetTxRate(hz);
+        double after = u.GetMasterClockRate();
+        if (after != before)
+        {
+            // Impossible by the admission rule (an admitted rate divides the wide rate); said out loud,
+            // because the receiver's samples around this instant were taken at a clock nobody chose.
+            Log($"UNEXPECTED: the master clock moved from {before:0} to {after:0} Hz when the TX rate was set to {hz:0} S/s");
+            _masterClock = after;
+        }
+        return eff;
+    }
+
+    protected override double ApplyTxGain(double db) => Usrp.SetTxGain(db);
+
+    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz)
+    {
+        var r = Usrp.TuneTx(centerHz, loOffsetHz == 0 ? UhdTxTunePolicy.LoOnTarget : UhdTxTunePolicy.LoOffset, loOffsetHz);
+        return ((long)Math.Round(r.ReadbackHz), (long)Math.Round(r.ActualRfHz));
+    }
+
+    protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open)
+    {
+        var u = Usrp;
+        long lo = GetTxState().LoHz;
+        if (Math.Abs(centerHz - lo) <= TxRatePlan.DspReachHz(_masterClock, open.Grant.RateHz))
+        {
+            var r = u.TuneTx(centerHz, UhdTxTunePolicy.KeepLo);
+            return ((long)Math.Round(r.ReadbackHz), (long)Math.Round(r.ActualRfHz), TxWords.RetuneDsp);
+        }
+        var t = u.TuneTx(centerHz, loOffsetHz == 0 ? UhdTxTunePolicy.LoOnTarget : UhdTxTunePolicy.LoOffset, loOffsetHz);
+        return ((long)Math.Round(t.ReadbackHz), (long)Math.Round(t.ActualRfHz), TxWords.RetuneRf);
+    }
+
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant)
+    {
+        var u = Usrp;
+        // Its own streamer, for its life (item 7). Making it powers the TX chain, which takes the AD9361
+        // through ALERT and back under the receiver: a front-end change before a sample is sent.
+        var streamer = u.CreateTxStreamer();
+        AnnounceFrontEndChange();
+        if (GetState().Antenna == "TX/RX")
+            Log("the receiver is on TX/RX: for every burst from TRX1 the board hears RX2 instead (b200_impl.cpp update_atrs, " +
+                "the full-duplex state) - its samples during the burst come from another port (section 9.17 item 3)");
+        try
+        {
+            return new UhdTransmission(this, request, grant, streamer, NoteTxAsync);
+        }
+        catch
+        {
+            streamer.Dispose();
+            throw;
+        }
+    }
+
+    private void NoteTxAsync(UhdAsyncEventCode code)
+    {
+        if ((code & UhdAsyncEventCode.BurstAck) != 0) Interlocked.Increment(ref _txAcks);
+        if ((code & (UhdAsyncEventCode.Underflow | UhdAsyncEventCode.UnderflowInPacket)) != 0) Interlocked.Increment(ref _txUnderflowEvents);
+        if ((code & (UhdAsyncEventCode.SeqError | UhdAsyncEventCode.SeqErrorInBurst)) != 0)
+        {
+            // Packets lost between the host and the radio: the burst on the air is spliced.
+            if (Interlocked.Increment(ref _txSeqErrors) == 1) Log("TX: packets were lost between the host and the radio (SEQ_ERROR) - the burst on the air is spliced");
+        }
+        if ((code & UhdAsyncEventCode.TimeError) != 0) Interlocked.Increment(ref _txTimeErrors);
     }
 
     private void StartStreaming()
@@ -291,8 +470,26 @@ internal sealed class UhdBackend : RadioBackendBase
         // A rate change re-plans UHD's master clock; stop the stream around it so no packet at the
         // old rate is written after the pipelines were told the new one.
         StopStreaming();
-        double eff = Usrp.SetRxRate(hz);
-        _masterClock = Usrp.GetMasterClockRate();
+        var u = Usrp;
+        // The TX rate UHD holds joins the LCM its automatic clock is chosen from (section 9.17 item 4):
+        // one that does not divide the NEW wide rate is moved first, to the lowest rate that wide rate
+        // admits at the clock it would get alone - so the receiver gets the clock it would have had with
+        // no transmitter. (No transmission is open: the server refuses set_rate under one, TX_ACTIVE.)
+        double txRate = GetTxState().RateHz;
+        if (Volatile.Read(ref _txCaps) != null && txRate > 0 && !TxRules.DividesWideRate(txRate, hz))
+        {
+            double tick = TxRatePlan.ModelTickHz(hz);
+            double[] plan = TxRatePlan.Admitted(TxRatePlan.DucHostRates(tick), tick, hz);
+            if (plan.Length > 0)
+            {
+                double moved = u.SetTxRate(plan[0]);
+                InitTxState(s => s.RateHz = moved, moved);
+                Log($"TX rate moved from {txRate:0} to {moved:0} S/s: {txRate:0} does not divide the new wide rate {hz:0} S/s");
+            }
+        }
+        double eff = u.SetRxRate(hz);
+        _masterClock = u.GetMasterClockRate();
+        if (_txFreqRange != null) RebuildTxCaps(u, eff);
         StartStreaming();
         return eff;
     }
@@ -368,5 +565,12 @@ internal sealed class UhdBackend : RadioBackendBase
         .Set("timeouts", Interlocked.Read(ref _timeouts))
         .Set("other_errors", Interlocked.Read(ref _otherErrors))
         .Set("first_samples_ms", Interlocked.Read(ref _lateFirstMs))
-        .Set("known_fault_opt_in", _opt.AllowKnownCodecFault);
+        .Set("known_fault_opt_in", _opt.AllowKnownCodecFault)
+        .Set("tx_available", Volatile.Read(ref _txCaps) != null)
+        .Set("tx_why_not", Volatile.Read(ref _txCaps) != null ? "" : _txWhyNot)
+        .Set("tx_quantum_samples", _txQuantum)
+        .Set("tx_burst_acks", Interlocked.Read(ref _txAcks))
+        .Set("tx_underflow_events", Interlocked.Read(ref _txUnderflowEvents))
+        .Set("tx_seq_errors", Interlocked.Read(ref _txSeqErrors))
+        .Set("tx_time_errors", Interlocked.Read(ref _txTimeErrors));
 }

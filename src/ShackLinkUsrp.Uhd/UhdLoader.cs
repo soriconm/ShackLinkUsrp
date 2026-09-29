@@ -163,6 +163,9 @@ public static class UhdLoader
             string layout = UhdNative.LayoutProblem();
             if (layout.Length > 0)
                 throw new InvalidOperationException("The UHD C API binding does not match the header layout: " + layout);
+            string txMd = UhdNative.TxMetadataProblem();
+            if (txMd.Length > 0)
+                throw new InvalidOperationException("The UHD C API binding does not pass the TX metadata flags as UHD reads them: " + txMd);
 
             Version = ReadVersion(isAbi: false);
             Abi = ReadVersion(isAbi: true);

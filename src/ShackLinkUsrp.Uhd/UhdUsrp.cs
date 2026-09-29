@@ -295,6 +295,122 @@ public sealed unsafe class UhdUsrp : IDisposable
         return 0;
     });
 
+    // ------------------------------------------------------------------ TX (docs/usrp_b210_support.md section 9.17 P4-b)
+
+    public int TxChannelCount => Locked(() =>
+    {
+        nuint n;
+        Check(uhd_usrp_get_tx_num_channels(Handle, &n), "uhd_usrp_get_tx_num_channels");
+        return (int)n;
+    });
+
+    /// <summary>Set the DUC's host rate and return what it READ BACK. On a B2xx with automatic clock
+    /// selection this joins the LCM the master clock is chosen from (b200_io_impl.cpp
+    /// set_auto_tick_rate), so the caller admits only rates that divide the wide rate.</summary>
+    public double SetTxRate(double hz, int chan = 0) => Locked(() =>
+    {
+        Check(uhd_usrp_set_tx_rate(Handle, hz, (nuint)chan), "uhd_usrp_set_tx_rate");
+        double v;
+        Check(uhd_usrp_get_tx_rate(Handle, (nuint)chan, &v), "uhd_usrp_get_tx_rate");
+        return v;
+    });
+
+    public double GetTxRate(int chan = 0) => Locked(() =>
+    {
+        double v;
+        Check(uhd_usrp_get_tx_rate(Handle, (nuint)chan, &v), "uhd_usrp_get_tx_rate");
+        return v;
+    });
+
+    /// <summary>The DUC's host rates at the CURRENT master clock: tick / n for each interpolation the
+    /// core offers (tx_dsp_core_3000.cpp get_host_rates) - UHD's answer, never a datasheet's.</summary>
+    public UhdMetaRange GetTxRates(int chan = 0) =>
+        Locked(() => ReadMetaRange(r => uhd_usrp_get_tx_rates(Handle, (nuint)chan, r), "uhd_usrp_get_tx_rates"));
+
+    /// <summary>Tune the transmitter so baseband 0 Hz leaves at <paramref name="targetHz"/>, the
+    /// synthesizer placed by <paramref name="policy"/> (<see cref="UhdTxTunePolicy"/>). UHD's own tune
+    /// request resolves it; the frequency is read back afterwards (hazard 6: a tune that returns OK is
+    /// not evidence that it tuned). The DUC's CORDIC takes the difference with the TX sign UHD applies.</summary>
+    public UhdTuneResult TuneTx(double targetHz, UhdTxTunePolicy policy, double loOffsetHz = 0.0, int chan = 0) => Locked(() =>
+    {
+        var req = new uhd_tune_request_t
+        {
+            target_freq = targetHz,
+            rf_freq_policy = policy switch
+            {
+                UhdTxTunePolicy.LoOffset => PolicyManual,
+                UhdTxTunePolicy.KeepLo => PolicyNone,
+                _ => PolicyAuto,
+            },
+            rf_freq = policy == UhdTxTunePolicy.LoOffset ? targetHz + loOffsetHz : 0.0,
+            dsp_freq_policy = PolicyAuto,
+            dsp_freq = 0.0,
+            args = IntPtr.Zero,
+        };
+        uhd_tune_result_t res;
+        Check(uhd_usrp_set_tx_freq(Handle, &req, (nuint)chan, &res), "uhd_usrp_set_tx_freq");
+        double readback;
+        Check(uhd_usrp_get_tx_freq(Handle, (nuint)chan, &readback), "uhd_usrp_get_tx_freq");
+        return new UhdTuneResult(res.clipped_rf_freq, res.target_rf_freq, res.actual_rf_freq,
+                                 res.target_dsp_freq, res.actual_dsp_freq, readback);
+    });
+
+    public double GetTxFrequency(int chan = 0) => Locked(() =>
+    {
+        double v;
+        Check(uhd_usrp_get_tx_freq(Handle, (nuint)chan, &v), "uhd_usrp_get_tx_freq");
+        return v;
+    });
+
+    public UhdMetaRange GetTxFrequencyRange(int chan = 0) =>
+        Locked(() => ReadMetaRange(r => uhd_usrp_get_tx_freq_range(Handle, (nuint)chan, r), "uhd_usrp_get_tx_freq_range"));
+
+    /// <summary>Gain name "" = the overall gain. Returns the value READ BACK (the B2xx's grid is 0.25 dB).</summary>
+    public double SetTxGain(double db, int chan = 0, string name = "") => Locked(() =>
+    {
+        IntPtr n = AllocAnsi(name);
+        try
+        {
+            Check(uhd_usrp_set_tx_gain(Handle, db, (nuint)chan, (byte*)n), "uhd_usrp_set_tx_gain");
+            double v;
+            Check(uhd_usrp_get_tx_gain(Handle, (nuint)chan, (byte*)n, &v), "uhd_usrp_get_tx_gain");
+            return v;
+        }
+        finally { Marshal.FreeHGlobal(n); }
+    });
+
+    public double GetTxGain(int chan = 0, string name = "") => Locked(() =>
+    {
+        IntPtr n = AllocAnsi(name);
+        try
+        {
+            double v;
+            Check(uhd_usrp_get_tx_gain(Handle, (nuint)chan, (byte*)n, &v), "uhd_usrp_get_tx_gain");
+            return v;
+        }
+        finally { Marshal.FreeHGlobal(n); }
+    });
+
+    public UhdMetaRange GetTxGainRange(int chan = 0, string name = "") => Locked(() =>
+    {
+        IntPtr n = AllocAnsi(name);
+        try { return ReadMetaRange(r => uhd_usrp_get_tx_gain_range(Handle, (byte*)n, (nuint)chan, r), "uhd_usrp_get_tx_gain_range"); }
+        finally { Marshal.FreeHGlobal(n); }
+    });
+
+    public string GetTxAntenna(int chan = 0) =>
+        Locked(() => ReadDeviceString((b, l) => uhd_usrp_get_tx_antenna(Handle, (nuint)chan, (byte*)b, l), "uhd_usrp_get_tx_antenna"));
+
+    public IReadOnlyList<string> GetTxAntennas(int chan = 0) =>
+        Locked(() => ReadDeviceStrings(v => uhd_usrp_get_tx_antennas(Handle, (nuint)chan, (IntPtr*)v), "uhd_usrp_get_tx_antennas"));
+
+    /// <summary>A TX streamer taking interleaved sc16 from the host, sc16 over USB. Its EXISTENCE enables
+    /// the AD9361's TX chain (b200_impl.cpp update_enables) and so disturbs the receiver once; and
+    /// creating one re-applies whatever TX rate UHD holds (get_tx_stream's rate update), so the caller
+    /// sets an admitted rate FIRST. It is NOT registered for <see cref="Dispose"/>: it belongs to the one
+    /// thread that drives it, and its owner ends that thread before the device goes.</summary>
+    public UhdTxStreamer CreateTxStreamer(int chan = 0) => Locked(() => new UhdTxStreamer(this, "sc16", "sc16", "", chan));
+
     // ------------------------------------------------------------------ streaming
 
     /// <summary>An RX streamer delivering interleaved sc16 on the host. <paramref name="otwFormat"/> is

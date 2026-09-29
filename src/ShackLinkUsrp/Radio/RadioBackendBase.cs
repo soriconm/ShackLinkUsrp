@@ -14,9 +14,11 @@ namespace ShackLinkUsrp.Radio;
 /// built on it, telemetry and the log. A concrete backend supplies the RADIO: how it opens, how it
 /// applies a setting, and the thread that fills the ring. The protocol server (MIT library) has
 /// already checked ownership, readiness and every range against <see cref="Caps"/> before a setter
-/// here runs; what is left to refuse is what only the radio knows.
+/// here runs; what is left to refuse is what only the radio knows. Both radios TRANSMIT
+/// (<see cref="ITxBackend"/>, docs/usrp_b210_support.md section 9.17 P4-b): the transmitter's state,
+/// the one open transmission and the rules around it are here, the hardware is the subclass's.
 /// </summary>
-internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
+internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioContext
 {
     private readonly object _stateLock = new();
     private readonly object _listenersLock = new();
@@ -167,9 +169,9 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     /// <see cref="SettledFrom"/> when it starts. Called AFTER the state is written, so a pipeline that
     /// applies the change reads the settings its next frame is taken at (the gain its rows state).
     /// </summary>
-    private void Announce(Action<IRadioListener, long> tell)
+    private void Announce(Action<IRadioListener, long> tell, long? at = null)
     {
-        long boundary = ChangeBoundary();
+        long boundary = at ?? ChangeBoundary();
         List<IRadioListener> all;
         lock (_listenersLock)
         {
@@ -180,8 +182,16 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
         foreach (var l in all) tell(l, boundary);
     }
 
-    /// <summary>A change to the receive chain that leaves the LO and the rate alone (A2 F3).</summary>
-    private void AnnounceFrontEnd() => Announce((l, at) => l.OnFrontEndChanged(at));
+    /// <summary>A change to the receive chain that leaves the LO and the rate alone (A2 F3). A burst's
+    /// start and end are one too (section 9.17 P4-a, receive interplay): on a B2xx the ATR moves the
+    /// receiver's port and the transmitter's leakage changes what it hears, so no row may integrate
+    /// across a key-up or a key-down. <paramref name="at"/>: the exact ring position, when the radio
+    /// knows it; null = the backend's own boundary for a change made now.</summary>
+    private void AnnounceFrontEnd(long? at = null) => Announce((l, p) => l.OnFrontEndChanged(p), at);
+
+    /// <summary>For a subclass whose radio changed the receive chain as a side effect (a TX streamer
+    /// powering the AD9361's TX chain moves it through ALERT and back).</summary>
+    protected void AnnounceFrontEndChange() => AnnounceFrontEnd();
 
     // ------------------------------------------------------------ IRadioBackend
 
@@ -331,6 +341,245 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
         lock (_listenersLock) return _listeners.ToList();
     }
 
+    // ------------------------------------------------------------ ITxBackend (section 9.17 P4-a, P4-b)
+
+    private readonly object _txLock = new();
+    private readonly TxState _txState = new() { GainDb = double.NaN };
+    private double _txConfiguredRateHz;
+    private RadioTransmission? _openTx;
+    private long _txBursts;
+
+    public event Action<long>? TxUnderflow;
+
+    /// <summary>The clock rows and blocks carry, which stamps the server's <c>tx</c> events.</summary>
+    public long ClockTicks => SidecarClock.Ticks;
+
+    /// <summary><c>caps.tx</c> for the wide rate in force; null while the radio is not ready or states no
+    /// transmitter (a UHD backend whose TX chain did not come up at open says why in its log).</summary>
+    public TxCaps? TxCaps
+    {
+        get
+        {
+            lock (_stateLock)
+                if (_state.Readiness != RadioStates.Ready) return null;
+            return RadioTxCaps();
+        }
+    }
+
+    public TxState GetTxState()
+    {
+        lock (_txLock) return _txState.Clone();
+    }
+
+    /// <summary>The open transmission, or null.</summary>
+    protected RadioTransmission? OpenTx
+    {
+        get { lock (_txLock) return _openTx; }
+    }
+
+    /// <summary>For a subclass: the transmitter's read-backs at open. <paramref name="configuredRateHz"/>
+    /// is the rate a generated source's own rate is put back to when it ends.</summary>
+    protected void InitTxState(Action<TxState> set, double configuredRateHz)
+    {
+        lock (_txLock)
+        {
+            set(_txState);
+            _txConfiguredRateHz = configuredRateHz;
+        }
+    }
+
+    /// <summary>What the transmitter can do now; null = no transmitter.</summary>
+    protected abstract TxCaps? RadioTxCaps();
+
+    /// <summary>Set the TX rate and return the rate READ BACK.</summary>
+    protected abstract double ApplyTxRate(double hz);
+
+    /// <summary>Set the TX gain and return the gain READ BACK.</summary>
+    protected abstract double ApplyTxGain(double db);
+
+    /// <summary>Tune with no transmission open: the LO on the carrier, or <paramref name="loOffsetHz"/>
+    /// from it (P4-3). Returns the effective centre and where the LO landed.</summary>
+    protected abstract (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz);
+
+    /// <summary>Move a keyed generated carrier's centre: the DUC's CORDIC inside its reach of the LO
+    /// (<see cref="TxWords.RetuneDsp"/>), the synthesizer beyond it (<see cref="TxWords.RetuneRf"/>).</summary>
+    protected abstract (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open);
+
+    /// <summary>Open the radio's side of a transmission. An IQ one radiates nothing before its first sample.</summary>
+    protected abstract RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant);
+
+    private void RequireTransmitter()
+    {
+        lock (_stateLock)
+            if (_state.Readiness != RadioStates.Ready)
+                throw new RadioRefusal(ErrorCodes.NotReady, "the radio is not open");
+        if (RadioTxCaps() == null) throw new RadioRefusal(TxRules.NoTransmitter().Code, TxRules.NoTransmitter().Text);
+    }
+
+    public TxConfigureResult ConfigureTx(TxSettings s)
+    {
+        RequireTransmitter();
+        var res = new TxConfigureResult();
+        if (s.RateHz != null)
+        {
+            double asked = s.RateHz.Value;
+            double eff = ApplyTxRate(asked);
+            lock (_txLock)
+            {
+                _txState.RateHz = eff;
+                _txConfiguredRateHz = eff;
+            }
+            Log($"TX rate {eff:0} S/s" + (eff != asked ? $" (asked {asked:0})" : ""));
+            // Every admitted rate is one the DUC reads back exactly (section 9.17 item 5): a mismatch is
+            // the radio disagreeing with its own rules, and the state already says what it did.
+            if (eff != asked)
+                throw new RadioRefusal(ErrorCodes.RadioFault, $"the transmitter read back {eff:0} S/s for the admitted rate {asked:0} S/s");
+        }
+        if (s.GainDb != null)
+        {
+            double eff = ApplyTxGain(s.GainDb.Value);
+            lock (_txLock) _txState.GainDb = eff;
+            Log($"TX gain {eff} dB" + (eff != s.GainDb.Value ? $" (asked {s.GainDb.Value})" : ""));
+        }
+        if (s.CenterHz != null || s.LoOffsetHz != null)
+        {
+            TxState st = GetTxState();
+            long center = s.CenterHz ?? st.CenterHz;
+            long offset = s.LoOffsetHz ?? st.LoOffsetHz;
+            var open = OpenTx;
+            if (open != null && !open.IsFinished && open.Request.IsGenerated && s.CenterHz != null)
+            {
+                var park = ApplyTxPark(center, offset, open);
+                res.TimeTicks = ClockTicks;
+                res.Retune = park.Retune;
+                open.Park(park.CenterHz);
+                lock (_txLock)
+                {
+                    _txState.CenterHz = park.CenterHz;
+                    _txState.LoHz = park.LoHz;
+                }
+                Log($"TX park to {park.CenterHz} Hz by the {(park.Retune == TxWords.RetuneDsp ? "DUC" : "synthesizer")}, LO {park.LoHz} Hz");
+            }
+            else
+            {
+                var tune = ApplyTxTune(center, offset);
+                lock (_txLock)
+                {
+                    _txState.CenterHz = tune.CenterHz;
+                    _txState.LoHz = tune.LoHz;
+                    _txState.LoOffsetHz = offset;
+                }
+                Log($"TX centre {tune.CenterHz} Hz, LO {tune.LoHz} Hz" + (tune.CenterHz != center ? $" (asked {center})" : ""));
+            }
+        }
+        return res;
+    }
+
+    public ITxTransmission StartTx(TxStartRequest r)
+    {
+        RequireTransmitter();
+        var caps = RadioTxCaps()!;
+        var open = OpenTx;
+        if (open != null && !open.IsFinished)
+            throw new RadioRefusal(ErrorCodes.TxActive, "a transmission is already open in the radio");
+        if (r.Source != TxSourceKinds.Iq && r.Source != TxSourceKinds.Tone)
+            throw new RadioRefusal(ErrorCodes.Unsupported,
+                $"this sidecar does not build a \"{r.Source}\" source yet; it builds {TxSourceKinds.Iq} and {TxSourceKinds.Tone}");
+        TxState st = GetTxState();
+        double rate = st.RateHz;
+        if (r.IsGenerated)
+        {
+            // Its samples are the sidecar's own: it runs at the LOWEST admitted rate that holds it (P4-a').
+            rate = TxRules.RateFor(r, caps);
+            if (rate <= 0) throw new RadioRefusal(ErrorCodes.OutOfRange, "no admitted TX rate holds this signal");
+            if (rate != st.RateHz)
+            {
+                double eff = ApplyTxRate(rate);
+                lock (_txLock) _txState.RateHz = eff;
+                if (eff != rate)
+                {
+                    RestoreConfiguredTxRate();
+                    throw new RadioRefusal(ErrorCodes.RadioFault, $"the transmitter read back {eff:0} S/s for the admitted rate {rate:0} S/s");
+                }
+            }
+        }
+        var grant = new TxGrant
+        {
+            Source = r.Source,
+            CenterHz = r.IsGenerated ? st.CenterHz + r.OffsetHz : st.CenterHz,
+            LoHz = st.LoHz,
+            RateHz = rate,
+            GainDb = st.GainDb,
+            LevelDbfs = r.IsGenerated ? r.LevelDbfs : double.NaN,
+            QueueSamples = r.IsGenerated ? 0 : TxRatePlan.QueueSamplesFor(rate),
+            MaxBlockSamples = ProtocolConstants.MaxIqBlockSamples,
+        };
+        RadioTransmission t;
+        try
+        {
+            t = OpenTransmission(r, grant);
+        }
+        catch
+        {
+            if (r.IsGenerated) RestoreConfiguredTxRate();
+            throw;
+        }
+        lock (_txLock) _openTx = t;
+        Interlocked.Increment(ref _txBursts);
+        Log($"transmission opened: {r.Source} at {grant.CenterHz} Hz, {rate:0} S/s, gain {st.GainDb} dB" +
+            (r.IsGenerated ? $", carrier {r.LevelDbfs} dBFS" : $", queue {grant.QueueSamples} samples"));
+        return t;
+    }
+
+    internal void RaiseTxUnderflow(long n) => TxUnderflow?.Invoke(n);
+
+    /// <summary>A transmission keyed or let go. Either is a front-end change to every receive pipeline;
+    /// letting go also frees the transmitter and puts back the rate a generated source moved.</summary>
+    internal void OnTransmissionEdge(RadioTransmission t, bool keyed, long? position)
+    {
+        AnnounceFrontEnd(position);
+        if (keyed)
+        {
+            Log($"transmission keyed: {t.Request.Source} at {t.Grant.CenterHz} Hz");
+            return;
+        }
+        lock (_txLock)
+            if (_openTx == t) _openTx = null;
+        if (t.Request.IsGenerated) RestoreConfiguredTxRate();
+        Log($"transmission let go: {t.Request.Source}, {t.Samples} samples, {t.Underflows} underflow(s)");
+    }
+
+    private void RestoreConfiguredTxRate()
+    {
+        double configured, now;
+        lock (_txLock)
+        {
+            configured = _txConfiguredRateHz;
+            now = _txState.RateHz;
+        }
+        if (configured <= 0 || configured == now) return;
+        try
+        {
+            double eff = ApplyTxRate(configured);
+            lock (_txLock) _txState.RateHz = eff;
+        }
+        catch (Exception ex)
+        {
+            Log($"the TX rate {configured:0} S/s could not be put back after a generated source: {ex.Message}");
+        }
+    }
+
+    /// <summary>The <c>tx</c> half of the telemetry every radio shares.</summary>
+    private JsonObject TxTelemetry()
+    {
+        var t = OpenTx;
+        var o = new JsonObject().Set("bursts", Interlocked.Read(ref _txBursts)).Set("open", t != null && !t.IsFinished);
+        if (t != null)
+            o.Set("source", t.Request.Source).Set("keyed", t.IsKeyed).Set("samples", t.Samples).Set("underflows", t.Underflows)
+             .Set("center_hz", t.Grant.CenterHz).Set("rate_hz", t.Grant.RateHz);
+        return o;
+    }
+
     public JsonObject GetTelemetry()
     {
         var pipelines = new JsonArray();
@@ -357,6 +606,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
             .Set("ring_capacity", Ring.Capacity)
             .Set("overflows", Overflows)
             .Set("pipelines", pipelines)
+            .Set("tx", TxTelemetry())
             .Set("source", RadioTelemetry());
     }
 
@@ -366,6 +616,10 @@ internal abstract class RadioBackendBase : IRadioBackend, IRadioContext
     {
         if (_disposed) return;
         _disposed = true;
+        // The transmitter first: nothing radiates past a closing radio.
+        var tx = OpenTx;
+        if (tx != null && !tx.IsFinished)
+            try { tx.Stop(false, 0); } catch (Exception ex) { Log("transmission stop at close: " + ex.Message); }
         List<IRadioListener> all;
         lock (_listenersLock)
         {

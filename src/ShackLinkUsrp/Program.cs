@@ -51,7 +51,7 @@ internal static class Program
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
 
         RadioBackendBase backend = opt.Sim
-            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs }
+            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb }
             : new UhdBackend(log, new UhdBackendOptions
             {
                 Serial = opt.Serial!,
@@ -74,6 +74,8 @@ internal static class Program
             FirstClientTimeoutSeconds = opt.FirstClientTimeoutSeconds,
             Persist = opt.Persist,
             SidecarVersion = Version,
+            TxMaxMs = opt.TxMaxMs,
+            TxStarveMs = opt.TxStarveMs,
             Log = log.Write,
         });
 
@@ -185,9 +187,12 @@ internal static class Program
 internal sealed class SidecarOptions
 {
     public const string Usage =
-        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] | --list\n" +
+        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list\n" +
         "  --sim-fault-after <ms>      (tests) the synthetic radio faults this long after it starts streaming\n" +
         "  --sim-settle-ms <ms>        (tests) a synthetic radio change takes effect this long after it is asked for, like in-flight USB buffers\n" +
+        "  --sim-tx-coupling <dB>      how the synthetic radio hears its own transmission: L dBFS at a TX gain of G is heard at L + G + this (default -80)\n" +
+        "  --tx-max-ms <ms>            the longest any transmission may run, whatever a client asks (default 3600000)\n" +
+        "  --tx-starve-ms <ms>         a keyed IQ transmission that receives no block this long is ended (default 500)\n" +
         "  --uhd <dir>                 load uhd.dll from <dir> (default: C:\\Program Files\\UHD\\bin)\n" +
         "  --images <dir>              UHD_IMAGES_DIR (default: the Ettus install's images)\n" +
         "  --fpga <path>               FPGA image for a clone board\n" +
@@ -211,6 +216,10 @@ internal sealed class SidecarOptions
     public string SimName = UsrpAddress.DefaultSimName;
     public int SimFaultAfterMs;
     public int SimSettleMs;
+    public double SimTxCouplingDb = SimBackend.DefaultTxCouplingDb;
+    public bool SimTxCouplingSet;
+    public long TxMaxMs = ProtocolConstants.DefaultTxMaxMs;
+    public int TxStarveMs = ProtocolConstants.DefaultTxStarveMs;
     public bool List;
     public bool Help;
     public string? UhdDirectory;
@@ -249,6 +258,23 @@ internal sealed class SidecarOptions
                 case "--sim-name": o.SimName = Next(); break;
                 case "--sim-fault-after": o.SimFaultAfterMs = Int(a, Next()); break;
                 case "--sim-settle-ms": o.SimSettleMs = Int(a, Next()); break;
+                case "--sim-tx-coupling":
+                    {
+                        string v = Next();
+                        if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out o.SimTxCouplingDb) ||
+                            double.IsNaN(o.SimTxCouplingDb) || double.IsInfinity(o.SimTxCouplingDb))
+                            throw new ArgumentException($"--sim-tx-coupling needs a number of decibels, not \"{v}\"");
+                        o.SimTxCouplingSet = true;
+                        break;
+                    }
+                case "--tx-max-ms":
+                    o.TxMaxMs = Int(a, Next());
+                    if (o.TxMaxMs < 1) throw new ArgumentException("--tx-max-ms must be at least 1: every transmission has a ceiling");
+                    break;
+                case "--tx-starve-ms":
+                    o.TxStarveMs = Int(a, Next());
+                    if (o.TxStarveMs < 1) throw new ArgumentException("--tx-starve-ms must be at least 1: a keyed radio fed nothing is ended");
+                    break;
                 case "--list": o.List = true; break;
                 case "--help": case "-h": case "/?": o.Help = true; break;
                 case "--uhd": o.UhdDirectory = Next(); break;
@@ -290,6 +316,8 @@ internal sealed class SidecarOptions
                 throw new ArgumentException("--sim-fault-after is for the synthetic radio (--sim); a real radio faults on its own");
             if (o.SimSettleMs > 0 && !o.Sim)
                 throw new ArgumentException("--sim-settle-ms is for the synthetic radio (--sim); a real radio's settle is its own");
+            if (o.SimTxCouplingSet && !o.Sim)
+                throw new ArgumentException("--sim-tx-coupling is for the synthetic radio (--sim); a real radio's coupling is its own");
             try
             {
                 if (o.Sim) UsrpAddress.Sim(o.SimName);

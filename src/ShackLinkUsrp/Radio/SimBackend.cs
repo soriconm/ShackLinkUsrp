@@ -66,6 +66,23 @@ internal sealed class SimBackend : RadioBackendBase
     /// own settle is 0 (ShackLink docs/usrp_b210_support.md 9.15: CRTU200's A2).</summary>
     public int SettleMs { get; init; }
 
+    /// <summary>
+    /// <c>--sim-tx-coupling</c>: how a transmission reaches this radio's own receiver (ShackLink
+    /// docs/usrp_b210_support.md section 9.17 P4-b). A TX sample at L dBFS, sent at a TX gain of G dB,
+    /// is heard at <c>L + G + TxCouplingDb</c> dBFS with the receiver at 30 dB (and the RX gain moves it
+    /// with everything else) - so a -10 dBFS tone at a TX gain of 50 dB reads -40 dBFS by default. A
+    /// stated number, in the telemetry as <c>tx_coupling_db</c>: no isolation was measured to choose it.
+    /// </summary>
+    public double TxCouplingDb { get; init; } = DefaultTxCouplingDb;
+
+    public const double DefaultTxCouplingDb = -80;
+
+    /// <summary>The B210's TX gain range and grid (UHD's get_tx_gain_range on the board, 0-89.75 in 0.25).</summary>
+    public const double TxGainMaxDb = 89.75, TxGainStepDb = 0.25;
+
+    private SimTransmission? _simTx;     // the generator's to mix; written by StartTx, cleared when it finishes
+    private double _txGainDb;
+
     public SimBackend(SidecarLog log, string name, double wideRateHz, long loHz = 100_000_000, double noiseDbfs = -65)
         : base(log,
                new RadioInfo { Serial = "sim-" + name, Product = "Synthetic B210", Name = name, Source = RadioSources.Sim, KnownCodecFault = false },
@@ -103,10 +120,88 @@ internal sealed class SimBackend : RadioBackendBase
         // A synthetic radio opens at once; the short pause lets a client see "opening" honestly.
         Thread.Sleep(200);
         UpdateState(s => { s.Antenna = "RX2"; s.BandwidthHz = _initial.RateHz; }, announce: false);
+        // The transmitter as a B210's comes up: 100 MHz, 0 dB, the LO on the carrier, and the lowest
+        // admitted rate set (the UHD backend sets it too, before its TX chain is touched).
+        double txRate = TxRates(_initial.RateHz).FirstOrDefault();
+        InitTxState(s =>
+        {
+            s.CenterHz = 100_000_000;
+            s.LoHz = 100_000_000;
+            s.LoOffsetHz = 0;
+            s.RateHz = txRate;
+            s.GainDb = 0;
+            s.Antenna = "TX/RX";
+        }, txRate);
         _generator = new Thread(Generate) { IsBackground = true, Name = "SimRadio", Priority = ThreadPriority.AboveNormal };
         _generator.Start();
         Log($"synthetic radio: {_scene.Length} signals, noise {_noiseDbfs} dBFS, {_initial.RateHz:0} S/s" +
-            (SettleMs > 0 ? $"; a change takes effect {SettleMs} ms after it is asked for (--sim-settle-ms)" : ""));
+            (SettleMs > 0 ? $"; a change takes effect {SettleMs} ms after it is asked for (--sim-settle-ms)" : "") +
+            $"; it transmits into itself with a coupling of {TxCouplingDb} dB");
+    }
+
+    // ------------------------------------------------------------ the transmitter (section 9.17 P4-b)
+
+    /// <summary>The TX rates admitted at <paramref name="wideRateHz"/>: the rules the UHD backend applies
+    /// to UHD's own answers, fed the ports of those answers (the DUC's host rates at the clock UHD's
+    /// automatic selection would choose).</summary>
+    private static double[] TxRates(double wideRateHz)
+    {
+        double tick = TxRatePlan.ModelTickHz(wideRateHz);
+        return TxRatePlan.Admitted(TxRatePlan.DucHostRates(tick), tick, wideRateHz);
+    }
+
+    protected override TxCaps? RadioTxCaps()
+    {
+        double wide = WideRateHz;
+        double[] rates = TxRates(wide);
+        if (rates.Length == 0) return null;
+        return new TxCaps
+        {
+            FreqMinHz = 50_000_000,
+            FreqMaxHz = 6_000_000_000,
+            GainMinDb = 0,
+            GainMaxDb = TxGainMaxDb,
+            GainStepDb = TxGainStepDb,
+            RatesHz = rates,
+            Antennas = new[] { "TX/RX" },
+            MaxMs = 0,              // the server's ceiling
+            QuantumSamples = 0,     // not stated: the synthetic radio has no transport packet
+            MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(TxRatePlan.ModelTickHz(wide), rates),
+            Sources = new[] { TxSourceKinds.Iq, TxSourceKinds.Tone },
+            Modulations = Array.Empty<string>(),
+            ModulatingWaveforms = Array.Empty<string>(),
+        };
+    }
+
+    // The synthetic DUC is exact: an admitted rate is read back as asked.
+    protected override double ApplyTxRate(double hz) => hz;
+
+    protected override double ApplyTxGain(double db)
+    {
+        double eff = Math.Clamp(Math.Round(db / TxGainStepDb) * TxGainStepDb, 0, TxGainMaxDb);
+        Volatile.Write(ref _txGainDb, eff);
+        return eff;
+    }
+
+    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz) => (centerHz, centerHz + loOffsetHz);
+
+    protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open)
+    {
+        long lo = GetTxState().LoHz;
+        double reach = TxRatePlan.DspReachHz(TxRatePlan.ModelTickHz(WideRateHz), open.Grant.RateHz);
+        return Math.Abs(centerHz - lo) <= reach
+            ? (centerHz, lo, TxWords.RetuneDsp)
+            : (centerHz, centerHz + loOffsetHz, TxWords.RetuneRf);
+    }
+
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant)
+    {
+        if (!TxRules.DividesWideRate(grant.RateHz, WideRateHz))
+            throw new ShackLinkUsrp.Server.RadioRefusal(ErrorCodes.OutOfRange,
+                $"the TX rate {grant.RateHz:0} S/s does not divide the wide rate {WideRateHz:0} S/s");
+        var t = new SimTransmission(this, request, grant);
+        Volatile.Write(ref _simTx, t);
+        return t;
     }
 
     protected override void CloseRadio()
@@ -116,7 +211,23 @@ internal sealed class SimBackend : RadioBackendBase
     }
 
     protected override long ApplyLo(long hz) { Schedule(s => s with { LoHz = hz }); return hz; }
-    protected override double ApplyRate(double hz) { Schedule(s => s with { RateHz = hz }); return hz; }
+    protected override double ApplyRate(double hz)
+    {
+        // As the UHD backend does: a TX rate that no longer divides the wide rate is moved to the lowest
+        // one the new rate admits (no transmission is open - the server refuses set_rate under one).
+        double txRate = GetTxState().RateHz;
+        if (txRate > 0 && !TxRules.DividesWideRate(txRate, hz))
+        {
+            double moved = TxRates(hz).FirstOrDefault();
+            if (moved > 0)
+            {
+                InitTxState(s => s.RateHz = moved, moved);
+                Log($"TX rate moved from {txRate:0} to {moved:0} S/s: {txRate:0} does not divide the new wide rate {hz:0} S/s");
+            }
+        }
+        Schedule(s => s with { RateHz = hz });
+        return hz;
+    }
     protected override double ApplyGain(double db) { Schedule(s => s with { GainDb = db, Agc = false }); return db; }
     protected override void ApplyAgc(bool on) => Schedule(s => s with { Agc = on });
     // Antenna and bandwidth change nothing the synthetic scene models, but they are radio changes all
@@ -154,7 +265,9 @@ internal sealed class SimBackend : RadioBackendBase
 
     protected override JsonObject RadioTelemetry() => new JsonObject()
         .Set("kind", "sim").Set("blocks", Interlocked.Read(ref _blocks)).Set("behind_ms", Interlocked.Read(ref _behindMs))
-        .Set("settle_ms", SettleMs);
+        .Set("settle_ms", SettleMs)
+        .Set("tx_coupling_db", TxCouplingDb)
+        .Set("tx_gain_db", Volatile.Read(ref _txGainDb));
 
     private void Generate()
     {
@@ -193,7 +306,10 @@ internal sealed class SimBackend : RadioBackendBase
         {
             if (FaultAfterMs > 0 && clock.ElapsedMilliseconds >= FaultAfterMs)
             {
-                Fault($"the synthetic radio faulted on purpose {FaultAfterMs} ms after it started streaming (--sim-fault-after)");
+                string why = $"the synthetic radio faulted on purpose {FaultAfterMs} ms after it started streaming (--sim-fault-after)";
+                // The transmitter lets go first, on this thread - nothing else will ever consume its samples.
+                Volatile.Read(ref _simTx)?.RadioStopped(why, produced);
+                Fault(why);
                 return;
             }
             int n = Block;
@@ -252,6 +368,17 @@ internal sealed class SimBackend : RadioBackendBase
                 pi[k] = q / mag;
                 modPhase[k] = mp % (2 * Math.PI);
             }
+            // What this radio is transmitting, heard by its own receiver (section 9.17 P4-b): its samples
+            // are taken here, at the TX rate against this clock, so this thread is its DAC.
+            var tx = Volatile.Read(ref _simTx);
+            if (tx != null)
+            {
+                if (tx.IsFinished)
+                    Interlocked.CompareExchange(ref _simTx, null, tx);
+                else
+                    tx.Mix(acc, n, lo, rate, 32767.0 * Math.Pow(10, (Volatile.Read(ref _txGainDb) + TxCouplingDb) / 20.0) * gain, produced);
+            }
+
             int start = (int)(Uniform() * (NoiseLen - Block)) * 2;
             for (int i = 0; i < n * 2; i++)
                 iq[i] = (short)Math.Clamp(Math.Round(acc[i] + noise[start + i] * noiseAmp), -32768, 32767);
@@ -273,5 +400,6 @@ internal sealed class SimBackend : RadioBackendBase
                 Interlocked.Exchange(ref _behindMs, (long)((now - due) * 1000));
             }
         }
+        Volatile.Read(ref _simTx)?.RadioStopped("the synthetic radio closed under the transmission", produced);
     }
 }

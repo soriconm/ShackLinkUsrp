@@ -5,7 +5,10 @@ through UHD and serves derived products over TCP to any number of clients:
 
 - **panoramas** — the full instantaneous span as integrated power-spectrum rows, per-client geometry;
 - **leases** — narrow IQ channels cut out of the wide stream by a per-lease DDC;
-- **events** — state changes, dropped leases, radio faults.
+- **events** — state changes, dropped leases, radio faults;
+- **transmit** — IQ a client streams to it, or a tone it generates itself, under a TX owner separate
+  from the LO owner, with a cap, a starvation limit and a drain that ends on the radio's own
+  acknowledgement (ShackLink `docs/usrp_b210_support.md` §9.17–§9.18; AM / FM and a stepped sweep follow).
 
 Clients today are ShackLink (the SDR server) and the RF Bench Analyser. They speak the protocol
 through the MIT-licensed `ShackLinkUsrp.Protocol` library, which lives in the ShackLink repository
@@ -23,7 +26,7 @@ separate program: clients talk to it over a socket and link none of it.
 |---|---|
 | `src/ShackLinkUsrp` | the executable: protocol server + radio backend + DSP pipelines |
 | `src/ShackLinkUsrp.Uhd` | the UHD C API binding (`uhd.h`) |
-| `src/ShackLinkUsrp.Dsp` | the wide-stream ring, panorama FFT and DDC leases |
+| `src/ShackLinkUsrp.Dsp` | the wide-stream ring, panorama FFT, DDC leases, and the transmitter's generators and interpolator |
 | `src/ShackLinkUsrp.UhdProbe` | an instrument: drives the binding against a real radio and prints what it measured |
 | `tests/ShackLinkUsrp.Tests` | the gate (exit 0/1) |
 
@@ -40,9 +43,25 @@ dotnet build ShackLinkUsrp.sln -c Release
 
 ```
 ShackLinkUsrp.exe --serial <serial> [--uhd <dir>] [--rate 10e6] [--linger 10]
-ShackLinkUsrp.exe --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>]
+ShackLinkUsrp.exe --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>]
 ShackLinkUsrp.exe --list
 ```
+
+Either radio also takes `--tx-max-ms <ms>` (the ceiling on any transmission, default one hour) and
+`--tx-starve-ms <ms>` (a keyed IQ transmission fed nothing that long is ended, default 500). The sidecar
+never transmits on its own: nothing on its command line or in any file starts a transmission.
+
+**The synthetic radio transmits into itself.** Its generator thread is its DAC: it takes a transmission's
+samples at the TX rate against the same clock that paces its receive stream, and adds them to what it
+receives at the TX frequency, at `L + G + coupling` dBFS for a sample at L dBFS sent at a TX gain of G
+(coupling −80 dB unless `--sim-tx-coupling` says otherwise; its telemetry states it). A gate sees the
+transmission in the panorama, and nothing anywhere radiated.
+
+**On a real B2xx** the TX chain is set up as the radio opens, before the receiver streams: an admitted TX
+rate (one that divides the wide rate, so a transmission never moves the master clock under the receiver)
+is set first, and one TX streamer is made and freed to prove the chain and read UHD's quantum. Nothing is
+sent. Each transmission then gets its own streamer, driven by ONE thread — UHD's C API writes a streamer's
+error string on every call, so its sends and its acknowledgement poll must not be split across threads.
 
 A sidecar lives as long as its clients: it exits `--linger` seconds after the last one leaves, at once
 when its radio is in a fault (a fault is terminal; only a fresh sidecar opens the radio again), and

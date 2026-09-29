@@ -41,6 +41,24 @@ public enum UhdRxErrorCode
     BadPacket = 0xF,
 }
 
+/// <summary>uhd_async_metadata_event_code_t (uhd/types/metadata.h): what a TX streamer's async
+/// channel reports. A bit set, though UHD sends one code per message.</summary>
+[Flags]
+public enum UhdAsyncEventCode
+{
+    None = 0x0,
+    /// <summary>The end-of-burst was transmitted: the last sample left the radio.</summary>
+    BurstAck = 0x1,
+    /// <summary>The radio ran out of samples mid-burst (it sends zeros until more arrive).</summary>
+    Underflow = 0x2,
+    /// <summary>Packets were lost between the host and the radio.</summary>
+    SeqError = 0x4,
+    TimeError = 0x8,
+    UnderflowInPacket = 0x10,
+    SeqErrorInBurst = 0x20,
+    UserPayload = 0x40,
+}
+
 /// <summary>
 /// Raw P/Invoke over UHD's C API (uhd.h). Every declaration here was read against the installed
 /// UHD 4.11.0.0 headers (C:\Program Files\UHD\include\uhd\...) and the 4.10 source tree
@@ -191,6 +209,42 @@ internal static unsafe class UhdNative
         Off<uhd_stream_cmd_t>(nameof(uhd_stream_cmd_t.time_spec_full_secs), 24);
         Off<uhd_stream_cmd_t>(nameof(uhd_stream_cmd_t.time_spec_frac_secs), 32);
 
+        return problems.Count == 0 ? "" : string.Join("; ", problems);
+    }
+
+    /// <summary>
+    /// The TX metadata is the one TX type that is not a struct: <c>uhd_tx_metadata_make</c> takes its
+    /// flags BY VALUE as C++ <c>bool</c>s and there is no setter afterwards (metadata_c.cpp), so a
+    /// mis-marshalled flag would silently send a burst with no end - the amplifier held on. Asserted at
+    /// load the only way a by-value parameter can be: make one of each shape and read every flag back
+    /// through UHD's own getters. "" = sound.
+    /// </summary>
+    internal static string TxMetadataProblem()
+    {
+        var problems = new List<string>();
+        foreach (var (sob, eob) in new[] { (true, false), (false, true), (false, false), (true, true) })
+        {
+            IntPtr md = IntPtr.Zero;
+            UhdError e = uhd_tx_metadata_make(&md, 0, 0, 0.0, sob ? (byte)1 : (byte)0, eob ? (byte)1 : (byte)0);
+            if (e != UhdError.None || md == IntPtr.Zero)
+            {
+                problems.Add($"uhd_tx_metadata_make(sob={sob}, eob={eob}) failed: {e}");
+                continue;
+            }
+            try
+            {
+                byte has, s, en;
+                uhd_tx_metadata_has_time_spec(md, &has);
+                uhd_tx_metadata_start_of_burst(md, &s);
+                uhd_tx_metadata_end_of_burst(md, &en);
+                if (has != 0 || (s != 0) != sob || (en != 0) != eob)
+                    problems.Add($"a TX metadata made with sob={sob}, eob={eob}, no time spec reads back sob={s}, eob={en}, has_time_spec={has}");
+            }
+            finally
+            {
+                uhd_tx_metadata_free(&md);
+            }
+        }
         return problems.Count == 0 ? "" : string.Join("; ", problems);
     }
 
@@ -410,6 +464,113 @@ internal static unsafe class UhdNative
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern UhdError uhd_rx_metadata_last_error(IntPtr h, byte* error_out, nuint strbuffer_len);
+
+    // ---------------------------------------------------------------- usrp/usrp.h: TX chain
+    // docs/usrp_b210_support.md section 9.17 P4-b. Same parameter-order trap as the RX siblings: each
+    // line is copied from usrp.h (set_tx_gain: gain, chan, name; get_tx_gain: chan, name, out;
+    // get_tx_gain_range: name, chan, out).
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_num_channels(IntPtr h, nuint* num_channels_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_set_tx_rate(IntPtr h, double rate, nuint chan);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_rate(IntPtr h, nuint chan, double* rate_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_rates(IntPtr h, nuint chan, IntPtr rates_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_set_tx_freq(IntPtr h, uhd_tune_request_t* tune_request, nuint chan, uhd_tune_result_t* tune_result);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_freq(IntPtr h, nuint chan, double* freq_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_freq_range(IntPtr h, nuint chan, IntPtr freq_range_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_set_tx_gain(IntPtr h, double gain, nuint chan, byte* gain_name);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_gain(IntPtr h, nuint chan, byte* gain_name, double* gain_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_gain_range(IntPtr h, byte* name, nuint chan, IntPtr gain_range_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_antenna(IntPtr h, nuint chan, byte* ant_out, nuint strbuffer_len);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_antennas(IntPtr h, nuint chan, IntPtr* antennas_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_usrp_get_tx_stream(IntPtr h, uhd_stream_args_t* stream_args, IntPtr h_out);
+
+    // ---------------------------------------------------------------- usrp/usrp.h: TX streamer
+    // usrp_c.cpp wraps every call below in UHD_SAFE_C_SAVE_ERROR(h, ...), which WRITES the handle's
+    // std::string last_error on every call, success included - so two threads calling into ONE TX
+    // streamer race on that string. UhdTxStreamer is therefore driven by one thread only: its send
+    // and its async-message poll are the same thread's calls (UHD's own examples use a second thread
+    // for recv_async_msg; through the C API that is a data race).
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_streamer_make(IntPtr* h);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_streamer_free(IntPtr* h);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_streamer_max_num_samps(IntPtr h, nuint* max_num_samps_out);
+
+    /// <summary><c>buffs</c> is const void** (one pointer per channel) and <c>md</c> a POINTER TO the
+    /// metadata handle - both straight from usrp.h, as for recv.</summary>
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_streamer_send(IntPtr h, void** buffs, nuint samps_per_buff, IntPtr* md, double timeout, nuint* items_sent);
+
+    /// <summary><c>valid</c> is a C++ <c>bool*</c>: one byte.</summary>
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_streamer_recv_async_msg(IntPtr h, IntPtr* md, double timeout, byte* valid);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_streamer_last_error(IntPtr h, byte* error_out, nuint strbuffer_len);
+
+    // ---------------------------------------------------------------- types/metadata.h: TX and async
+
+    /// <summary>The flags are C++ <c>bool</c>s passed BY VALUE (one byte each; x64 passes them in a
+    /// register and the callee reads the low byte) - asserted at load by <see cref="TxMetadataProblem"/>.</summary>
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_metadata_make(IntPtr* handle, byte has_time_spec, long full_secs, double frac_secs, byte start_of_burst, byte end_of_burst);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_metadata_free(IntPtr* handle);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_metadata_has_time_spec(IntPtr h, byte* result_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_metadata_start_of_burst(IntPtr h, byte* result_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_tx_metadata_end_of_burst(IntPtr h, byte* result_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_async_metadata_make(IntPtr* handle);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_async_metadata_free(IntPtr* handle);
+
+    /// <summary>The out-parameter is uhd_async_metadata_event_code_t, an MSVC enum: 4 bytes.</summary>
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_async_metadata_event_code(IntPtr h, int* event_code_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_async_metadata_has_time_spec(IntPtr h, byte* result_out);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern UhdError uhd_async_metadata_time_spec(IntPtr h, long* full_secs_out, double* frac_secs_out);
 
     // ---------------------------------------------------------------- string helpers
 
