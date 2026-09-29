@@ -46,3 +46,21 @@ ShackLinkUsrp.exe --list
 
 UHD is not bundled. By default the Ettus install (`C:\Program Files\UHD\bin`) is used; `--uhd <dir>`
 loads `uhd.dll` from another directory.
+
+## A diagnostic UHD for a board with a known CODEC fault
+
+Stock UHD refuses a B2xx whose AD936x CODEC loopback self-test fails, as it should. The
+OpenSourceSDRLab clone this was developed on has a defective RX D8 line and fails that test, so its
+bring-up used a UHD v4.8.0.0 built from source with `patches/uhd-4.8-b210-codec-loopback.patch`:
+the loopback failure becomes a warning when `UHD_B200_IGNORE_CODEC_LOOPBACK=1`, plus the build fixes
+a modern MSVC / libusb / Boost toolchain needs. `--allow-known-codec-fault` sets that variable in the
+sidecar's own environment before `uhd.dll` loads, and `--uhd <dir>` points at the patched build:
+
+```
+ShackLinkUsrp.exe --serial <serial> --uhd C:\Dev\USRP_B210\uhd-4.8-soapy-diagnostic --allow-known-codec-fault
+```
+
+A stock UHD ignores the variable. **A board opened this way proves plumbing only — its samples are
+not trustworthy for any level or spectral measurement.** The patch is GPL-3.0-or-later like the UHD
+source it modifies; it lived in the ShackLink repository's `tools\` while ShackLink still had an
+in-process SoapyUHD bench path, and moved here when that path was deleted (2026-09-28).

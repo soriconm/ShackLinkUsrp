@@ -27,8 +27,8 @@ public sealed record UhdLoadOptions
     public string? UhdDirectory { get; init; }
 
     /// <summary>Sets UHD_B200_IGNORE_CODEC_LOOPBACK=1 - honoured ONLY by the patched diagnostic
-    /// build, and only meaningful for a board with the known RX D8 fault. The stock UHD ignores
-    /// it and refuses such a board, as it should.</summary>
+    /// build (<c>patches/uhd-4.8-b210-codec-loopback.patch</c>), and only meaningful for a board
+    /// with the known RX D8 fault. The stock UHD ignores it and refuses such a board, as it should.</summary>
     public bool AllowKnownCodecFault { get; init; }
 
     /// <summary>UHD_IMAGES_DIR. Null = keep an inherited value, else the Ettus install's images.</summary>

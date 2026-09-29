@@ -1,0 +1,90 @@
+diff --git a/host/cmake/Modules/UHDBoost.cmake b/host/cmake/Modules/UHDBoost.cmake
+index e8c0aae..84ef195 100644
+--- a/host/cmake/Modules/UHDBoost.cmake
++++ b/host/cmake/Modules/UHDBoost.cmake
+@@ -277,8 +277,8 @@ else()
+     # Boost 1.70.0's find cmake scripts don't always set the expected
+     # return variables. Replicate the commit that fixes that issue here:
+     # https://github.com/boostorg/boost_install/commit/cfa8d55250dfc2635e907e42da423e4eb540dee5
+-    if(Boost_FOUND AND (${Boost_VERSION} VERSION_EQUAL 1.70.0))
+-        message(STATUS "  Enabling possible Boost 1.70.0 Fixes")
++    if(Boost_FOUND AND ((${Boost_VERSION} VERSION_EQUAL 1.70.0) OR TARGET Boost::thread))
++        message(STATUS "  Enabling Boost CMake target compatibility fixes")
+ 
+         # FindBoost compatibility variables: Boost_LIBRARIES, Boost_<C>_LIBRARY
+         if(NOT Boost_LIBRARIES OR "${Boost_LIBRARIES}" STREQUAL "")
+diff --git a/host/lib/rfnoc/ctrlport_endpoint.cpp b/host/lib/rfnoc/ctrlport_endpoint.cpp
+index 436b46b..ceb3b72 100644
+--- a/host/lib/rfnoc/ctrlport_endpoint.cpp
++++ b/host/lib/rfnoc/ctrlport_endpoint.cpp
+@@ -9,6 +9,7 @@
+ #include <uhd/utils/log.hpp>
+ #include <uhdlib/rfnoc/chdr_packet_writer.hpp>
+ #include <uhdlib/rfnoc/ctrlport_endpoint.hpp>
++#include <chrono>
+ #include <condition_variable>
+ #include <boost/optional.hpp>
+ #include <deque>
+diff --git a/host/lib/rfnoc/rfnoc_rx_streamer.cpp b/host/lib/rfnoc/rfnoc_rx_streamer.cpp
+index 0ef1b2a..3a6ab67 100644
+--- a/host/lib/rfnoc/rfnoc_rx_streamer.cpp
++++ b/host/lib/rfnoc/rfnoc_rx_streamer.cpp
+@@ -9,6 +9,7 @@
+ #include <uhdlib/rfnoc/node_accessor.hpp>
+ #include <uhdlib/rfnoc/rfnoc_rx_streamer.hpp>
+ #include <atomic>
++#include <chrono>
+ #include <thread>
+ 
+ using namespace std::chrono_literals;
+diff --git a/host/lib/transport/libusb1_base.hpp b/host/lib/transport/libusb1_base.hpp
+index d220c44..06b5af2 100644
+--- a/host/lib/transport/libusb1_base.hpp
++++ b/host/lib/transport/libusb1_base.hpp
+@@ -11,6 +11,11 @@
+ #include <uhd/config.hpp>
+ #include <uhd/transport/usb_device_handle.hpp>
+ #include <uhd/utils/noncopyable.hpp>
++#ifdef _WIN32
++// libusb 1.0.30 declares APIs with struct timeval, but its MSVC header no
++// longer supplies that Winsock type itself.
++#    include <winsock2.h>
++#endif
+ #include <libusb.h>
+ #include <boost/format.hpp>
+ #include <memory>
+diff --git a/host/lib/usrp/common/ad936x_manager.cpp b/host/lib/usrp/common/ad936x_manager.cpp
+index 97ea601..f01ba56 100644
+--- a/host/lib/usrp/common/ad936x_manager.cpp
++++ b/host/lib/usrp/common/ad936x_manager.cpp
+@@ -10,6 +10,7 @@
+ #include <boost/functional/hash.hpp>
+ #include <chrono>
+ #include <cmath>
++#include <cstdlib>
+ #include <list>
+ #include <memory>
+ #include <string>
+@@ -120,10 +121,18 @@ public:
+             // Compare TX and RX values to test word
+             const bool test_fail = word32 != rb_tx or word32 != rb_rx;
+             if (test_fail) {
+-                UHD_LOGGER_ERROR("AD936X")
+-                    << "CODEC loopback test failed! "
+-                    << boost::format("Expected: 0x%08X Received (TX/RX): 0x%08X/0x%08X")
+-                           % word32 % rb_tx % rb_rx;
++                const std::string details = str(
++                    boost::format(
++                        "CODEC loopback test failed! Expected: 0x%08X Received "
++                        "(TX/RX): 0x%08X/0x%08X")
++                    % word32 % rb_tx % rb_rx);
++                const char* ignore_failure = std::getenv("UHD_B200_IGNORE_CODEC_LOOPBACK");
++                if (ignore_failure != nullptr && std::string(ignore_failure) == "1") {
++                    UHD_LOGGER_WARNING("AD936X")
++                        << details << "; continuing for diagnostics only.";
++                    break;
++                }
++                UHD_LOGGER_ERROR("AD936X") << details;
+                 throw uhd::runtime_error("CODEC loopback test failed.");
+             }
+         }
