@@ -45,6 +45,12 @@ internal sealed class SimBackend : RadioBackendBase
     private long _behindMs;
     private long _blocks;
 
+    /// <summary>A test hook (<c>--sim-fault-after</c>): fault this many milliseconds after the radio
+    /// starts streaming, the way a real one dies - the samples stop and the state says why in words,
+    /// until the process ends. 0 = never. It is how a gate reaches the fault paths (the idle rule
+    /// among them, ShackLink docs/usrp_b210_support.md 9.11 finding 1) without a failing board.</summary>
+    public int FaultAfterMs { get; init; }
+
     public SimBackend(SidecarLog log, string name, double wideRateHz, long loHz = 100_000_000, double noiseDbfs = -65)
         : base(log,
                new RadioInfo { Serial = "sim-" + name, Product = "Synthetic B210", Name = name, Source = RadioSources.Sim },
@@ -142,6 +148,11 @@ internal sealed class SimBackend : RadioBackendBase
 
         while (!_stop)
         {
+            if (FaultAfterMs > 0 && clock.ElapsedMilliseconds >= FaultAfterMs)
+            {
+                Fault($"the synthetic radio faulted on purpose {FaultAfterMs} ms after it started streaming (--sim-fault-after)");
+                return;
+            }
             long lo;
             double rate, gainDb;
             lock (_radioLock)

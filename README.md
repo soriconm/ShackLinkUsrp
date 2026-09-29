@@ -40,9 +40,14 @@ dotnet build ShackLinkUsrp.sln -c Release
 
 ```
 ShackLinkUsrp.exe --serial <serial> [--uhd <dir>] [--rate 10e6] [--linger 10]
-ShackLinkUsrp.exe --sim [--sim-name <name>]
+ShackLinkUsrp.exe --sim [--sim-name <name>] [--sim-fault-after <ms>]
 ShackLinkUsrp.exe --list
 ```
+
+A sidecar lives as long as its clients: it exits `--linger` seconds after the last one leaves, at once
+when its radio is in a fault (a fault is terminal; only a fresh sidecar opens the radio again), and
+never with `--persist`. `--sim-fault-after` makes the synthetic radio fault on cue, for tests of those
+paths.
 
 UHD is not bundled. By default the Ettus install (`C:\Program Files\UHD\bin`) is used; `--uhd <dir>`
 loads `uhd.dll` from another directory.

@@ -51,7 +51,7 @@ internal static class Program
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
 
         RadioBackendBase backend = opt.Sim
-            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz)
+            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs }
             : new UhdBackend(log, new UhdBackendOptions
             {
                 Serial = opt.Serial!,
@@ -185,7 +185,8 @@ internal static class Program
 internal sealed class SidecarOptions
 {
     public const string Usage =
-        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] | --list\n" +
+        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] [--sim-fault-after <ms>] | --list\n" +
+        "  --sim-fault-after <ms>      (tests) the synthetic radio faults this long after it starts streaming\n" +
         "  --uhd <dir>                 load uhd.dll from <dir> (default: C:\\Program Files\\UHD\\bin)\n" +
         "  --images <dir>              UHD_IMAGES_DIR (default: the Ettus install's images)\n" +
         "  --fpga <path>               FPGA image for a clone board\n" +
@@ -207,6 +208,7 @@ internal sealed class SidecarOptions
     public string? Serial;
     public bool Sim;
     public string SimName = UsrpAddress.DefaultSimName;
+    public int SimFaultAfterMs;
     public bool List;
     public bool Help;
     public string? UhdDirectory;
@@ -243,6 +245,7 @@ internal sealed class SidecarOptions
                 case "--serial": o.Serial = Next(); break;
                 case "--sim": o.Sim = true; break;
                 case "--sim-name": o.SimName = Next(); break;
+                case "--sim-fault-after": o.SimFaultAfterMs = Int(a, Next()); break;
                 case "--list": o.List = true; break;
                 case "--help": case "-h": case "/?": o.Help = true; break;
                 case "--uhd": o.UhdDirectory = Next(); break;
@@ -280,6 +283,8 @@ internal sealed class SidecarOptions
         if (!o.Help && !o.List)
         {
             if (o.Sim == (o.Serial != null)) throw new ArgumentException("give exactly one of --serial <serial> or --sim");
+            if (o.SimFaultAfterMs > 0 && !o.Sim)
+                throw new ArgumentException("--sim-fault-after is for the synthetic radio (--sim); a real radio faults on its own");
             try
             {
                 if (o.Sim) UsrpAddress.Sim(o.SimName);

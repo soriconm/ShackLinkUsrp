@@ -40,6 +40,8 @@ internal static class Program
         Run("in process: a lease on the synthetic radio", InProcessLease);
         Run("in process: panorama, sweep, retune, rate change", InProcessPanorama);
         Run("spawned: the real executable, joined, then left to exit", SpawnJoinExit);
+        Run("command line: the synthetic radio's fault hook", FaultHookOptions);
+        Run("spawned: a radio in a fault ends its sidecar when its last client leaves", SpawnFaultExit);
 
         try { Directory.Delete(_temp, true); } catch { }
         Console.WriteLine();
@@ -533,5 +535,80 @@ internal static class Program
         string logPath = Rendezvous.LogPathFor("sim-" + name);
         Check(File.Exists(logPath) && File.ReadAllText(logPath).Contains("stopping: the last client left"),
               "its log says why it stopped");
+    }
+
+    private static void FaultHookOptions()
+    {
+        Check(SidecarOptions.Parse(new[] { "--sim", "--sim-fault-after", "1500" }).SimFaultAfterMs == 1500,
+              "--sim-fault-after takes milliseconds");
+        Check(SidecarOptions.Parse(new[] { "--sim" }).SimFaultAfterMs == 0, "...and is off unless given");
+        string? why = null;
+        try { SidecarOptions.Parse(new[] { "--serial", "KO6ETZB", "--sim-fault-after", "10" }); }
+        catch (ArgumentException ex) { why = ex.Message; }
+        Check(why != null && why.Contains("--sim"), $"...and is refused on a real radio, in words ({why})");
+    }
+
+    /// <summary>
+    /// ShackLink docs/usrp_b210_support.md 9.11 finding 1, on the real executable: a radio in a
+    /// fault stays in it until the process ends, so a sidecar with no client left serves nobody.
+    /// Lingering made the next two restart attempts join it, read the old fault and restart the
+    /// linger by leaving. The linger here is 30 s, so an exit within seconds is the fault rule.
+    /// </summary>
+    private static void SpawnFaultExit()
+    {
+        string exe = SidecarExe();
+        string stateDir = Rendezvous.Root;
+        string name = "fault" + Environment.ProcessId;
+        var opts = new UsrpSessionOptions
+        {
+            ClientName = "spawner",
+            SidecarExe = exe,
+            Launch = new SidecarLaunch { LingerSeconds = 30, ExtraArgs = new[] { "--state-dir", stateDir, "--sim-fault-after", "1500" } },
+        };
+        var addr = UsrpAddress.Sim(name);
+        string logPath = Rendezvous.LogPathFor("sim-" + name);
+
+        var a = UsrpSession.Open(addr, opts);
+        int pid = a.SidecarPid;
+        Check(a.Spawned && a.WaitReady(5000) == RadioStates.Ready, $"the spawned synthetic radio is ready (pid {pid})");
+        var ev = a.OpenEvents();
+        string? faultText = null;
+        var faulted = new ManualResetEventSlim();
+        ev.Connection.EventReceived += (c, n, body) =>
+        {
+            if (n != EventNames.RadioFault) return;
+            faultText = body.GetString("text", "");
+            faulted.Set();
+        };
+        ev.Connection.StartReader();
+        Check(faulted.Wait(8000) && faultText != null && faultText.Contains("--sim-fault-after"),
+              $"the radio faults on cue and says so on the event feed ({faultText})");
+        Check(a.GetState().Readiness == RadioStates.Fault, "...and its state reads fault");
+        Thread.Sleep(1200);
+        Check(Rendezvous.IsProcessAlive(pid), "a faulted sidecar stays while a client is connected - that client can still read the fault");
+
+        ev.Dispose();
+        var sw = Stopwatch.StartNew();
+        a.Dispose();
+        bool gone = WaitFor(() => !Rendezvous.IsProcessAlive(pid), 12000);
+        long exitMs = sw.ElapsedMilliseconds;
+        Check(gone && exitMs < 5000, $"its last client leaving ends it at once: exited {exitMs} ms later, against a 30 s linger");
+        Check(!File.Exists(Rendezvous.PathFor("sim-" + name)), "...and removes its rendezvous file");
+        Check(File.Exists(logPath) && File.ReadAllText(logPath).Contains("stopping: the radio is in a fault and no client is connected"),
+              "its log says why it stopped");
+
+        // The next open - an auto-restart's - spawns a fresh sidecar instead of joining the dead one.
+        // That one is left healthy and lingering; its own fault then ends it with nobody connected.
+        int pid2;
+        using (var b = UsrpSession.Open(addr, opts))
+        {
+            pid2 = b.SidecarPid;
+            Check(b.Spawned && pid2 != pid && b.WaitReady(5000) == RadioStates.Ready,
+                  $"the next open spawns a fresh sidecar (pid {pid2}, was {pid}) whose radio is ready");
+        }
+        Check(WaitFor(() => !Rendezvous.IsProcessAlive(pid2), 12000),
+              "a radio that faults while its sidecar lingers with nobody connected ends it too, well inside the 30 s linger");
+        Check(File.Exists(logPath) && File.ReadAllText(logPath).Contains("stopping: the radio is in a fault and no client is connected"),
+              "...and says so");
     }
 }
