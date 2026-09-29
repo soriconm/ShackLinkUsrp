@@ -32,7 +32,11 @@
          configuration: every Release sidecar shipped the Debug library, JIT optimizer off (ShackLink
          docs/usrp_b210_support.md 9.11 item 8). Keeping them makes it the parent's configuration; its
          platform is pinned to AnyCPU on the reference itself, so it lands in the same
-         bin\(cfg)\netstandard2.0\ as ShackLink's own build. The gate reads both DebuggableAttributes. -->
+         bin\(cfg)\netstandard2.0\ as ShackLink's own build. The gate reads both DebuggableAttributes.
+         EVERY project here that reaches the library must reference it DIRECTLY, pin and all: one that
+         reaches it only transitively (through the exe) gets no metadata, so it arrives with different
+         global properties (x64 in this solution's build) and builds a SECOND instance - the CRTU200
+         session measured exactly that in its tree. Today both consumers are direct: one instance. -->
     <ShouldUnsetParentConfigurationAndPlatform>false</ShouldUnsetParentConfigurationAndPlatform>
   </PropertyGroup>
 </Project>
