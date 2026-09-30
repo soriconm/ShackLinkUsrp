@@ -120,27 +120,30 @@ internal sealed class UhdBackend : RadioBackendBase
         if (_opt.AllowKnownCodecFault)
             Log("KNOWN-FAULT OPT-IN: the CODEC loopback test is bypassed; this board's receive samples are NOT trustworthy for measurement.");
 
-        var found = UhdUsrp.Find($"type=b200,serial={_opt.Serial}");
-        if (found.Count == 0)
-        {
-            var any = UhdUsrp.Find("type=b200");
-            throw new InvalidOperationException(any.Count == 0
-                ? $"no B2xx is attached (UHD found none); is serial {_opt.Serial} plugged into a USB 3 port?"
-                : $"no B2xx with serial {_opt.Serial} is attached; UHD sees: {string.Join(" | ", any)}");
-        }
-        if (found.Count > 1)
-            throw new InvalidOperationException(
-                $"{found.Count} devices answer serial {_opt.Serial}; clones ship one EEPROM serial - re-serialise one with b2xx_fx3_utils (hazard 22)");
+        // The board is chosen HERE, by exact string, from an UNFILTERED find: UHD matches serials as
+        // hexadecimal numbers and cannot be asked for one that is not (UhdDeviceSelection, 9.20).
+        var found = UhdUsrp.Find("type=b200");
+        var plan = UhdDeviceSelection.Plan(_opt.Serial, found);
+        if (plan.Refused) throw new InvalidOperationException(plan.Refusal);
+        if (plan.Note.Length > 0) Log(plan.Note);
 
-        var args = $"type=b200,serial={_opt.Serial}";
+        var args = plan.Args;
         if (!string.IsNullOrWhiteSpace(_opt.FpgaPath)) args += $",fpga={_opt.FpgaPath}";
         if (!string.IsNullOrWhiteSpace(_opt.ExtraDeviceArgs)) args += "," + _opt.ExtraDeviceArgs;
         Log($"opening {args} (a cold board loads firmware and the bitstream first)");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var usrp = UhdUsrp.Open(args);
-        Log($"opened in {sw.Elapsed.TotalSeconds:0.0} s: {found[0]}");
+        Log($"opened in {sw.Elapsed.TotalSeconds:0.0} s");
 
         var info = usrp.GetRxInfo();
+        // Is it the board that was asked for? Checked whenever the board states a serial; REQUIRED when it was
+        // opened without one (another B2xx plugged in between the find and the open is the case this closes).
+        var wrongBoard = UhdDeviceSelection.OpenedSerialRefusal(_opt.Serial, info.MboardSerial, plan.MustConfirmSerial);
+        if (wrongBoard.Length > 0)
+        {
+            try { usrp.Dispose(); } catch { }
+            throw new InvalidOperationException(wrongBoard);
+        }
         Info = InfoFor(_opt,
                        string.IsNullOrEmpty(info.MboardSerial) ? _opt.Serial : info.MboardSerial,
                        string.IsNullOrEmpty(info.MboardId) ? "B2xx" : info.MboardId,
