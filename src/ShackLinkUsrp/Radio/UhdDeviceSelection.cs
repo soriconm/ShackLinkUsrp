@@ -98,7 +98,7 @@ internal static class UhdDeviceSelection
         if (mine == 0)
             return Refuse($"no B2xx with serial {serial} is attached; UHD sees: {string.Join(" | ", found!)}");
         if (mine > 1)
-            return Refuse($"{mine} devices answer serial {serial}; clones ship one EEPROM serial - re-serialise one with b2xx_fx3_utils (hazard 22)");
+            return Refuse($"{mine} devices answer serial {serial}; clones ship one EEPROM serial - {ReserialiseRemedy("one of them")} (hazard 22)");
 
         var others = serials.Where(s => !string.Equals(s, serial, StringComparison.Ordinal)).ToList();
         bool uhdReadsIt = UhdSerialsMatch(serial, serial);
@@ -115,8 +115,16 @@ internal static class UhdDeviceSelection
                 $"UHD cannot select serial {serial} by its serial: {rule}. It is the only B2xx attached, so it is opened " +
                 "as the only one and its serial is checked once it is open.", "");
         return Refuse($"UHD cannot select serial {serial} while another B2xx is attached ({string.Join(", ", others)}): {rule}. " +
-                      "Detach the other B2xx, or give this one a hexadecimal serial with b2xx_fx3_utils.");
+                      $"Detach the other B2xx, or {ReserialiseRemedy("this one")}.");
     }
+
+    /// <summary>What re-serialises a B2xx, in the words every refusal uses (ShackLink docs/usrp_b210_support.md
+    /// 9.26 F4). NOT b2xx_fx3_utils, which the earlier sentences named: its options are reset, firmware, FPGA
+    /// and bootloader only, and it cannot write a serial. usrp_burn_mb_eeprom opens the radio in full, so it
+    /// must be the only B2xx attached, and a board that fails the CODEC loopback test needs a UHD that bypasses it.</summary>
+    public static string ReserialiseRemedy(string whichBoard) =>
+        $"give {whichBoard} its own hexadecimal serial with UHD's usrp_burn_mb_eeprom --args type=b200 " +
+        "--values serial=<hex>, run with only that board attached";
 
     /// <summary>
     /// Is the board UHD opened the one that was asked for? "" when it is. The serial is the open radio's own

@@ -87,6 +87,10 @@ internal static partial class Program
         Run("9.20: UHD's serial rule, ported (hexadecimal numbers, not strings)", UhdSerialRuleCases);
         Run("9.20: which B2xx to open, and when to refuse", UhdOpenPlanCases);
         Run("9.20: the UHD open path, pinned in the source", UhdOpenSourceRules);
+        Run("9.26: --list's answer, from the bench's find strings", ListAnswerCases);
+        Run("9.26: the real executable's --list --json, down its no-UHD path", ListJsonSpawnCases);
+        Run("9.26: one UHD finder at a time - the device lock, taken for real", DeviceOpsLockCases);
+        Run("9.26: both finders hold the lock, pinned in the source", DeviceOpsLockSourceRules);
         Run("9.23 DS2: a ring aligned to the other side's position", RingAlignCases);
         Run("9.23 DS2: the NCO's phase is the radio position's", NcoAnchorCases);
         Run("9.23 DS2: both receive sides of the synthetic radio", SimTwoSides);

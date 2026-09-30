@@ -133,20 +133,27 @@ internal sealed class UhdBackend : RadioBackendBase
         if (_opt.AllowKnownCodecFault)
             Log("KNOWN-FAULT OPT-IN: the CODEC loopback test is bypassed; this board's receive samples are NOT trustworthy for measurement.");
 
-        // The board is chosen HERE, by exact string, from an UNFILTERED find: UHD matches serials as
-        // hexadecimal numbers and cannot be asked for one that is not (UhdDeviceSelection, 9.20).
-        var found = UhdUsrp.Find("type=b200");
-        var plan = UhdDeviceSelection.Plan(_opt.Serial, found);
-        if (plan.Refused) throw new InvalidOperationException(plan.Refusal);
-        if (plan.Note.Length > 0) Log(plan.Note);
+        // The find and the make hold the machine's ONE UHD device lock, so a catalogue's background find
+        // (--list) never meets this open half-way through a board's firmware load (9.26 D3).
+        UhdDeviceSelection.OpenPlan plan;
+        UhdUsrp usrp;
+        using (UhdDeviceOpsLock.Acquire(UhdDeviceOpsLock.DefaultWait, Log))
+        {
+            // The board is chosen HERE, by exact string, from an UNFILTERED find: UHD matches serials as
+            // hexadecimal numbers and cannot be asked for one that is not (UhdDeviceSelection, 9.20).
+            var found = UhdUsrp.Find("type=b200");
+            plan = UhdDeviceSelection.Plan(_opt.Serial, found);
+            if (plan.Refused) throw new InvalidOperationException(plan.Refusal);
+            if (plan.Note.Length > 0) Log(plan.Note);
 
-        var args = plan.Args;
-        if (!string.IsNullOrWhiteSpace(_opt.FpgaPath)) args += $",fpga={_opt.FpgaPath}";
-        if (!string.IsNullOrWhiteSpace(_opt.ExtraDeviceArgs)) args += "," + _opt.ExtraDeviceArgs;
-        Log($"opening {args} (a cold board loads firmware and the bitstream first)");
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var usrp = UhdUsrp.Open(args);
-        Log($"opened in {sw.Elapsed.TotalSeconds:0.0} s");
+            var args = plan.Args;
+            if (!string.IsNullOrWhiteSpace(_opt.FpgaPath)) args += $",fpga={_opt.FpgaPath}";
+            if (!string.IsNullOrWhiteSpace(_opt.ExtraDeviceArgs)) args += "," + _opt.ExtraDeviceArgs;
+            Log($"opening {args} (a cold board loads firmware and the bitstream first)");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            usrp = UhdUsrp.Open(args);
+            Log($"opened in {sw.Elapsed.TotalSeconds:0.0} s");
+        }
 
         var info = usrp.GetRxInfo();
         // Is it the board that was asked for? Checked whenever the board states a serial; REQUIRED when it was

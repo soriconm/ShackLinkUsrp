@@ -55,8 +55,10 @@ internal static partial class Program
         // Two boards, and UHD cannot tell them apart.
         p = UhdDeviceSelection.Plan("KO6ETZB", new[] { BenchFind, "type=b200,name=x,serial=30AD2D7,product=B210" });
         Check(p.Refused && p.Refusal.Contains("30AD2D7") && p.Refusal.Contains("not a hexadecimal number") &&
-              p.Refusal.Contains("Detach the other B2xx") && p.Refusal.Contains("b2xx_fx3_utils"),
-              "KO6ETZB beside another B2xx: REFUSED - a 'type=b200' open could take the other one: " + p.Refusal);
+              p.Refusal.Contains("Detach the other B2xx") && p.Refusal.Contains("usrp_burn_mb_eeprom --args type=b200 --values serial=<hex>") &&
+              !p.Refusal.Contains("b2xx_fx3_utils"),
+              "KO6ETZB beside another B2xx: REFUSED - a 'type=b200' open could take the other one - naming the tool that CAN " +
+              "re-serialise (b2xx_fx3_utils cannot, 9.26 F4): " + p.Refusal);
         p = UhdDeviceSelection.Plan("30AD2D7", new[] { "type=b200,serial=30AD2D7", "type=b200,serial=30AD2D7Z" });
         Check(p.Refused && p.Refusal.Contains("reads as the same number as '30AD2D7Z'"),
               "a hex serial beside one UHD reads as the same NUMBER: refused, naming it: " + p.Refusal);
@@ -67,8 +69,10 @@ internal static partial class Program
         p = UhdDeviceSelection.Plan("KO6ETZB", new[] { "type=b200,serial=30AD2D7" });
         Check(p.Refused && p.Refusal.StartsWith("no B2xx with serial KO6ETZB is attached; UHD sees: "), "another board only: " + p.Refusal);
         p = UhdDeviceSelection.Plan("KO6ETZB", new[] { BenchFind, BenchFind });
-        Check(p.Refused && p.Refusal.Contains("2 devices answer serial KO6ETZB") && p.Refusal.Contains("hazard 22"),
-              "two boards with ONE serial (the clones' EEPROM): refused, and still in the words ShackLink reads as permanent");
+        Check(p.Refused && p.Refusal.Contains("2 devices answer serial KO6ETZB") && p.Refusal.Contains("hazard 22") &&
+              p.Refusal.Contains("usrp_burn_mb_eeprom") && !p.Refusal.Contains("b2xx_fx3_utils"),
+              "two boards with ONE serial (the clones' EEPROM): refused, still in the words ShackLink reads as permanent, " +
+              "naming the tool that works: " + p.Refusal);
         p = UhdDeviceSelection.Plan("ko6etzb", new[] { BenchFind });
         Check(p.Refused && p.Refusal.StartsWith("no B2xx with serial ko6etzb is attached"),
               "the board is chosen by EXACT string, as UHD's B2xx code opens a handle: a different case is not this board");

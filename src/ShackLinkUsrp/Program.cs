@@ -147,39 +147,58 @@ internal static class Program
     }
 
     /// <summary>Radios present, without opening any (W7): UHD's find, and whether a sidecar already
-    /// serves each (its rendezvous file). A B2xx another process holds may be missing from UHD's answer.</summary>
+    /// serves each (its rendezvous file). A B2xx another process holds may be missing from UHD's answer.
+    /// The find loads FX3 firmware into every cold board it can claim - which is how a catalogue that asks
+    /// for this gets a serial for a board fresh from power-up (ShackLink docs/usrp_b210_support.md 9.26).
+    /// With <c>--json &lt;file&gt;</c> the answer is written there, in the library's spelling, whatever
+    /// happened; a spawner hands a child no pipe (SidecarSpawner, D6).</summary>
     private static int RunList(SidecarOptions opt)
     {
+        Action<string>? log = opt.Console ? Console.Error.WriteLine : null;
         try
         {
-            UhdLoader.Load(new UhdLoadOptions { UhdDirectory = opt.UhdDirectory, ImagesDirectory = opt.ImagesDirectory },
-                           opt.Console ? Console.Error.WriteLine : null);
+            UhdLoader.Load(new UhdLoadOptions { UhdDirectory = opt.UhdDirectory, ImagesDirectory = opt.ImagesDirectory }, log);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"error: UHD could not be loaded: {ex.Message}");
-            return 1;
+            return FinishList(opt, new DiscoveryResult { Error = $"UHD could not be loaded: {ex.Message}" }, 1);
         }
-        var found = UhdUsrp.Find("type=b200");
-        var serials = new List<string>();
-        foreach (var dev in found)
+        IReadOnlyList<string> found;
+        try
         {
-            var kv = dev.Split(',').Select(p => p.Split('=', 2)).Where(p => p.Length == 2)
-                        .GroupBy(p => p[0]).ToDictionary(g => g.Key, g => g.First()[1]);
-            kv.TryGetValue("serial", out var serial);
-            kv.TryGetValue("product", out var product);
-            kv.TryGetValue("name", out var name);
-            serial ??= "";
-            serials.Add(serial);
-            string busy = "free";
-            if (serial.Length > 0 && Rendezvous.TryRead(serial, out var r) && Rendezvous.IsProcessAlive(r.Pid))
-                busy = $"served by pid {r.Pid} on port {r.Port}";
-            Console.WriteLine($"usrp:{serial}  product={product}  name={name}  {busy}");
+            using (UhdDeviceOpsLock.Acquire(UhdDeviceOpsLock.DefaultWait, log))
+                found = UhdUsrp.Find("type=b200");
         }
-        foreach (var dup in serials.GroupBy(s => s).Where(g => g.Count() > 1))
-            Console.WriteLine($"warning: {dup.Count()} devices answer serial {dup.Key}; clones ship one EEPROM serial - re-serialise one with b2xx_fx3_utils");
-        if (found.Count == 0) Console.WriteLine("no B2xx found");
-        return 0;
+        catch (Exception ex)
+        {
+            return FinishList(opt, new DiscoveryResult { Error = $"UHD's find failed: {ex.Message}", UhdVersion = UhdLoader.Version }, 1);
+        }
+        var result = ListAnswer.From(found,
+            serial => Rendezvous.TryRead(serial, out var r) && Rendezvous.IsProcessAlive(r.Pid) ? r.Pid : 0,
+            UhdLoader.Version);
+        return FinishList(opt, result, 0);
+    }
+
+    private static int FinishList(SidecarOptions opt, DiscoveryResult result, int exitCode)
+    {
+        if (opt.JsonPath == null)
+        {
+            foreach (var line in ListAnswer.HumanLines(result)) Console.WriteLine(line);
+            return exitCode;
+        }
+        try
+        {
+            // Written whole then renamed, so a reader never sees half an answer.
+            string tmp = opt.JsonPath + ".tmp";
+            File.WriteAllText(tmp, SidecarDiscovery.Compose(result));
+            File.Move(tmp, opt.JsonPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"the list could not be written to {opt.JsonPath}: {ex.Message}");
+            return 3;
+        }
+        return exitCode;
     }
 }
 
@@ -188,7 +207,9 @@ internal static class Program
 internal sealed class SidecarOptions
 {
     public const string Usage =
-        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list\n" +
+        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list [--json <file>]\n" +
+        "  --list                      UHD's find: every B2xx it can claim, loading firmware into a cold one\n" +
+        "  --json <file>               (with --list) write the answer there as one JSON object, whatever happened\n" +
         "  --sim-fault-after <ms>      (tests) the synthetic radio faults this long after it starts streaming\n" +
         "  --sim-settle-ms <ms>        (tests) a synthetic radio change takes effect this long after it is asked for, like in-flight USB buffers\n" +
         "  --sim-tx-coupling <dB>      how the synthetic radio hears its own transmission: L dBFS at a TX gain of G is heard at L + G + this (default -80)\n" +
@@ -229,6 +250,8 @@ internal sealed class SidecarOptions
     public long TxMaxMs = ProtocolConstants.DefaultTxMaxMs;
     public int TxStarveMs = ProtocolConstants.DefaultTxStarveMs;
     public bool List;
+    /// <summary><c>--json &lt;file&gt;</c>: where <c>--list</c> writes its answer (ShackLink docs/usrp_b210_support.md 9.26 D2).</summary>
+    public string? JsonPath;
     public bool Help;
     public string? UhdDirectory;
     public string? ImagesDirectory;
@@ -310,6 +333,7 @@ internal sealed class SidecarOptions
                     if (o.TxStarveMs < 1) throw new ArgumentException("--tx-starve-ms must be at least 1: a keyed radio fed nothing is ended");
                     break;
                 case "--list": o.List = true; break;
+                case "--json": o.JsonPath = Next(); break;
                 case "--help": case "-h": case "/?": o.Help = true; break;
                 case "--uhd": o.UhdDirectory = Next(); break;
                 case "--images": o.ImagesDirectory = Next(); break;
@@ -356,6 +380,7 @@ internal sealed class SidecarOptions
                 default: throw new ArgumentException($"unknown option {a}");
             }
         }
+        if (o.JsonPath != null && !o.List) throw new ArgumentException("--json <file> goes with --list");
         if (!o.Help && !o.List)
         {
             if (o.Sim == (o.Serial != null)) throw new ArgumentException("give exactly one of --serial <serial> or --sim");
