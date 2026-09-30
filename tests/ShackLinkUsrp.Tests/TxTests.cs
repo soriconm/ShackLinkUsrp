@@ -265,8 +265,10 @@ internal static partial class Program
             var tc = s.Caps.Tx;
             Check(s.Radio.Source == RadioSources.Sim && tc != null, $"the synthetic radio states a transmitter (caps.tx) and that it is synthetic ({s.Radio.Source})");
             Check(tc!.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone, TxSourceKinds.Mod, TxSourceKinds.Step }) &&
-                  tc.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm }) && tc.ModulatingWaveforms.SequenceEqual(new[] { TxWords.Sine }),
-                  $"it builds {string.Join(", ", tc.Sources)}; it modulates {string.Join(" and ", tc.Modulations)} with a {string.Join("", tc.ModulatingWaveforms)}");
+                  tc.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm }) && tc.ModulatingWaveforms.SequenceEqual(TxWaveforms.All) &&
+                  tc.ModulatingHarmonics == ProtocolConstants.TxModulatingHarmonics,
+                  $"it builds {string.Join(", ", tc.Sources)}; it modulates {string.Join(" and ", tc.Modulations)} by {string.Join(", ", tc.ModulatingWaveforms)} " +
+                  $"({tc.ModulatingHarmonics} harmonics)");
             Check(tc.MinDwellMs == ProtocolConstants.TxMinDwellMs && tc.MinDwellMs == 5 && tc.MaxStepPoints == 8192,
                   $"a step lasts at least {tc.MinDwellMs} ms and a sweep has at most {tc.MaxStepPoints} points (the RF Bench Analyser's trace budget)");
             Check(tc.RatesHz.SequenceEqual(new[] { 200e3, 250e3, 400e3, 500e3, 1e6, 2e6 }) && tc.GainMinDb == 0 && tc.GainMaxDb == 89.75 && tc.GainStepDb == 0.25,

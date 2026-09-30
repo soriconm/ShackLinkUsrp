@@ -356,12 +356,14 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
     public static readonly string[] BuiltSources = { TxSourceKinds.Iq, TxSourceKinds.Tone, TxSourceKinds.Mod, TxSourceKinds.Step };
 
     /// <summary>What <c>caps.tx</c> says about the generated sources - the ONE place both radios state them,
-    /// so the synthetic radio cannot offer what the UHD one does not build, or the reverse.</summary>
+    /// so the synthetic radio cannot offer what the UHD one does not build, or the reverse. The modulating waves are
+    /// the protocol library's (section 9.21 Q5), cut at its harmonic count.</summary>
     protected static TxCaps StateGeneratedSources(TxCaps caps)
     {
         caps.Sources = (string[])BuiltSources.Clone();
         caps.Modulations = new[] { TxWords.Am, TxWords.Fm };
-        caps.ModulatingWaveforms = new[] { TxWords.Sine };
+        caps.ModulatingWaveforms = (string[])TxWaveforms.All.Clone();
+        caps.ModulatingHarmonics = ProtocolConstants.TxModulatingHarmonics;
         caps.MinDwellMs = ProtocolConstants.TxMinDwellMs;
         caps.MaxStepPoints = TxStepPlan.MaxPoints;
         return caps;
@@ -437,7 +439,10 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
 
     /// <summary>Open the radio's side of a transmission. An IQ one radiates nothing before its first sample;
     /// a stepped one runs by <paramref name="plan"/>.</summary>
-    protected abstract RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan);
+    /// <summary>Open a transmission. A generated source's <paramref name="signal"/> is <c>TxRules.Describe</c> of it
+    /// against these caps - the one computation the server states on the grant, and the one its generator is built
+    /// from; null for IQ.</summary>
+    protected abstract RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal);
 
     private void RequireTransmitter()
     {
@@ -519,6 +524,14 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
         TxState st = GetTxState();
         double rate = st.RateHz;
         TxStepPlan? plan = null;
+        // What a generated source IS, from the rules it was admitted by: its generator is built from exactly this.
+        TxSignal? signal = null;
+        if (r.IsGenerated)
+        {
+            signal = TxRules.Describe(r, caps);
+            if (signal == null)
+                throw new RadioRefusal(ErrorCodes.Unsupported, "this signal cannot be described against the transmitter's caps, so it is not generated");
+        }
         if (r.IsGenerated)
         {
             // Its samples are the sidecar's own: it runs at the LOWEST admitted rate that holds it (P4-a'). A
@@ -587,7 +600,7 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
         RadioTransmission t;
         try
         {
-            t = OpenTransmission(r, grant, plan);
+            t = OpenTransmission(r, grant, plan, signal);
         }
         catch
         {

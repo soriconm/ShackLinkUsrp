@@ -49,7 +49,7 @@ internal abstract class RadioTransmission : ITxTransmission
     private Action<StreamEnd>? _endedHandlers;
     private StreamEnd? _unheardEnd;
 
-    protected RadioTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan)
+    protected RadioTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
         _backend = backend;
         Request = request;
@@ -63,9 +63,7 @@ internal abstract class RadioTransmission : ITxTransmission
                 Generator = new ToneGenerator(request.OffsetHz, grant.RateHz, request.LevelDbfs);
                 break;
             case TxSourceKinds.Mod:
-                Generator = request.Modulation == TxWords.Am
-                    ? ModGenerator.Am(request.OffsetHz, grant.RateHz, request.LevelDbfs, request.AfHz, request.AmDepthPercent / 100.0)
-                    : ModGenerator.Fm(request.OffsetHz, grant.RateHz, request.LevelDbfs, request.AfHz, request.FmDeviationHz);
+                Generator = ModulatedSource(request, grant, signal);
                 break;
             case TxSourceKinds.Step:
                 Plan = plan ?? throw new ArgumentNullException(nameof(plan), "a stepped source needs its plan");
@@ -83,6 +81,25 @@ internal abstract class RadioTransmission : ITxTransmission
         CenterHz = request.Source == TxSourceKinds.Iq ? grant.CenterHz
                  : Plan != null ? (Plan.Baseband ? grant.CenterHz - (Plan.FrequencyHz[0] - Plan.CenterHz) : grant.CenterHz)
                  : grant.CenterHz - request.OffsetHz;
+    }
+
+    /// <summary>A <c>mod</c> source's generator, built from the signal the rules described (section 9.21): the wave's
+    /// components are the library's, so what goes out is what the grant says and what a client predicts.</summary>
+    private static IIqGenerator ModulatedSource(TxStartRequest request, TxGrant grant, TxSignal? signal)
+    {
+        var wave = signal?.Waveform ?? throw new RadioRefusal(ErrorCodes.Unsupported,
+            $"a {request.Modulation} carrier needs its modulating wave described; this one was not");
+        var components = wave.Components.Select(c => new ModComponent(c.FrequencyHz, c.Amplitude, c.PhaseRad)).ToArray();
+        switch (request.Modulation)
+        {
+            case TxWords.Am:
+                return ModGenerator.Am(request.OffsetHz, grant.RateHz, request.LevelDbfs, components, request.AmDepthPercent / 100.0);
+            case TxWords.Fm:
+                return ModGenerator.Fm(request.OffsetHz, grant.RateHz, request.LevelDbfs, components, request.FmDeviationHz);
+            default:
+                throw new RadioRefusal(ErrorCodes.Unsupported,
+                    $"this sidecar does not modulate \"{request.Modulation}\"; it builds {TxWords.Am} and {TxWords.Fm}");
+        }
     }
 
     public TxStartRequest Request { get; }

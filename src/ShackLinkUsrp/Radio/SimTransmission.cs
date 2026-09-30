@@ -27,8 +27,8 @@ internal sealed class SimTransmission : RadioTransmission
     private long _keyPosition;
     private long _ratio;          // wide samples per TX sample: an admitted TX rate divides the wide rate
 
-    public SimTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan)
-        : base(backend, request, grant, plan) { }
+    public SimTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
+        : base(backend, request, grant, plan, signal) { }
 
     /// <summary>
     /// The synthetic radio's clock reached this transmission for a block of <paramref name="n"/> wide

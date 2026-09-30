@@ -338,7 +338,7 @@ internal sealed class UhdBackend : RadioBackendBase
         return ((long)Math.Round(r.ReadbackHz), (long)Math.Round(r.ActualRfHz));
     }
 
-    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan)
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
         var u = Usrp;
         // Its own streamer, for its life (item 7). Making it powers the TX chain, which takes the AD9361
@@ -350,7 +350,7 @@ internal sealed class UhdBackend : RadioBackendBase
                 "the full-duplex state) - its samples during the burst come from another port (section 9.17 item 3)");
         try
         {
-            return new UhdTransmission(this, request, grant, plan, streamer, NoteTxAsync);
+            return new UhdTransmission(this, request, grant, plan, signal, streamer, NoteTxAsync);
         }
         catch
         {

@@ -197,12 +197,12 @@ internal sealed class SimBackend : RadioBackendBase
     protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo) =>
         (carrierHz, moveLo ? loHz : GetTxState().LoHz);
 
-    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan)
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
         if (!TxRules.DividesWideRate(grant.RateHz, WideRateHz))
             throw new ShackLinkUsrp.Server.RadioRefusal(ErrorCodes.OutOfRange,
                 $"the TX rate {grant.RateHz:0} S/s does not divide the wide rate {WideRateHz:0} S/s");
-        var t = new SimTransmission(this, request, grant, plan);
+        var t = new SimTransmission(this, request, grant, plan, signal);
         Volatile.Write(ref _simTx, t);
         return t;
     }

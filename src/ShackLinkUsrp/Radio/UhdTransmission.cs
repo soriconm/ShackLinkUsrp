@@ -39,9 +39,9 @@ internal sealed class UhdTransmission : RadioTransmission
     private readonly Thread _sender;
     private long _abortTs;
 
-    public UhdTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, UhdTxStreamer streamer,
-                           Action<UhdAsyncEventCode> asyncSeen)
-        : base(backend, request, grant, plan)
+    public UhdTransmission(RadioBackendBase backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal,
+                           UhdTxStreamer streamer, Action<UhdAsyncEventCode> asyncSeen)
+        : base(backend, request, grant, plan, signal)
     {
         _streamer = streamer;
         _asyncSeen = asyncSeen;
