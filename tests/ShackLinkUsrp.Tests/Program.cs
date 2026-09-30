@@ -91,6 +91,8 @@ internal static partial class Program
         Run("9.26: the real executable's --list --json, down its no-UHD path", ListJsonSpawnCases);
         Run("9.26: one UHD finder at a time - the device lock, taken for real", DeviceOpsLockCases);
         Run("9.26: both finders hold the lock, pinned in the source", DeviceOpsLockSourceRules);
+        Run("9.27: the native rates, offered on every machine (source rules)", NativeRateSourceRules);
+        Run("9.27: the analog bandwidth follows the rate until set, and a set one survives a rate change", BandwidthRuleCases);
         Run("9.23 DS2: a ring aligned to the other side's position", RingAlignCases);
         Run("9.23 DS2: the NCO's phase is the radio position's", NcoAnchorCases);
         Run("9.23 DS2: both receive sides of the synthetic radio", SimTwoSides);

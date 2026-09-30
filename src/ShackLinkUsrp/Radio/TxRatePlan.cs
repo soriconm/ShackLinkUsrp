@@ -13,13 +13,13 @@ namespace ShackLinkUsrp.Radio;
 /// </summary>
 internal static class TxRatePlan
 {
-    /// <summary>The lowest TX rate offered. 200 kHz divides every wide rate this sidecar offers on Windows
-    /// (2, 5, 10, 20 MS/s) and is the DUC's exact tick / n at every clock measured (section 9.17 item 5);
-    /// nothing a client of this sidecar generates needs less.</summary>
+    /// <summary>The lowest TX rate offered: nothing a client of this sidecar generates needs less (section 9.17
+    /// item 5). Every native wide rate (section 9.27) admits a TX rate between this and
+    /// <see cref="MaxTxRateHz"/> - 15.36 MS/s's lowest is 240 kHz, not 200 - which the sidecar's gate checks.</summary>
     public const double MinTxRateHz = 200_000;
 
-    /// <summary>The highest TX rate offered: nothing here needs more, and a TX stream beside a 10 MS/s
-    /// receiver on Windows USB has not been measured.</summary>
+    /// <summary>The highest TX rate offered: what the generated sources and ShackLink's IQ need, with room.
+    /// A functional bound, not a measurement of any machine (section 9.27).</summary>
     public const double MaxTxRateHz = 2_000_000;
 
     /// <summary>AD9361_MIN_CLOCK_RATE / AD9361_MAX_CLOCK_RATE (ad9361_device.cpp).</summary>

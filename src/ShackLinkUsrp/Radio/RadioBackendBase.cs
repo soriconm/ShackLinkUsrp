@@ -397,6 +397,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         lock (_stateLock) _state.WideRateHz = eff;
         Announce((l, at) => l.OnRateChanged(eff, at));
         Log($"wide rate {eff:0} S/s" + (Math.Abs(eff - hz) > 0.5 ? $" (asked {hz:0})" : ""));
+        ReapplyBandwidth(eff);
         // A new rate moves the clock, and with two sides the reach with it: centres that no longer fit are
         // brought together, said out loud (the server ended every lease before a rate change).
         if (StreamingSides.Length > 1)
@@ -453,12 +454,60 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         AnnounceFrontEnd(side: side);
     }
 
-    /// <summary>ONE filter for both chains (S3): every side is told.</summary>
+    /// <summary>ONE filter for both chains (S3): every side is told. A bandwidth a client SETS is kept across
+    /// rate changes (<see cref="ReapplyBandwidth"/>); until one is set, it follows the wide rate.</summary>
     public void SetBandwidth(double hz)
     {
         double eff = ApplyBandwidth(hz);
+        lock (_stateLock)
+        {
+            _state.BandwidthHz = eff;
+            _bandwidthSetHz = hz;
+        }
+        AnnounceFrontEnd();
+    }
+
+    /// <summary>The analog bandwidth a client set; NaN = none, and it follows the wide rate.</summary>
+    private double _bandwidthSetHz = double.NaN;
+
+    /// <summary>
+    /// After a rate change, put the analog filter where it should be and say so (ShackLink
+    /// docs/usrp_b210_support.md 9.27). UHD re-programs the AD9361's filter from the clock on every
+    /// master-clock change (<c>ad9361_device_t::set_clock_rate</c> calls <c>set_bw_filter</c> with its own
+    /// clock-derived width), so without this a set bandwidth was silently lost and the state kept reporting
+    /// it. A set value is re-applied; otherwise the filter follows the new rate.
+    /// </summary>
+    private void ReapplyBandwidth(double rateHz)
+    {
+        double set;
+        lock (_stateLock) set = _bandwidthSetHz;
+        bool follows = double.IsNaN(set);
+        double want = follows ? BandwidthForRate(rateHz, Caps) : set;
+        double eff;
+        try
+        {
+            eff = ApplyBandwidth(want);
+        }
+        catch (Exception ex)
+        {
+            Log($"the analog bandwidth could not be re-applied after the rate change: {ex.Message}");
+            return;
+        }
         lock (_stateLock) _state.BandwidthHz = eff;
         AnnounceFrontEnd();
+        Log(follows
+            ? $"analog bandwidth {eff:0} Hz, following the wide rate"
+            : $"analog bandwidth kept at {eff:0} Hz, as it was set" +
+              (eff < rateHz * 0.99 ? $" - narrower than the {rateHz:0} S/s stream, so its edges are filtered" : ""));
+    }
+
+    /// <summary>The bandwidth that follows a wide rate: the rate itself, inside the radio's analog range.</summary>
+    internal static double BandwidthForRate(double rateHz, RadioCaps? caps)
+    {
+        double bw = rateHz;
+        if (caps != null && caps.BandwidthMaxHz > 0) bw = Math.Min(bw, caps.BandwidthMaxHz);
+        if (caps != null && caps.BandwidthMinHz > 0) bw = Math.Max(bw, caps.BandwidthMinHz);
+        return bw;
     }
 
     public JsonArray GetSettings() => RadioSettings();

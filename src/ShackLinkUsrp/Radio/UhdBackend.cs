@@ -24,13 +24,6 @@ internal sealed record UhdBackendOptions
     public long LoHz { get; init; } = 100_000_000;
     /// <summary>RF LO offset from the centre, compensated in the FPGA DDC, so the DC spike is off-centre.</summary>
     public long DcOffsetHz { get; init; }
-    /// <summary>
-    /// <c>--dual-rates</c>: the wide rates offered while BOTH receive sides stream. EMPTY BY DEFAULT: a rate is
-    /// offered with two sides only once it has been measured clean with two sides on this OS and USB format
-    /// (ShackLink docs/usrp_b210_support.md section 9.23.2 item 4, DS0), and until then the option is the bench's
-    /// way in - said in the log whenever it is used.
-    /// </summary>
-    public double[] DualRatesHz { get; init; } = Array.Empty<double>();
 }
 
 /// <summary>
@@ -77,14 +70,10 @@ internal sealed class UhdBackend : RadioBackendBase
         _dcOffsetHz = opt.DcOffsetHz;
     }
 
-    /// <summary>Rates this sidecar offers on this OS and USB format (section 9.1 D7): sc16 is clean to
-    /// 10 MS/s on Windows, sc8 to 20; nothing above is offered on Windows until it is measured clean.</summary>
-    private static double[] OfferedRates(string otw)
-    {
-        bool windows = OperatingSystem.IsWindows();
-        if (!windows) return new[] { 2e6, 5e6, 10e6, 20e6, 30.72e6, 40e6, 56e6 };
-        return otw == "sc8" ? new[] { 2e6, 5e6, 10e6, 20e6 } : new[] { 2e6, 5e6, 10e6 };
-    }
+    /// <summary>The rates this radio is offered at: its NATIVE range, on every OS and in either USB format
+    /// (ShackLink docs/usrp_b210_support.md section 9.27, which supersedes 9.1 D7). Which of them stream
+    /// cleanly depends on the computer; its overflows say so, and the operator decides.</summary>
+    private static double[] OfferedRates() => (double[])B2xxRates.Native.Clone();
 
     private static RadioCaps InitialCaps(UhdBackendOptions opt) => new()
     {
@@ -94,7 +83,7 @@ internal sealed class UhdBackend : RadioBackendBase
         GainMinDb = 0,
         GainMaxDb = 76,
         GainStepDb = 1,
-        WideRatesHz = OfferedRates(opt.OtwFormat),
+        WideRatesHz = OfferedRates(),
         LeaseDecimMin = 2,
         LeaseDecimMax = 4096,
         MaxLeases = 8,
@@ -181,7 +170,7 @@ internal sealed class UhdBackend : RadioBackendBase
             GainMinDb = gain.Start,
             GainMaxDb = gain.Stop,
             GainStepDb = gain.Step,
-            WideRatesHz = OfferedRates(_opt.OtwFormat),
+            WideRatesHz = OfferedRates(),
             LeaseDecimMin = 2,
             LeaseDecimMax = 4096,
             MaxLeases = 8,
@@ -193,14 +182,14 @@ internal sealed class UhdBackend : RadioBackendBase
             BandwidthMaxHz = bw.Stop,
             // The default subdev spec lists both sides of a B210: channel 0 is RX A, channel 1 RX B (S9).
             RxSides = twoSides ? new[] { RxSides.A, RxSides.B } : null,
-            DualRatesHz = twoSides ? _opt.DualRatesHz.Where(r => OfferedRates(_opt.OtwFormat).Contains(r) && SideRules.DualClockHz(r) > 0).ToArray() : null,
+            // Every native rate the two-side clock admits - a hardware rule, never a measurement (section 9.27).
+            DualRatesHz = twoSides ? B2xxRates.TwoSide(OfferedRates()) : null,
         };
-        if (twoSides && _opt.DualRatesHz.Length > 0)
-            Log($"BENCH: two sides are offered at {string.Join(", ", Caps.DualRatesHz!.Select(r => r.ToString("0", CultureInfo.InvariantCulture)))} S/s by --dual-rates, " +
-                "not by a measurement on this machine (section 9.23.2 item 4)");
 
         lock (_radioLock) _usrp = usrp;
-        double rate = usrp.SetRxRate(_opt.WideRateHz);
+        // The clock is the sidecar's from the first rate on (section 9.27): every later change sets it too.
+        SetClockFor(usrp, ClockFor(1, _opt.WideRateHz), _opt.WideRateHz, twoSides: false);
+        double rate = usrp.GetRxRate(0);
         var tune = usrp.TuneRx(_opt.LoHz, _dcOffsetHz);
         double g = usrp.SetRxGain(30);
         string ant = ants.Contains("RX2") ? usrp.SetRxAntenna("RX2") : usrp.GetRxAntenna();
@@ -565,19 +554,27 @@ internal sealed class UhdBackend : RadioBackendBase
         return ((long)Math.Round(ra.ActualRfHz), result);
     }
 
-    /// <summary>Set the clock the base chose, when it must be set: always once the sidecar has set one (UHD's
-    /// automatic clock is then off for good), and whenever two sides are asked for. The rate is set again on every
-    /// channel after it, because a new clock re-plans each DDC's decimation.</summary>
+    /// <summary>
+    /// Set the clock the base chose, ALWAYS - one side or two (section 9.27) - then the rate on every channel,
+    /// because a new clock re-plans each DDC's decimation. UHD's automatic clock takes the LCM of every DSP rate
+    /// it holds, the second RX channel's OLD rate and the TX rate included, and when that LCM passes the AD9361's
+    /// ceiling it keeps the old clock and rounds the decimation: on a B210, 12.5 -> 15.36 MS/s landed on 16.67
+    /// and every later rate whose LCM with the previous one was too large stayed on the 50 MHz clock (measured,
+    /// UsrpKindTest --rate-sweep). For one side the clock is UHD's own formula (<see cref="RadioBackendBase.ClockFor"/>),
+    /// so a rate lands where UHD would have put it from a fresh start.
+    /// </summary>
     private void SetClockFor(UhdUsrp u, double clockHz, double rateHz, bool twoSides)
     {
-        if (clockHz <= 0 || (!_explicitClock && !twoSides)) return;
-        double before = u.GetMasterClockRate();
-        if (Math.Abs(before - clockHz) > 0.5)
+        if (clockHz > 0)
         {
-            u.SetMasterClockRate(clockHz);
-            Log($"master clock {before:0} -> {u.GetMasterClockRate():0} Hz (asked {clockHz:0}) for {(twoSides ? "two sides" : "one side")} at {rateHz:0} S/s");
+            double before = u.GetMasterClockRate();
+            if (Math.Abs(before - clockHz) > 0.5)
+            {
+                u.SetMasterClockRate(clockHz);
+                Log($"master clock {before:0} -> {u.GetMasterClockRate():0} Hz (asked {clockHz:0}) for {(twoSides ? "two sides" : "one side")} at {rateHz:0} S/s");
+            }
+            _explicitClock = true;
         }
-        _explicitClock = true;
         for (int ch = 0; ch < _rxChannels; ch++) u.SetRxRate(rateHz, ch);
         _masterClock = u.GetMasterClockRate();
     }
@@ -620,18 +617,9 @@ internal sealed class UhdBackend : RadioBackendBase
                 Log($"TX rate moved from {txRate:0} to {moved:0} S/s: {txRate:0} does not divide the new wide rate {hz:0} S/s");
             }
         }
-        double eff;
-        if (_explicitClock || _streamSides.Length > 1)
-        {
-            // The sidecar chooses the clock now (S4): the two-side clock, or UHD's own formula for one side.
-            SetClockFor(u, ClockFor(_streamSides.Length, hz), hz, _streamSides.Length > 1);
-            eff = u.GetRxRate(0);
-        }
-        else
-        {
-            eff = u.SetRxRate(hz);
-            if (_rxChannels >= 2) u.SetRxRate(hz, 1);
-        }
+        // The sidecar chooses the clock, always (S4, section 9.27): the two-side clock, or UHD's own formula for one side.
+        SetClockFor(u, ClockFor(_streamSides.Length, hz), hz, _streamSides.Length > 1);
+        double eff = u.GetRxRate(0);
         _masterClock = u.GetMasterClockRate();
         if (_txFreqRange != null) RebuildTxCaps(u, eff);
         StartStreaming();

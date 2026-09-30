@@ -64,8 +64,9 @@ internal static class Program
                 WideRateHz = opt.RateHz,
                 LoHz = opt.LoHz,
                 DcOffsetHz = opt.DcOffsetHz,
-                DualRatesHz = opt.DualRatesHz,
             });
+        if (opt.DualRatesHz.Length > 0)
+            log.Write("--dual-rates is ignored: every native rate the two-side clock admits is offered now (ShackLink docs/usrp_b210_support.md 9.27)");
 
         var server = new UsrpServer(backend, new UsrpServerOptions
         {
@@ -223,11 +224,11 @@ internal sealed class SidecarOptions
         "  --fpga <path>               FPGA image for a clone board\n" +
         "  --args <k=v,...>            extra UHD device arguments\n" +
         "  --allow-known-codec-fault   a patched UHD may open a board whose CODEC loopback fails; its samples are NOT trustworthy\n" +
-        "  --otw sc16|sc8              the USB sample format (sc8 is clean to 20 MS/s on Windows, sc16 to 10)\n" +
+        "  --otw sc16|sc8              the USB sample format: sc8 halves the USB load at 8-bit resolution (every rate is offered in both)\n" +
         "  --rate <S/s>                initial wide rate (default 10e6)\n" +
         "  --lo <Hz>                   initial LO (default 100e6)\n" +
         "  --dc-offset <Hz>            RF LO offset compensated in the FPGA DDC (default 0)\n" +
-        "  --dual-rates <S/s,...>      (bench) wide rates both receive sides may stream at before they are measured clean\n" +
+        "  --dual-rates <S/s,...>      (obsolete, ignored) every native rate the two-side clock admits is offered\n" +
         "  --port <n>                  listening port (default 0 = ephemeral, published in the rendezvous file)\n" +
         "  --listen <ip>               bind address (default 127.0.0.1)\n" +
         "  --linger <s>                exit this long after the last client leaves (default 10)\n" +
