@@ -265,7 +265,7 @@ internal static partial class Program
             var tc = s.Caps.Tx;
             Check(s.Radio.Source == RadioSources.Sim && tc != null, $"the synthetic radio states a transmitter (caps.tx) and that it is synthetic ({s.Radio.Source})");
             Check(tc!.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone, TxSourceKinds.Mod, TxSourceKinds.Step }) &&
-                  tc.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm, TxWords.Pm, TxWords.Dsb, TxWords.Ssb }) && tc.ModulatingWaveforms.SequenceEqual(TxWaveforms.All) &&
+                  tc.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm, TxWords.Pm, TxWords.Dsb, TxWords.Ssb, TxWords.Pulse }) && tc.ModulatingWaveforms.SequenceEqual(TxWaveforms.All) &&
                   tc.ModulatingHarmonics == ProtocolConstants.TxModulatingHarmonics,
                   $"it builds {string.Join(", ", tc.Sources)}; it modulates {string.Join(" and ", tc.Modulations)} by {string.Join(", ", tc.ModulatingWaveforms)} " +
                   $"({tc.ModulatingHarmonics} harmonics)");

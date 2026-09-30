@@ -87,6 +87,10 @@ internal abstract class RadioTransmission : ITxTransmission
     /// components are the library's, so what goes out is what the grant says and what a client predicts.</summary>
     private static IIqGenerator ModulatedSource(TxStartRequest request, TxGrant grant, TxSignal? signal)
     {
+        // A pulse has no modulating wave: its envelope is its width, period and EFFECTIVE edges (section 9.21 Q4).
+        if (request.Modulation == TxWords.Pulse)
+            return PulseCarrier.For(request, signal ?? throw new RadioRefusal(ErrorCodes.Unsupported, "a pulse needs its timing described; this one was not"),
+                                    grant.RateHz);
         var wave = signal?.Waveform ?? throw new RadioRefusal(ErrorCodes.Unsupported,
             $"a {request.Modulation} carrier needs its modulating wave described; this one was not");
         var components = wave.Components.Select(c => new ModComponent(c.FrequencyHz, c.Amplitude, c.PhaseRad)).ToArray();
@@ -107,7 +111,7 @@ internal abstract class RadioTransmission : ITxTransmission
                                         upper: request.Sideband == TxWords.Usb);
             default:
                 throw new RadioRefusal(ErrorCodes.Unsupported,
-                    $"this sidecar does not modulate \"{request.Modulation}\"; it builds {TxWords.Am}, {TxWords.Fm}, {TxWords.Pm}, {TxWords.Dsb} and {TxWords.Ssb}");
+                    $"this sidecar does not modulate \"{request.Modulation}\"; it builds {TxWords.Am}, {TxWords.Fm}, {TxWords.Pm}, {TxWords.Dsb}, {TxWords.Ssb} and {TxWords.Pulse}");
         }
     }
 

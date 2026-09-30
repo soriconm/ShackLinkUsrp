@@ -361,7 +361,7 @@ internal abstract class RadioBackendBase : IRadioBackend, ITxBackend, IRadioCont
     protected static TxCaps StateGeneratedSources(TxCaps caps)
     {
         caps.Sources = (string[])BuiltSources.Clone();
-        caps.Modulations = new[] { TxWords.Am, TxWords.Fm, TxWords.Pm, TxWords.Dsb, TxWords.Ssb };
+        caps.Modulations = new[] { TxWords.Am, TxWords.Fm, TxWords.Pm, TxWords.Dsb, TxWords.Ssb, TxWords.Pulse };
         caps.ModulatingWaveforms = (string[])TxWaveforms.All.Clone();
         caps.ModulatingHarmonics = ProtocolConstants.TxModulatingHarmonics;
         caps.MinDwellMs = ProtocolConstants.TxMinDwellMs;

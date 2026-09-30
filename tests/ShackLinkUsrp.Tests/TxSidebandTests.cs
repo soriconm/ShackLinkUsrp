@@ -140,7 +140,7 @@ internal static partial class Program
             s.WaitReady(5000);
             Check(s.Radio.Source == RadioSources.Sim, "before anything is keyed, the radio says it is synthetic");
             var caps = s.Caps.Tx!;
-            Check(caps.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm, TxWords.Pm, TxWords.Dsb, TxWords.Ssb }),
+            Check(caps.OffersModulation(TxWords.Pm) && caps.OffersModulation(TxWords.Dsb) && caps.OffersModulation(TxWords.Ssb),
                   $"caps.tx modulates {string.Join(", ", caps.Modulations)}");
             s.ClaimTx();
             const double pbin = 2e6 / 4096;

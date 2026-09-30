@@ -82,6 +82,8 @@ internal static partial class Program
         Run("9.21 S2: a square AM and a two-tone FM in the synthetic radio's own panorama", SimModWaveLoopback);
         Run("9.21 S3: DSB, SSB and PM", SidebandPmCases);
         Run("9.21 S3: DSB, SSB and PM in the synthetic radio's own panorama", SimSidebandPmLoopback);
+        Run("9.21 S4: the pulse generator", PulseGeneratorCases);
+        Run("9.21 S4: a pulse train in the synthetic radio's panorama, and measured through a lease", SimPulseLoopback);
         Run("9.20: UHD's serial rule, ported (hexadecimal numbers, not strings)", UhdSerialRuleCases);
         Run("9.20: which B2xx to open, and when to refuse", UhdOpenPlanCases);
         Run("9.20: the UHD open path, pinned in the source", UhdOpenSourceRules);
@@ -902,7 +904,7 @@ internal static partial class Program
             : $"caps.tx: {ct.FreqMinHz}-{ct.FreqMaxHz} Hz, gain {ct.GainMinDb}-{ct.GainMaxDb} step {ct.GainStepDb}, " +
               $"rates {string.Join("/", ct.RatesHz.Select(r => (r / 1e3).ToString("0.###", CultureInfo.InvariantCulture)))} kS/s, " +
               $"antennas {string.Join(",", ct.Antennas)}, quantum {ct.QuantumSamples}, max LO offset {ct.MaxLoOffsetHz} Hz, sources {string.Join(",", ct.Sources)}, " +
-              $"modulations {string.Join(",", ct.Modulations)} ({string.Join(",", ct.ModulatingWaveforms)}), dwell >= {ct.MinDwellMs} ms, <= {ct.MaxStepPoints} points");
+              $"modulations {string.Join(",", ct.Modulations)} ({string.Join(",", ct.ModulatingWaveforms)} at {ct.ModulatingHarmonics} harmonics), dwell >= {ct.MinDwellMs} ms, <= {ct.MaxStepPoints} points");
         if (st.Tx != null)
             Console.WriteLine($"state.tx: {st.Tx.CenterHz} Hz (LO {st.Tx.LoHz}), {st.Tx.RateHz} S/s, {st.Tx.GainDb} dB, {st.Tx.Antenna}, keyed {st.Tx.Keyed}");
 
