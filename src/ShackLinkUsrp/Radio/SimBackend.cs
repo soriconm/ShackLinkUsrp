@@ -33,8 +33,11 @@ internal sealed class SimBackend : RadioBackendBase
         new(118_100_000, -40, 'A', 400, 0.8),     // airband AM
     };
 
-    /// <summary>What the generator produces at; a radio change replaces it at one exact sample.</summary>
-    private readonly record struct Settings(long LoHz, double RateHz, double GainDb, bool Agc);
+    /// <summary>What the generator produces at; a radio change replaces it at one exact sample. Side B has its own
+    /// centre, gain and AGC (ShackLink docs/usrp_b210_support.md section 9.23), and which sides stream is a
+    /// change like any other - so a side switched on starts at an exact position too.</summary>
+    private readonly record struct Settings(long LoHz, double RateHz, double GainDb, bool Agc,
+                                            long LoB, double GainDbB, bool AgcB, bool StreamA, bool StreamB);
 
     private readonly SimSignal[] _scene;
     private readonly double _noiseDbfs;
@@ -77,6 +80,19 @@ internal sealed class SimBackend : RadioBackendBase
 
     public const double DefaultTxCouplingDb = -80;
 
+    /// <summary>
+    /// <c>--sim-side-b-gain-db</c> and <c>--sim-side-b-phase-deg</c> (section 9.23): what the synthetic radio's
+    /// SECOND receive side hears the same scene through - this gain relative to side A at equal settings, and
+    /// this phase, with its own independent noise. Stated numbers (telemetry: <c>side_b_gain_db</c>,
+    /// <c>side_b_phase_deg</c>), so a dual lease's relative level and phase have a truth to be checked against.
+    /// The phase holds while the two centres are equal from the start; a side that moves away and back comes
+    /// back at another phase, as a real radio's may (the relative phase across a retune is UNVERIFIED on a B210).
+    /// </summary>
+    public double SideBGainDb { get; init; } = DefaultSideBGainDb;
+    public double SideBPhaseDeg { get; init; } = DefaultSideBPhaseDeg;
+
+    public const double DefaultSideBGainDb = -6, DefaultSideBPhaseDeg = 30;
+
     /// <summary>The B210's TX gain range and grid (UHD's get_tx_gain_range on the board, 0-89.75 in 0.25).</summary>
     public const double TxGainMaxDb = 89.75, TxGainStepDb = 0.25;
 
@@ -93,7 +109,7 @@ internal sealed class SimBackend : RadioBackendBase
     {
         _scene = DefaultScene;
         _noiseDbfs = noiseDbfs;
-        _initial = _asked = new Settings(loHz, wideRateHz, 30, false);
+        _initial = _asked = new Settings(loHz, wideRateHz, 30, false, loHz, 30, false, true, false);
     }
 
     private static RadioCaps MakeCaps() => new()
@@ -113,6 +129,9 @@ internal sealed class SimBackend : RadioBackendBase
         Agc = true,
         BandwidthMinHz = 200e3,
         BandwidthMaxHz = 56e6,
+        // Two sides, at every offered rate a two-side clock serves (no USB here to measure a ceiling on).
+        RxSides = new[] { RxSides.A, RxSides.B },
+        DualRatesHz = new[] { 2e6, 10e6, 20e6 }.Where(r => SideRules.DualClockHz(r) > 0).ToArray(),
     };
 
     protected override void OpenRadio()
@@ -120,6 +139,7 @@ internal sealed class SimBackend : RadioBackendBase
         // A synthetic radio opens at once; the short pause lets a client see "opening" honestly.
         Thread.Sleep(200);
         UpdateState(s => { s.Antenna = "RX2"; s.BandwidthHz = _initial.RateHz; }, announce: false);
+        UpdateSideB(gainDb: 30, agc: false, antenna: "RX2", centerHz: _initial.LoB);
         // The transmitter as a B210's comes up: 100 MHz, 0 dB, the LO on the carrier, and the lowest
         // admitted rate set (the UHD backend sets it too, before its TX chain is touched).
         double txRate = TxRates(_initial.RateHz).FirstOrDefault();
@@ -136,6 +156,7 @@ internal sealed class SimBackend : RadioBackendBase
         _generator.Start();
         Log($"synthetic radio: {_scene.Length} signals, noise {_noiseDbfs} dBFS, {_initial.RateHz:0} S/s" +
             (SettleMs > 0 ? $"; a change takes effect {SettleMs} ms after it is asked for (--sim-settle-ms)" : "") +
+            $"; its RX B hears the scene at {SideBGainDb} dB and {SideBPhaseDeg} degrees from RX A, with its own noise" +
             $"; it transmits into itself with a coupling of {TxCouplingDb} dB");
     }
 
@@ -213,7 +234,33 @@ internal sealed class SimBackend : RadioBackendBase
         _generator?.Join(2000);
     }
 
-    protected override long ApplyLo(long hz) { Schedule(s => s with { LoHz = hz }); return hz; }
+    // The synthetic radio's scene is computed per side about the side's centre, so the RF LO a placement
+    // chooses changes nothing it generates; the centres are exact, and the RF LO is read back as asked.
+    protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers) ApplyTuning(long rfLoHz, IReadOnlyDictionary<string, long> centers)
+    {
+        Schedule(s => s with
+        {
+            LoHz = centers.TryGetValue(RxSides.A, out long a) ? a : s.LoHz,
+            LoB = centers.TryGetValue(RxSides.B, out long b) ? b : s.LoB,
+        });
+        return (rfLoHz, centers);
+    }
+
+    protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers, double ClockHz) ApplyRxSides(
+        IReadOnlyList<string> sides, long rfLoHz, IReadOnlyDictionary<string, long> centers, double clockHz)
+    {
+        // The generator switches at the change's exact position and aligns a side switched on to it there.
+        Schedule(s => s with
+        {
+            StreamA = sides.Contains(RxSides.A),
+            StreamB = sides.Contains(RxSides.B),
+            LoHz = centers.TryGetValue(RxSides.A, out long a) ? a : s.LoHz,
+            LoB = centers.TryGetValue(RxSides.B, out long b) ? b : s.LoB,
+        });
+        return (rfLoHz, centers, clockHz);
+    }
+
+    protected override double MasterClockHz => ClockFor(StreamingSides.Length, WideRateHz);
     protected override double ApplyRate(double hz)
     {
         // As the UHD backend does: a TX rate that no longer divides the wide rate is moved to the lowest
@@ -231,11 +278,16 @@ internal sealed class SimBackend : RadioBackendBase
         Schedule(s => s with { RateHz = hz });
         return hz;
     }
-    protected override double ApplyGain(double db) { Schedule(s => s with { GainDb = db, Agc = false }); return db; }
-    protected override void ApplyAgc(bool on) => Schedule(s => s with { Agc = on });
+    protected override double ApplyGain(string side, double db)
+    {
+        Schedule(s => side == RxSides.B ? s with { GainDbB = db, AgcB = false } : s with { GainDb = db, Agc = false });
+        return db;
+    }
+    protected override void ApplyAgc(string side, bool on) =>
+        Schedule(s => side == RxSides.B ? s with { AgcB = on } : s with { Agc = on });
     // Antenna and bandwidth change nothing the synthetic scene models, but they are radio changes all
     // the same: each has a position where it took effect, and that is what gets announced.
-    protected override string ApplyAntenna(string name) { Schedule(s => s); return name; }
+    protected override string ApplyAntenna(string side, string name) { Schedule(s => s); return name; }
     protected override double ApplyBandwidth(double hz) { Schedule(s => s); return hz; }
 
     /// <summary>Queue a change for the generator. It takes effect at one exact ring position: SettleMs
@@ -248,7 +300,7 @@ internal sealed class SimBackend : RadioBackendBase
         {
             long settle = (long)(_asked.RateHz * SettleMs / 1000.0);
             _asked = change(_asked);
-            long at = Math.Max(Math.Max(Ring.Written + settle, _committedThrough), _lastChangeAt);
+            long at = Math.Max(Math.Max(RadioPosition + settle, _committedThrough), _lastChangeAt);
             _changes.Enqueue((at, _asked));
             _lastChangeAt = at;
         }
@@ -270,7 +322,9 @@ internal sealed class SimBackend : RadioBackendBase
         .Set("kind", "sim").Set("blocks", Interlocked.Read(ref _blocks)).Set("behind_ms", Interlocked.Read(ref _behindMs))
         .Set("settle_ms", SettleMs)
         .Set("tx_coupling_db", TxCouplingDb)
-        .Set("tx_gain_db", Volatile.Read(ref _txGainDb));
+        .Set("tx_gain_db", Volatile.Read(ref _txGainDb))
+        .Set("side_b_gain_db", SideBGainDb)
+        .Set("side_b_phase_deg", SideBPhaseDeg);
 
     private void Generate()
     {
@@ -292,13 +346,20 @@ internal sealed class SimBackend : RadioBackendBase
         }
 
         var iq = new short[Block * 2];
+        var iqB = new short[Block * 2];
         var acc = new double[Block * 2];
+        var raw = new double[Block * 2];     // side A's signals before its gain (the TX mix adds into acc after)
+        var accB = new double[Block * 2];
+        // Side B hears each signal about ITS centre: A's phasors, turned by psi(p) = -2 pi (loB - loA) p / rate.
+        double psiR = 1, psiI = 0;
+        double phiR = Math.Cos(SideBPhaseDeg * Math.PI / 180), phiI = Math.Sin(SideBPhaseDeg * Math.PI / 180);
+        bool wasA = true, wasB = false;
         int m = _scene.Length;
         var pr = new double[m];
         var pi = new double[m];
         var modPhase = new double[m];
         for (int k = 0; k < m; k++) pr[k] = 1.0;
-        long produced = 0;               // = Ring.Written: the generator is the ring's only writer
+        long produced = 0;               // the radio position: the generator is the rings' only writer
         long clockStartTs = Stopwatch.GetTimestamp();
         var clock = Stopwatch.StartNew();
         double rateAtStart = 0;
@@ -329,6 +390,14 @@ internal sealed class SimBackend : RadioBackendBase
             long lo = current.LoHz;
             double rate = current.RateHz;
             double gainDb = current.Agc ? 30 : current.GainDb;
+            bool streamA = current.StreamA, streamB = current.StreamB;
+            // A side switched on starts HERE, at the position the other stands at (section 9.23.2 item 1).
+            if (streamA && !wasA) RingOf(RxSides.A).AlignTo(produced);
+            if (streamB && !wasB) RingOf(RxSides.B).AlignTo(produced);
+            wasA = streamA;
+            wasB = streamB;
+            long loB = current.LoB;
+            double gainB = Math.Pow(10, ((current.AgcB ? 30 : current.GainDbB) - 30 + SideBGainDb) / 20.0);
             if (rate != rateAtStart)
             {
                 // A new rate restarts the pacing reference; the signals keep their phases.
@@ -340,13 +409,18 @@ internal sealed class SimBackend : RadioBackendBase
             // The RF gain moves every signal and the noise together, and clips at full scale like an ADC.
             double gain = Math.Pow(10, (gainDb - 30) / 20.0);
             double noiseAmp = Math.Pow(10, _noiseDbfs / 20.0) * gain * 32767.0 / Math.Sqrt(2);
-            Array.Clear(acc, 0, n * 2);
+            double noiseAmpB = Math.Pow(10, _noiseDbfs / 20.0) * gainB * 32767.0 / Math.Sqrt(2);
+            Array.Clear(raw, 0, n * 2);
+            Array.Clear(accB, 0, n * 2);
             for (int k = 0; k < m; k++)
             {
                 var sig = _scene[k];
+                // Each side hears only what falls inside ITS window; the phasor is referenced to side A's centre.
+                bool inA = streamA && Math.Abs(sig.FreqHz - lo) < rate / 2;
+                bool inB = streamB && Math.Abs(sig.FreqHz - loB) < rate / 2;
+                if (!inA && !inB) continue;
                 double off = sig.FreqHz - lo;
-                if (Math.Abs(off) >= rate / 2) continue;
-                double amp0 = Math.Pow(10, sig.LevelDbfs / 20.0) * gain * 32767.0;
+                double amp0 = Math.Pow(10, sig.LevelDbfs / 20.0) * 32767.0;
                 double mstep = 2 * Math.PI * sig.ModRateHz * Sub / rate;
                 double r = pr[k], q = pi[k], mp = modPhase[k];
                 for (int b = 0; b < n; b += Sub)
@@ -359,8 +433,16 @@ internal sealed class SimBackend : RadioBackendBase
                     double sr = Math.Cos(w), si = Math.Sin(w);
                     for (int t = b; t < e; t++)
                     {
-                        acc[2 * t] += a * r;
-                        acc[2 * t + 1] += a * q;
+                        if (inA)
+                        {
+                            raw[2 * t] += a * r;
+                            raw[2 * t + 1] += a * q;
+                        }
+                        if (inB)
+                        {
+                            accB[2 * t] += a * r;
+                            accB[2 * t + 1] += a * q;
+                        }
                         double nr = r * sr - q * si;
                         q = r * si + q * sr;
                         r = nr;
@@ -371,6 +453,35 @@ internal sealed class SimBackend : RadioBackendBase
                 pr[k] = r / mag;
                 pi[k] = q / mag;
                 modPhase[k] = mp % (2 * Math.PI);
+            }
+            for (int i = 0; i < n * 2; i++) acc[i] = raw[i] * gain;
+            if (streamB)
+            {
+                // Side B: its gain, its stated phase, and psi turning A's phasors to B's centre - one rotation per sample.
+                double w = -2 * Math.PI * (loB - lo) / rate;
+                double wr = Math.Cos(w), wi = Math.Sin(w);
+                for (int t = 0; t < n; t++)
+                {
+                    double xr = accB[2 * t], xi = accB[2 * t + 1];
+                    double yr = xr * psiR - xi * psiI, yi = xr * psiI + xi * psiR;
+                    accB[2 * t] = gainB * (yr * phiR - yi * phiI);
+                    accB[2 * t + 1] = gainB * (yr * phiI + yi * phiR);
+                    double npr = psiR * wr - psiI * wi;
+                    psiI = psiR * wi + psiI * wr;
+                    psiR = npr;
+                }
+                double pm = Math.Sqrt(psiR * psiR + psiI * psiI);
+                psiR /= pm;
+                psiI /= pm;
+            }
+            else if (loB != lo)
+            {
+                // Not streaming, psi still runs: the relative phase is a function of position, not of who listened.
+                double w = -2 * Math.PI * (loB - lo) / rate * n;
+                double cr = Math.Cos(w), ci = Math.Sin(w);
+                double npr = psiR * cr - psiI * ci;
+                psiI = psiR * ci + psiI * cr;
+                psiR = npr;
             }
             // What this radio is transmitting, heard by its own receiver (section 9.17 P4-b): its samples
             // are taken here, at the TX rate against this clock, so this thread is its DAC.
@@ -390,9 +501,20 @@ internal sealed class SimBackend : RadioBackendBase
             }
 
             int start = (int)(Uniform() * (NoiseLen - Block)) * 2;
-            for (int i = 0; i < n * 2; i++)
-                iq[i] = (short)Math.Clamp(Math.Round(acc[i] + noise[start + i] * noiseAmp), -32768, 32767);
-            Ring.Write(iq.AsSpan(0, n * 2));
+            if (streamA)
+            {
+                for (int i = 0; i < n * 2; i++)
+                    iq[i] = (short)Math.Clamp(Math.Round(acc[i] + noise[start + i] * noiseAmp), -32768, 32767);
+                RingOf(RxSides.A).Write(iq.AsSpan(0, n * 2));
+            }
+            if (streamB)
+            {
+                // Its own noise: another stretch of the table, never side A's.
+                int startB = (int)(Uniform() * (NoiseLen - Block)) * 2;
+                for (int i = 0; i < n * 2; i++)
+                    iqB[i] = (short)Math.Clamp(Math.Round(accB[i] + noise[startB + i] * noiseAmpB), -32768, 32767);
+                RingOf(RxSides.B).Write(iqB.AsSpan(0, n * 2));
+            }
             produced += n;
             Interlocked.Increment(ref _blocks);
 

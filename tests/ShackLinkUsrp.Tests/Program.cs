@@ -87,6 +87,10 @@ internal static partial class Program
         Run("9.20: UHD's serial rule, ported (hexadecimal numbers, not strings)", UhdSerialRuleCases);
         Run("9.20: which B2xx to open, and when to refuse", UhdOpenPlanCases);
         Run("9.20: the UHD open path, pinned in the source", UhdOpenSourceRules);
+        Run("9.23 DS2: a ring aligned to the other side's position", RingAlignCases);
+        Run("9.23 DS2: the NCO's phase is the radio position's", NcoAnchorCases);
+        Run("9.23 DS2: both receive sides of the synthetic radio", SimTwoSides);
+        Run("9.23 DS2: what only a board can prove, pinned in the source", SidesSourceRules);
 
         try { Directory.Delete(_temp, true); } catch { }
         Console.WriteLine();
@@ -781,11 +785,23 @@ internal static partial class Program
     {
         string root = RepoRoot();
         string backend = File.ReadAllText(Path.Combine(root, "src", "ShackLinkUsrp", "Radio", "RadioBackendBase.cs"));
-        foreach (var setter in new[] { "void SetLo(long hz)", "void SetRate(double hz)", "void SetGain(double db)", "void SetAgc(bool on)",
-                                       "void SetAntenna(string name)", "void SetBandwidth(double hz)", "string SetSetting(string key, string value)" })
+        foreach (var setter in new[] { "void SetLo(long hz)", "void SetRate(double hz)", "void SetBandwidth(double hz)",
+                                       "string SetSetting(string key, string value)",
+                                       // section 9.23: the per-side setters, the side switch and a side's centre
+                                       "void SetGain(string side, double db)", "void SetAgc(string side, bool on)",
+                                       "void SetAntenna(string side, string name)", "void SetRxSides(IReadOnlyList<string> sides)",
+                                       "void SetCenter(string side, long hz)" })
         {
             string? body = MemberBody(backend, "public " + setter);
             Check(body != null && body.Contains("Announce"), $"RadioBackendBase.{setter} announces the change to every pipeline");
+        }
+        // The one-side setters are side A's: each goes through the per-side one, which announces.
+        foreach (var (setter, sided) in new[] { ("void SetGain(double db)", "SetGain(RxSides.A, db)"), ("void SetAgc(bool on)", "SetAgc(RxSides.A, on)"),
+                                                ("void SetAntenna(string name)", "SetAntenna(RxSides.A, name)") })
+        {
+            int at = backend.IndexOf("public " + setter, StringComparison.Ordinal);
+            string line = at < 0 ? "" : backend.Substring(at, Math.Max(0, backend.IndexOf('\n', at) - at));
+            Check(line.Contains("=> " + sided), $"RadioBackendBase.{setter} is side A's, through {sided}");
         }
         string worker = File.ReadAllText(Path.Combine(root, "src", "ShackLinkUsrp", "Pipelines", "SpectrumWorker.cs"));
         int reads = CountOf(worker, "RowGainDb");

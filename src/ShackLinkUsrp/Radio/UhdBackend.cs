@@ -24,6 +24,13 @@ internal sealed record UhdBackendOptions
     public long LoHz { get; init; } = 100_000_000;
     /// <summary>RF LO offset from the centre, compensated in the FPGA DDC, so the DC spike is off-centre.</summary>
     public long DcOffsetHz { get; init; }
+    /// <summary>
+    /// <c>--dual-rates</c>: the wide rates offered while BOTH receive sides stream. EMPTY BY DEFAULT: a rate is
+    /// offered with two sides only once it has been measured clean with two sides on this OS and USB format
+    /// (ShackLink docs/usrp_b210_support.md section 9.23.2 item 4, DS0), and until then the option is the bench's
+    /// way in - said in the log whenever it is used.
+    /// </summary>
+    public double[] DualRatesHz { get; init; } = Array.Empty<double>();
 }
 
 /// <summary>
@@ -38,6 +45,12 @@ internal sealed class UhdBackend : RadioBackendBase
     private readonly object _radioLock = new();
     private UhdUsrp? _usrp;
     private UhdRxStreamer? _streamer;
+    /// <summary>The sides the receive streamer carries, in its channel order (section 9.23).</summary>
+    private string[] _streamSides = RxSides.OnlyA;
+    /// <summary>True once the sidecar has set the master clock itself: UHD then never chooses one again (S4), so
+    /// every later clock is set here too.</summary>
+    private bool _explicitClock;
+    private int _rxChannels = 1;
     private Thread? _recvThread;
     private volatile bool _stopRecv;
     private long _dcOffsetHz;
@@ -152,6 +165,8 @@ internal sealed class UhdBackend : RadioBackendBase
         var gain = usrp.GetRxGainRange();
         var bw = usrp.GetRxBandwidthRange();
         var ants = usrp.GetRxAntennas();
+        _rxChannels = usrp.RxChannelCount;
+        bool twoSides = _rxChannels >= 2;
         Caps = new RadioCaps
         {
             FreqMinHz = (long)Math.Ceiling(freq.Start),
@@ -169,14 +184,30 @@ internal sealed class UhdBackend : RadioBackendBase
             Agc = true,
             BandwidthMinHz = bw.Start,
             BandwidthMaxHz = bw.Stop,
+            // The default subdev spec lists both sides of a B210: channel 0 is RX A, channel 1 RX B (S9).
+            RxSides = twoSides ? new[] { RxSides.A, RxSides.B } : null,
+            DualRatesHz = twoSides ? _opt.DualRatesHz.Where(r => OfferedRates(_opt.OtwFormat).Contains(r) && SideRules.DualClockHz(r) > 0).ToArray() : null,
         };
+        if (twoSides && _opt.DualRatesHz.Length > 0)
+            Log($"BENCH: two sides are offered at {string.Join(", ", Caps.DualRatesHz!.Select(r => r.ToString("0", CultureInfo.InvariantCulture)))} S/s by --dual-rates, " +
+                "not by a measurement on this machine (section 9.23.2 item 4)");
 
         lock (_radioLock) _usrp = usrp;
         double rate = usrp.SetRxRate(_opt.WideRateHz);
         var tune = usrp.TuneRx(_opt.LoHz, _dcOffsetHz);
         double g = usrp.SetRxGain(30);
         string ant = ants.Contains("RX2") ? usrp.SetRxAntenna("RX2") : usrp.GetRxAntenna();
-        double bandwidth = usrp.SetRxBandwidth(Math.Min(rate, bw.Stop));
+        double bandwidth = SetBandwidthBothChains(usrp, Math.Min(rate, bw.Stop));
+        if (twoSides)
+        {
+            // RX B at open: its own gain and port, the same rate (a two-channel streamer has one rate, S6), not streaming.
+            double gB = usrp.SetRxGain(30, 1);
+            var antsB = usrp.GetRxAntennas(1);
+            string antB = antsB.Contains("RX2") ? usrp.SetRxAntenna("RX2", 1) : usrp.GetRxAntenna(1);
+            usrp.SetRxRate(rate, 1);
+            UpdateSideB(gainDb: gB, agc: false, antenna: antB, centerHz: (long)Math.Round(tune.ReadbackHz));
+        }
+        UpdateRfLo((long)Math.Round(tune.ActualRfHz));
         _masterClock = usrp.GetMasterClockRate();
         UpdateState(s =>
         {
@@ -371,11 +402,14 @@ internal sealed class UhdBackend : RadioBackendBase
         if ((code & UhdAsyncEventCode.TimeError) != 0) Interlocked.Increment(ref _txTimeErrors);
     }
 
+    private static int Chan(string side) => side == RxSides.B ? 1 : 0;
+
     private void StartStreaming()
     {
         UhdUsrp usrp;
         lock (_radioLock) usrp = _usrp ?? throw new InvalidOperationException("the radio is not open");
-        _streamer = usrp.CreateRxStreamer(_opt.OtwFormat);
+        // ONE streamer for every streaming side (S5): an overflow restarts them together, and the rings stay in lockstep.
+        _streamer = usrp.CreateRxStreamer(_opt.OtwFormat, "", _streamSides.Select(Chan).ToArray());
         _stopRecv = false;
         _recvThread = new Thread(RecvLoop) { IsBackground = true, Name = "UhdRecv", Priority = ThreadPriority.Highest };
         _recvThread.Start();
@@ -394,7 +428,9 @@ internal sealed class UhdBackend : RadioBackendBase
     {
         var s = _streamer!;
         UhdUsrp.TrySetThreadPriority();
-        var buf = new short[Math.Max(s.MaxSamplesPerPacket, 1) * 8 * 2];
+        var sides = _streamSides;
+        var rings = sides.Select(RingOf).ToArray();
+        var bufs = sides.Select(_ => new short[Math.Max(s.MaxSamplesPerPacket, 1) * 8 * 2]).ToArray();
         int silentMs = 0;
         var started = System.Diagnostics.Stopwatch.StartNew();
         bool first = true;
@@ -403,7 +439,7 @@ internal sealed class UhdBackend : RadioBackendBase
             s.StartContinuous();
             while (!_stopRecv)
             {
-                int got = s.Recv(buf, first ? 3.0 : 0.25, out var md);
+                int got = s.Recv(bufs, first ? 3.0 : 0.25, out var md);
                 Interlocked.Increment(ref _recvCalls);
                 if (got > 0)
                 {
@@ -412,7 +448,8 @@ internal sealed class UhdBackend : RadioBackendBase
                         Interlocked.Exchange(ref _lateFirstMs, started.ElapsedMilliseconds);
                         first = false;
                     }
-                    Ring.Write(buf.AsSpan(0, got * 2));
+                    // The same count into every streaming side's ring: radio position n is one instant on all.
+                    for (int i = 0; i < rings.Length; i++) rings[i].Write(bufs[i].AsSpan(0, got * 2));
                     Interlocked.Add(ref _recvSamples, got);
                     silentMs = 0;
                 }
@@ -471,10 +508,65 @@ internal sealed class UhdBackend : RadioBackendBase
         }
     }
 
-    protected override long ApplyLo(long hz)
+    protected override double MasterClockHz => _masterClock;
+
+    /// <summary>
+    /// One side: the classic tune on that side's channel, the LO at the centre plus the offset. Two: ONE tune on
+    /// channel 0 with the RF LO where the base placed it, then channel 1's DDC alone (rf policy NONE), then both
+    /// read back - never a tune on channel 1, which would move the LO under channel 0 (section 9.23.2 item 8).
+    /// </summary>
+    protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers) ApplyTuning(long rfLoHz, IReadOnlyDictionary<string, long> centers)
     {
-        var r = Usrp.TuneRx(hz, Interlocked.Read(ref _dcOffsetHz));
-        return (long)Math.Round(r.ReadbackHz);
+        var u = Usrp;
+        var result = new Dictionary<string, long>();
+        if (centers.Count == 1)
+        {
+            var (side, c) = centers.First();
+            var r = u.TuneRx(c, rfLoHz - c, Chan(side));
+            result[side] = (long)Math.Round(r.ReadbackHz);
+            return ((long)Math.Round(r.ActualRfHz), result);
+        }
+        long cA = centers[RxSides.A], cB = centers[RxSides.B];
+        var ra = u.TuneRx(cA, rfLoHz - cA, 0);
+        var rb = u.TuneRxDspOnly(cB, 1);
+        result[RxSides.A] = (long)Math.Round(u.GetRxFrequency(0));
+        result[RxSides.B] = (long)Math.Round(rb.ReadbackHz);
+        if (Math.Abs(ra.ActualRfHz - rb.ActualRfHz) > 1)
+            Log($"UNEXPECTED: channel 1's tune reports the RF LO at {rb.ActualRfHz:0} Hz, channel 0's at {ra.ActualRfHz:0} Hz - they share one synthesizer");
+        return ((long)Math.Round(ra.ActualRfHz), result);
+    }
+
+    /// <summary>Set the clock the base chose, when it must be set: always once the sidecar has set one (UHD's
+    /// automatic clock is then off for good), and whenever two sides are asked for. The rate is set again on every
+    /// channel after it, because a new clock re-plans each DDC's decimation.</summary>
+    private void SetClockFor(UhdUsrp u, double clockHz, double rateHz, bool twoSides)
+    {
+        if (clockHz <= 0 || (!_explicitClock && !twoSides)) return;
+        double before = u.GetMasterClockRate();
+        if (Math.Abs(before - clockHz) > 0.5)
+        {
+            u.SetMasterClockRate(clockHz);
+            Log($"master clock {before:0} -> {u.GetMasterClockRate():0} Hz (asked {clockHz:0}) for {(twoSides ? "two sides" : "one side")} at {rateHz:0} S/s");
+        }
+        _explicitClock = true;
+        for (int ch = 0; ch < _rxChannels; ch++) u.SetRxRate(rateHz, ch);
+        _masterClock = u.GetMasterClockRate();
+    }
+
+    protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers, double ClockHz) ApplyRxSides(
+        IReadOnlyList<string> sides, long rfLoHz, IReadOnlyDictionary<string, long> centers, double clockHz)
+    {
+        // The streamer is made again: which chains run follows from which streamers exist (S8).
+        StopStreaming();
+        var u = Usrp;
+        SetClockFor(u, clockHz, WideRateHz, sides.Count > 1);
+        _streamSides = RxSides.Canonical(sides) ?? RxSides.OnlyA;
+        // Nothing writes the rings now: a side switched on starts at the position the other has reached.
+        AlignRings(_streamSides);
+        var tuned = ApplyTuning(rfLoHz, centers);
+        if (_txFreqRange != null) RebuildTxCaps(u, WideRateHz);
+        StartStreaming();
+        return (tuned.RfLoHz, tuned.Centers, _masterClock);
     }
 
     protected override double ApplyRate(double hz)
@@ -499,20 +591,45 @@ internal sealed class UhdBackend : RadioBackendBase
                 Log($"TX rate moved from {txRate:0} to {moved:0} S/s: {txRate:0} does not divide the new wide rate {hz:0} S/s");
             }
         }
-        double eff = u.SetRxRate(hz);
+        double eff;
+        if (_explicitClock || _streamSides.Length > 1)
+        {
+            // The sidecar chooses the clock now (S4): the two-side clock, or UHD's own formula for one side.
+            SetClockFor(u, ClockFor(_streamSides.Length, hz), hz, _streamSides.Length > 1);
+            eff = u.GetRxRate(0);
+        }
+        else
+        {
+            eff = u.SetRxRate(hz);
+            if (_rxChannels >= 2) u.SetRxRate(hz, 1);
+        }
         _masterClock = u.GetMasterClockRate();
         if (_txFreqRange != null) RebuildTxCaps(u, eff);
         StartStreaming();
         return eff;
     }
 
-    protected override double ApplyGain(double db) => Usrp.SetRxGain(db);
+    // Gain, AGC and the antenna are per chain on the AD9361 (S2): each side's own channel.
+    protected override double ApplyGain(string side, double db) => Usrp.SetRxGain(db, Chan(side));
 
-    protected override void ApplyAgc(bool on) => Usrp.SetRxAgc(on);
+    protected override void ApplyAgc(string side, bool on) => Usrp.SetRxAgc(on, Chan(side));
 
-    protected override string ApplyAntenna(string name) => Usrp.SetRxAntenna(name);
+    protected override string ApplyAntenna(string side, string name) => Usrp.SetRxAntenna(name, Chan(side));
 
-    protected override double ApplyBandwidth(double hz) => Usrp.SetRxBandwidth(hz);
+    protected override double ApplyBandwidth(double hz) => SetBandwidthBothChains(Usrp, hz);
+
+    /// <summary>
+    /// ONE analog filter serves both chains (S3), but UHD keeps a bandwidth node PER FRONTEND with no publisher:
+    /// writing one side's changes the chip for both and leaves the other side's node reading its old value. So the
+    /// same value is written to EVERY channel's node - both then say what the chip holds - and the last write's
+    /// read-back is the answer.
+    /// </summary>
+    private double SetBandwidthBothChains(UhdUsrp u, double hz)
+    {
+        double eff = u.SetRxBandwidth(hz, 0);
+        for (int ch = 1; ch < _rxChannels; ch++) eff = u.SetRxBandwidth(hz, ch);
+        return eff;
+    }
 
     protected override JsonArray RadioSettings()
     {
@@ -572,6 +689,9 @@ internal sealed class UhdBackend : RadioBackendBase
         .Set("uhd_path", UhdLoader.LoadedPath)
         .Set("otw_format", _opt.OtwFormat)
         .Set("master_clock_hz", _masterClock)
+        .Set("explicit_clock", _explicitClock)
+        .Set("rx_channels", _rxChannels)
+        .Set("stream_sides", _streamSides)
         .Set("recv_calls", Interlocked.Read(ref _recvCalls))
         .Set("recv_samples", Interlocked.Read(ref _recvSamples))
         .Set("timeouts", Interlocked.Read(ref _timeouts))

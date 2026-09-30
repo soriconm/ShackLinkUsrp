@@ -20,7 +20,10 @@ public sealed unsafe class UhdRxStreamer : IDisposable
 
     public string CpuFormat { get; }
     public string OtwFormat { get; }
-    public int Channel { get; }
+    /// <summary>The channels it carries, in the order its buffers are handed to <see cref="Recv(short[][], double, out UhdRxMetadata, bool)"/>.</summary>
+    public int[] Channels { get; }
+
+    public int Channel => Channels[0];
 
     /// <summary>uhd_rx_streamer_max_num_samps: the samples one transport packet carries - the
     /// device's own quantum (docs/usrp_b210_support.md §3.5), not a number to invent.</summary>
@@ -28,12 +31,13 @@ public sealed unsafe class UhdRxStreamer : IDisposable
 
     public bool IsStreaming => _streaming;
 
-    internal UhdRxStreamer(UhdUsrp owner, string cpuFormat, string otwFormat, string streamArgs, int chan)
+    internal UhdRxStreamer(UhdUsrp owner, string cpuFormat, string otwFormat, string streamArgs, int[] channels)
     {
         _owner = owner;
         CpuFormat = cpuFormat;
         OtwFormat = otwFormat;
-        Channel = chan;
+        if (channels == null || channels.Length < 1) throw new ArgumentException("a streamer carries at least one channel", nameof(channels));
+        Channels = (int[])channels.Clone();
 
         IntPtr h = IntPtr.Zero;
         Throw(uhd_rx_streamer_make(&h), "uhd_rx_streamer_make", IntPtr.Zero);
@@ -42,7 +46,8 @@ public sealed unsafe class UhdRxStreamer : IDisposable
         IntPtr cpu = AllocAnsi(cpuFormat);
         IntPtr otw = AllocAnsi(otwFormat);
         IntPtr args = AllocAnsi(streamArgs); // "" not NULL: stream_args_c_to_cpp does no null check
-        nuint channel = (nuint)chan;
+        nuint* channelList = stackalloc nuint[Channels.Length];
+        for (int i = 0; i < Channels.Length; i++) channelList[i] = (nuint)Channels[i];
         try
         {
             var sa = new uhd_stream_args_t
@@ -50,8 +55,8 @@ public sealed unsafe class UhdRxStreamer : IDisposable
                 cpu_format = cpu,
                 otw_format = otw,
                 args = args,
-                channel_list = (IntPtr)(&channel),
-                n_channels = 1,
+                channel_list = (IntPtr)channelList,
+                n_channels = Channels.Length,
             };
             UhdError e = uhd_usrp_get_rx_stream(owner.Handle, &sa, _h);
             if (e != UhdError.None)
@@ -112,7 +117,7 @@ public sealed unsafe class UhdRxStreamer : IDisposable
         _streaming = false;
         if (e != UhdError.None) throw new UhdException(e, "uhd_rx_streamer_issue_stream_cmd(stop)", StreamerLastError());
 
-        var scratch = new short[Math.Max(2, MaxSamplesPerPacket * 2)];
+        var scratch = Channels.Select(_ => new short[Math.Max(2, MaxSamplesPerPacket * 2)]).ToArray();
         for (int i = 0; i < 256; i++)
         {
             int got = Recv(scratch, drainTimeoutSeconds, out UhdRxMetadata md, onePacket: true);
@@ -126,6 +131,40 @@ public sealed unsafe class UhdRxStreamer : IDisposable
     /// OVERFLOW means the host fell behind and the FPGA dropped samples). A call-level failure (a
     /// dead device) throws.
     /// </summary>
+    /// <summary>
+    /// Receive into one buffer per channel (<see cref="Channels"/>' order), every buffer the same length: UHD
+    /// fills them with the SAME count of samples from the same instants. Returns that count.
+    /// </summary>
+    public int Recv(short[][] interleavedIq, double timeoutSeconds, out UhdRxMetadata metadata, bool onePacket = false)
+    {
+        if (interleavedIq.Length != Channels.Length)
+            throw new ArgumentException($"{Channels.Length} buffer(s) are needed, one per channel", nameof(interleavedIq));
+        if (Channels.Length == 1) return Recv(interleavedIq[0], timeoutSeconds, out metadata, onePacket);
+        IntPtr h = Live;
+        int samps = interleavedIq.Min(b => b.Length) / 2;
+        nuint got = 0;
+        var pins = new System.Runtime.InteropServices.GCHandle[interleavedIq.Length];
+        try
+        {
+            void** bufs = stackalloc void*[interleavedIq.Length];
+            for (int i = 0; i < interleavedIq.Length; i++)
+            {
+                pins[i] = System.Runtime.InteropServices.GCHandle.Alloc(interleavedIq[i], System.Runtime.InteropServices.GCHandleType.Pinned);
+                bufs[i] = (void*)pins[i].AddrOfPinnedObject();
+            }
+            IntPtr md = _md;
+            UhdError e = uhd_rx_streamer_recv(h, bufs, (nuint)samps, &md, timeoutSeconds, onePacket ? (byte)1 : (byte)0, &got);
+            if (e != UhdError.None) throw new UhdException(e, "uhd_rx_streamer_recv", StreamerLastError());
+        }
+        finally
+        {
+            foreach (var p in pins)
+                if (p.IsAllocated) p.Free();
+        }
+        metadata = ReadMetadata();
+        return (int)got;
+    }
+
     public int Recv(Span<short> interleavedIq, double timeoutSeconds, out UhdRxMetadata metadata, bool onePacket = false)
     {
         IntPtr h = Live;

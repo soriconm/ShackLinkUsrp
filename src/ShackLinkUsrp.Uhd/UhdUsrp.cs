@@ -194,6 +194,31 @@ public sealed unsafe class UhdUsrp : IDisposable
                                  res.target_dsp_freq, res.actual_dsp_freq, readback);
     });
 
+    /// <summary>
+    /// Move ONLY channel <paramref name="chan"/>'s DDC so its samples are centred on <paramref name="targetHz"/>,
+    /// the RF LO left where it is (rf policy NONE, dsp AUTO) - how the second side of a B210 is tuned, because its
+    /// one RX synthesizer is the first side's too (ShackLink docs/usrp_b210_support.md section 9.23 S1). The DDC
+    /// shift is what reaches the target from the LO now; the read-back is the centre the channel is actually on.
+    /// </summary>
+    public UhdTuneResult TuneRxDspOnly(double targetHz, int chan) => Locked(() =>
+    {
+        var req = new uhd_tune_request_t
+        {
+            target_freq = targetHz,
+            rf_freq_policy = PolicyNone,
+            rf_freq = 0.0,
+            dsp_freq_policy = PolicyAuto,
+            dsp_freq = 0.0,
+            args = IntPtr.Zero,
+        };
+        uhd_tune_result_t res;
+        Check(uhd_usrp_set_rx_freq(Handle, &req, (nuint)chan, &res), "uhd_usrp_set_rx_freq");
+        double readback;
+        Check(uhd_usrp_get_rx_freq(Handle, (nuint)chan, &readback), "uhd_usrp_get_rx_freq");
+        return new UhdTuneResult(res.clipped_rf_freq, res.target_rf_freq, res.actual_rf_freq,
+                                 res.target_dsp_freq, res.actual_dsp_freq, readback);
+    });
+
     public double GetRxFrequency(int chan = 0) => Locked(() =>
     {
         double v;
@@ -415,11 +440,17 @@ public sealed unsafe class UhdUsrp : IDisposable
 
     /// <summary>An RX streamer delivering interleaved sc16 on the host. <paramref name="otwFormat"/> is
     /// what crosses USB: "sc16" (4 B per sample) or "sc8" (2 B, the §2.4 throughput lever).</summary>
-    public UhdRxStreamer CreateRxStreamer(string otwFormat = "sc16", string streamArgs = "", int chan = 0)
+    public UhdRxStreamer CreateRxStreamer(string otwFormat = "sc16", string streamArgs = "", int chan = 0) =>
+        CreateRxStreamer(otwFormat, streamArgs, new[] { chan });
+
+    /// <summary>ONE streamer over <paramref name="channels"/> - UHD's "MIMO time" when there are two: an overflow
+    /// stops, flushes and restarts both together, so the channels stay sample-aligned (b200_io_impl.cpp
+    /// handle_overflow; ShackLink docs/usrp_b210_support.md section 9.23 S5).</summary>
+    public UhdRxStreamer CreateRxStreamer(string otwFormat, string streamArgs, int[] channels)
     {
         lock (_gate)
         {
-            var s = new UhdRxStreamer(this, "sc16", otwFormat, streamArgs, chan);
+            var s = new UhdRxStreamer(this, "sc16", otwFormat, streamArgs, channels);
             _streamers.Add(s);
             return s;
         }

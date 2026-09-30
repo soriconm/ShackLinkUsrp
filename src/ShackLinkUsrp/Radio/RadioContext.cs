@@ -6,11 +6,16 @@ using ShackLinkUsrp.Dsp;
 
 namespace ShackLinkUsrp.Radio;
 
-/// <summary>What a pipeline may read about the radio it hangs off. Pipelines never call the
-/// radio: they read the ring and these facts, and are TOLD about retunes and rate changes.</summary>
+/// <summary>What a pipeline may read about the radio it hangs off - ONE receive side of it (ShackLink
+/// docs/usrp_b210_support.md section 9.23): that side's ring, the centre its samples sit on and the gain
+/// its rows state. Pipelines never call the radio: they read the ring and these facts, and are TOLD about
+/// retunes and rate changes.</summary>
 internal interface IRadioContext
 {
+    /// <summary>"A" or "B" (<see cref="ShackLinkUsrp.Wire.RxSides"/>).</summary>
+    string Side { get; }
     WideRing Ring { get; }
+    /// <summary>The centre this side's wide stream sits on - never the RF LO, which the radio places.</summary>
     long LoHz { get; }
     double WideRateHz { get; }
     /// <summary>Radio overflows since the radio opened (monotonic): headers report deltas.</summary>
@@ -39,6 +44,50 @@ internal interface IRadioListener
     /// chain that leaves the LO and the rate alone: the gain, AGC, the antenna, the analog bandwidth or
     /// a named radio setting. A spectrum that integrates across one mixes two radios (A2 F3).</summary>
     void OnFrontEndChanged(long position);
+
+    /// <summary>The radio was reconfigured under this side with its centre and rate unchanged (section 9.23.2
+    /// item 3): the other side was switched on or off - the streamer made again, the clock perhaps moved - or
+    /// the RF LO was placed elsewhere under an unmoved centre. Samples at and after <paramref name="position"/>
+    /// come after it, and time between the samples before and after it may be missing.</summary>
+    void OnRadioReconfigured(long position);
+}
+
+/// <summary>
+/// One receive side of the radio as its pipelines see it (section 9.23): its own ring - written in lockstep
+/// with the other side's, so radio position n is the same instant on both - its own listeners and settle
+/// boundary, so a gain change on RX B restarts none of RX A's rows, and the side's centre and gain read from
+/// the radio. Built and owned by <see cref="RadioBackendBase"/>.
+/// </summary>
+internal sealed class SideContext : IRadioContext
+{
+    private readonly RadioBackendBase _radio;
+    internal readonly object ListenersLock = new();
+    internal readonly List<IRadioListener> Listeners = new();
+    /// <summary>A client's sweep accumulator on this side, by client id.</summary>
+    internal readonly Dictionary<int, ShackLinkUsrp.Pipelines.SweepWorker> Sweeps = new();
+    internal long SettledFromValue;
+
+    public SideContext(RadioBackendBase radio, string side, int ringSamples)
+    {
+        _radio = radio;
+        Side = side;
+        Ring = new WideRing(ringSamples);
+    }
+
+    public string Side { get; }
+    public WideRing Ring { get; }
+    public long LoHz => _radio.CenterOf(Side);
+    public double WideRateHz => _radio.WideRateHz;
+    public long Overflows => _radio.Overflows;
+    public float RowGainDb => _radio.RowGainOf(Side);
+    public int MaxFftSize => _radio.MaxFftSize;
+    public long SettledFrom => Volatile.Read(ref SettledFromValue);
+    public void Log(string line) => _radio.Log(line);
+
+    internal List<IRadioListener> Snapshot()
+    {
+        lock (ListenersLock) return Listeners.ToList();
+    }
 }
 
 /// <summary>The sidecar's one monotonic clock for time_ticks (100 ns units).</summary>

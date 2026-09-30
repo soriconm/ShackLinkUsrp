@@ -51,7 +51,7 @@ internal static class Program
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
 
         RadioBackendBase backend = opt.Sim
-            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb }
+            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
             : new UhdBackend(log, new UhdBackendOptions
             {
                 Serial = opt.Serial!,
@@ -64,6 +64,7 @@ internal static class Program
                 WideRateHz = opt.RateHz,
                 LoHz = opt.LoHz,
                 DcOffsetHz = opt.DcOffsetHz,
+                DualRatesHz = opt.DualRatesHz,
             });
 
         var server = new UsrpServer(backend, new UsrpServerOptions
@@ -191,6 +192,8 @@ internal sealed class SidecarOptions
         "  --sim-fault-after <ms>      (tests) the synthetic radio faults this long after it starts streaming\n" +
         "  --sim-settle-ms <ms>        (tests) a synthetic radio change takes effect this long after it is asked for, like in-flight USB buffers\n" +
         "  --sim-tx-coupling <dB>      how the synthetic radio hears its own transmission: L dBFS at a TX gain of G is heard at L + G + this (default -80)\n" +
+        "  --sim-side-b-gain-db <dB>   what the synthetic radio's RX B hears the scene at, relative to RX A (default -6)\n" +
+        "  --sim-side-b-phase-deg <d>  ...and at which phase from RX A (default 30)\n" +
         "  --tx-max-ms <ms>            the longest any transmission may run, whatever a client asks (default 3600000)\n" +
         "  --tx-starve-ms <ms>         a keyed IQ transmission that receives no block this long is ended (default 500)\n" +
         "  --uhd <dir>                 load uhd.dll from <dir> (default: C:\\Program Files\\UHD\\bin)\n" +
@@ -202,6 +205,7 @@ internal sealed class SidecarOptions
         "  --rate <S/s>                initial wide rate (default 10e6)\n" +
         "  --lo <Hz>                   initial LO (default 100e6)\n" +
         "  --dc-offset <Hz>            RF LO offset compensated in the FPGA DDC (default 0)\n" +
+        "  --dual-rates <S/s,...>      (bench) wide rates both receive sides may stream at before they are measured clean\n" +
         "  --port <n>                  listening port (default 0 = ephemeral, published in the rendezvous file)\n" +
         "  --listen <ip>               bind address (default 127.0.0.1)\n" +
         "  --linger <s>                exit this long after the last client leaves (default 10)\n" +
@@ -217,6 +221,8 @@ internal sealed class SidecarOptions
     public int SimFaultAfterMs;
     public int SimSettleMs;
     public double SimTxCouplingDb = SimBackend.DefaultTxCouplingDb;
+    public double SimSideBGainDb = SimBackend.DefaultSideBGainDb;
+    public double SimSideBPhaseDeg = SimBackend.DefaultSideBPhaseDeg;
     public bool SimTxCouplingSet;
     public long TxMaxMs = ProtocolConstants.DefaultTxMaxMs;
     public int TxStarveMs = ProtocolConstants.DefaultTxStarveMs;
@@ -231,6 +237,7 @@ internal sealed class SidecarOptions
     public double RateHz = 10e6;
     public long LoHz = 100_000_000;
     public long DcOffsetHz;
+    public double[] DualRatesHz = Array.Empty<double>();
     public int Port;
     public IPAddress Listen = IPAddress.Loopback;
     public int LingerSeconds = ProtocolConstants.DefaultLingerSeconds;
@@ -267,6 +274,22 @@ internal sealed class SidecarOptions
                         o.SimTxCouplingSet = true;
                         break;
                     }
+                case "--sim-side-b-gain-db":
+                    {
+                        string v = Next();
+                        if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out o.SimSideBGainDb) ||
+                            double.IsNaN(o.SimSideBGainDb) || double.IsInfinity(o.SimSideBGainDb))
+                            throw new ArgumentException($"--sim-side-b-gain-db needs a number of decibels, not \"{v}\"");
+                        break;
+                    }
+                case "--sim-side-b-phase-deg":
+                    {
+                        string v = Next();
+                        if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out o.SimSideBPhaseDeg) ||
+                            double.IsNaN(o.SimSideBPhaseDeg) || double.IsInfinity(o.SimSideBPhaseDeg))
+                            throw new ArgumentException($"--sim-side-b-phase-deg needs a number of degrees, not \"{v}\"");
+                        break;
+                    }
                 case "--tx-max-ms":
                     o.TxMaxMs = Int(a, Next());
                     if (o.TxMaxMs < 1) throw new ArgumentException("--tx-max-ms must be at least 1: every transmission has a ceiling");
@@ -287,6 +310,19 @@ internal sealed class SidecarOptions
                     if (o.OtwFormat != "sc16" && o.OtwFormat != "sc8") throw new ArgumentException("--otw is sc16 or sc8");
                     break;
                 case "--rate": o.RateHz = Double(a, Next()); break;
+                case "--dual-rates":
+                    {
+                        string v = Next();
+                        var rates = new List<double>();
+                        foreach (var part in v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        {
+                            if (!double.TryParse(part, NumberStyles.Float, CultureInfo.InvariantCulture, out double r) || !(r > 0))
+                                throw new ArgumentException($"--dual-rates needs a comma-separated list of rates in S/s, not \"{v}\"");
+                            rates.Add(r);
+                        }
+                        o.DualRatesHz = rates.ToArray();
+                        break;
+                    }
                 case "--lo": o.LoHz = (long)Double(a, Next()); break;
                 case "--dc-offset":
                     {

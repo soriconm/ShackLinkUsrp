@@ -108,6 +108,19 @@ public sealed class WideRing
         return w2 - position <= _capacity;
     }
 
+    /// <summary>Move the write position forward to <paramref name="position"/> without writing - how a receive
+    /// side switched on starts at the position the other side has reached, so one position is one instant on
+    /// both (ShackLink docs/usrp_b210_support.md section 9.23.2 item 1). Only while nothing writes the ring;
+    /// never backwards. What was in the ring before is stale and no reader is left holding it (a side's
+    /// pipelines end when it is switched off).</summary>
+    public void AlignTo(long position)
+    {
+        if (position <= Volatile.Read(ref _written)) return;
+        Interlocked.Exchange(ref _written, position);
+        if (Volatile.Read(ref _waiters) > 0)
+            lock (_signal) Monitor.PulseAll(_signal);
+    }
+
     /// <summary>The oldest position still readable.</summary>
     public long Oldest => Math.Max(0, Written - _capacity);
 }

@@ -95,6 +95,10 @@ internal abstract class SpectrumWorker : IRadioListener, IDisposable
 
     public void OnFrontEndChanged(long position) => Resync(position);
 
+    // The other side switched, or the RF LO was placed elsewhere under this side's unmoved centre: a row
+    // must not integrate across it (section 9.23.2 item 3).
+    public void OnRadioReconfigured(long position) => Resync(position);
+
     private void Resync(long position)
     {
         lock (_pendingLock)
