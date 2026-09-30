@@ -314,6 +314,8 @@ internal sealed class UhdBackend : RadioBackendBase
             MaxMs = 0,               // the server's ceiling
             QuantumSamples = _txQuantum,
             MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(usrp.GetMasterClockRate(), rates),
+            // 2R2T (section 9.23 Q3): a second TX chain to silence is what lets a burst open beside two receivers.
+            DualRx = usrp.TxChannelCount >= 2 && _rxChannels >= 2,
         }));
         if (rates.Length == 0) _txWhyNot = $"no admitted TX rate divides the wide rate {wideRate:0} S/s";
     }
@@ -374,10 +376,30 @@ internal sealed class UhdBackend : RadioBackendBase
         var u = Usrp;
         // Its own streamer, for its life (item 7). Making it powers the TX chain, which takes the AD9361
         // through ALERT and back under the receiver: a front-end change before a sample is sent.
-        var streamer = u.CreateTxStreamer();
+        UhdTxStreamer streamer;
+        if (StreamingSides.Length > 1)
+        {
+            // Two receivers stream: UHD refuses them one transmitter (b200 update_enables, section 9.23 S7), so the burst is
+            // 2R2T. TX B is SILENCED - its gain at the minimum, READ BACK before anything is made, its rate TX A's (one
+            // streamer, one rate), fed zeros every send. TRX2 then carries TX B's leakage alone; its level is UNVERIFIED.
+            var range = u.GetTxGainRange(1);
+            double quiet = u.SetTxGain(range.Start, 1);
+            if (quiet != range.Start)
+                throw new RadioRefusal(ErrorCodes.RadioFault,
+                    $"TX B could not be silenced: its gain read back {quiet} dB, not its minimum {range.Start} dB - nothing was keyed");
+            double rateB = u.SetTxRate(grant.RateHz, 1);
+            if (rateB != grant.RateHz)
+                throw new RadioRefusal(ErrorCodes.RadioFault, $"TX B's rate read back {rateB} S/s, not TX A's {grant.RateHz} S/s - nothing was keyed");
+            Log($"2R2T: both receive sides stream, so TX B is silenced (gain {quiet} dB, zeros) beside TX A; TRX2 carries its leakage");
+            streamer = u.CreateTxStreamer(new[] { 0, 1 });
+        }
+        else
+        {
+            streamer = u.CreateTxStreamer();
+        }
         AnnounceFrontEndChange();
-        if (GetState().Antenna == "TX/RX")
-            Log("the receiver is on TX/RX: for every burst from TRX1 the board hears RX2 instead (b200_impl.cpp update_atrs, " +
+        foreach (var side in grant.RxPortMoves ?? Array.Empty<string>())
+            Log($"{RxSides.Words(side)} is on TX/RX: for every burst it hears RX2 instead (b200_impl.cpp update_atrs, " +
                 "the full-duplex state) - its samples during the burst come from another port (section 9.17 item 3)");
         try
         {

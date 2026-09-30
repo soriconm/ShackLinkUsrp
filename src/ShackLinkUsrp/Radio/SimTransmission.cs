@@ -23,6 +23,8 @@ internal sealed class SimTransmission : RadioTransmission
     private double[] _re = new double[4096];
     private double[] _im = new double[4096];
     private double _ncoRe = 1.0, _ncoIm = 0.0;
+    // The same carrier as RX B hears it, about RX B's own centre (ShackLink docs/usrp_b210_support.md 9.23 Q3): its own phasor.
+    private double _ncoReB = 1.0, _ncoImB = 0.0;
     private bool _starving;
     private long _keyPosition;
     private long _ratio;          // wide samples per TX sample: an admitted TX rate divides the wide rate
@@ -39,7 +41,10 @@ internal sealed class SimTransmission : RadioTransmission
     /// exact ring positions; a step, and a sweep's end, split the block at theirs. Ring position p is due
     /// at <paramref name="baseTicks"/> + (p - <paramref name="basePosition"/>) / rate on the sidecar's clock.
     /// </summary>
-    public void Mix(double[] acc, int n, long loHz, double rateHz, double amplitude, long position, long basePosition, long baseTicks)
+    /// <param name="accB">RX B's block, when RX B streams (2R2T, section 9.23 Q3): the same transmitted samples mixed about
+    /// <paramref name="loB"/> at <paramref name="amplitudeB"/>. Null = RX A alone hears it, as before.</param>
+    public void Mix(double[] acc, int n, long loHz, double rateHz, double amplitude, long position, long basePosition, long baseTicks,
+                    double[]? accB = null, long loB = 0, double amplitudeB = 0)
     {
         if (IsFinished) return;
         if (AbortRequested)
@@ -130,7 +135,8 @@ internal sealed class SimTransmission : RadioTransmission
                 edge = Math.Min(edge, at);
             }
             int upTo = (int)Math.Min(n, edge - position);
-            MixInto(acc, j, upTo, loHz, rateHz, amplitude);
+            MixInto(acc, j, upTo, loHz, rateHz, amplitude, ref _ncoRe, ref _ncoIm);
+            if (accB != null) MixInto(accB, j, upTo, loB, rateHz, amplitudeB, ref _ncoReB, ref _ncoImB);
             j = upTo;
         }
         if (end <= position + n)
@@ -149,13 +155,13 @@ internal sealed class SimTransmission : RadioTransmission
     /// place in the receive span. Heard only where the receiver's span holds the whole band; a real
     /// receiver's filters would take anything beyond it, and folding it back in would put a signal where
     /// nothing transmits.</summary>
-    private void MixInto(double[] acc, int from, int to, long loHz, double rateHz, double amplitude)
+    private void MixInto(double[] acc, int from, int to, long loHz, double rateHz, double amplitude, ref double ncoRe, ref double ncoIm)
     {
         double shift = CenterHz - loHz;
         if (!(Math.Abs(shift) + Grant.RateHz * ProtocolConstants.TxUsableFraction / 2 < rateHz / 2)) return;
         double w = 2 * Math.PI * shift / rateHz;
         double sr = Math.Cos(w), si = Math.Sin(w);
-        double pr = _ncoRe, pi = _ncoIm;
+        double pr = ncoRe, pi = ncoIm;
         for (int j = from; j < to; j++)
         {
             double xr = _re[j], xi = _im[j];
@@ -166,8 +172,8 @@ internal sealed class SimTransmission : RadioTransmission
             pr = npr;
         }
         double mag = Math.Sqrt(pr * pr + pi * pi);
-        _ncoRe = pr / mag;
-        _ncoIm = pi / mag;
+        ncoRe = pr / mag;
+        ncoIm = pi / mag;
     }
 
     /// <summary>The synthetic radio stopped under the transmission (a fault, or it closed).</summary>

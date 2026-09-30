@@ -25,17 +25,24 @@ public sealed unsafe class UhdTxStreamer : IDisposable
 
     public string CpuFormat { get; }
     public string OtwFormat { get; }
-    public int Channel { get; }
+    public int Channel => Channels[0];
+
+    /// <summary>The channels it carries: the first sends, the rest are SILENCED - fed zeros of the same length every send
+    /// (2R2T, section 9.23 Q3).</summary>
+    public int[] Channels { get; }
+
+    private short[] _zeros = Array.Empty<short>();
 
     /// <summary>uhd_tx_streamer_max_num_samps: the samples one transport packet carries - the device's
     /// own quantum (caps.tx.quantum_samples).</summary>
     public int MaxSamplesPerPacket { get; }
 
-    internal UhdTxStreamer(UhdUsrp owner, string cpuFormat, string otwFormat, string streamArgs, int chan)
+    internal UhdTxStreamer(UhdUsrp owner, string cpuFormat, string otwFormat, string streamArgs, int[] channels)
     {
         CpuFormat = cpuFormat;
         OtwFormat = otwFormat;
-        Channel = chan;
+        if (channels == null || channels.Length < 1) throw new ArgumentException("a TX streamer carries at least one channel", nameof(channels));
+        Channels = (int[])channels.Clone();
 
         IntPtr h = IntPtr.Zero;
         UhdError me = uhd_tx_streamer_make(&h);
@@ -45,7 +52,8 @@ public sealed unsafe class UhdTxStreamer : IDisposable
         IntPtr cpu = AllocAnsi(cpuFormat);
         IntPtr otw = AllocAnsi(otwFormat);
         IntPtr args = AllocAnsi(streamArgs); // "" not NULL: stream_args_c_to_cpp does no null check
-        nuint channel = (nuint)chan;
+        nuint* channelList = stackalloc nuint[Channels.Length];
+        for (int i = 0; i < Channels.Length; i++) channelList[i] = (nuint)Channels[i];
         try
         {
             var sa = new uhd_stream_args_t
@@ -53,8 +61,8 @@ public sealed unsafe class UhdTxStreamer : IDisposable
                 cpu_format = cpu,
                 otw_format = otw,
                 args = args,
-                channel_list = (IntPtr)(&channel),
-                n_channels = 1,
+                channel_list = (IntPtr)channelList,
+                n_channels = Channels.Length,
             };
             UhdError e = uhd_usrp_get_tx_stream(owner.Handle, &sa, _h);
             if (e != UhdError.None)
@@ -111,11 +119,16 @@ public sealed unsafe class UhdTxStreamer : IDisposable
         IntPtr h = Live;
         int samps = interleavedIq.Length / 2;
         nuint sent = 0;
+        // Every silenced channel is sent the same count of zeros: one streamer's channels move together.
+        if (Channels.Length > 1 && _zeros.Length < interleavedIq.Length) _zeros = new short[interleavedIq.Length];
         fixed (short* p = interleavedIq)
+        fixed (short* z = _zeros)
         {
-            void* buf = p;
+            void** bufs = stackalloc void*[Channels.Length];
+            bufs[0] = p;
+            for (int i = 1; i < Channels.Length; i++) bufs[i] = z;
             IntPtr md = startOfBurst ? _mdStart : _mdMiddle;
-            UhdError e = uhd_tx_streamer_send(h, &buf, (nuint)samps, &md, timeoutSeconds, &sent);
+            UhdError e = uhd_tx_streamer_send(h, bufs, (nuint)samps, &md, timeoutSeconds, &sent);
             if (e != UhdError.None) throw new UhdException(e, "uhd_tx_streamer_send", LastError());
         }
         return (int)sent;
@@ -128,9 +141,10 @@ public sealed unsafe class UhdTxStreamer : IDisposable
         IntPtr h = Live;
         nuint sent = 0;
         short dummy = 0;
-        void* buf = &dummy;
+        void** bufs = stackalloc void*[Channels.Length];
+        for (int i = 0; i < Channels.Length; i++) bufs[i] = &dummy;
         IntPtr md = _mdEnd;
-        UhdError e = uhd_tx_streamer_send(h, &buf, 0, &md, timeoutSeconds, &sent);
+        UhdError e = uhd_tx_streamer_send(h, bufs, 0, &md, timeoutSeconds, &sent);
         if (e != UhdError.None) throw new UhdException(e, "uhd_tx_streamer_send(end of burst)", LastError());
     }
 

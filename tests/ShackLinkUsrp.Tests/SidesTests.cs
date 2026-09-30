@@ -273,6 +273,49 @@ internal static partial class Program
         }
     }
 
+    /// <summary>2R2T (section 9.23 Q3): with both sides streaming, the synthetic radio transmits, RX A hears its carrier at
+    /// the stated coupling and RX B at ITS stated coupling, and the grant names the side on TX/RX.</summary>
+    private static void SimTwoSidesTx()
+    {
+        var (backend, server, log) = StartSimTx("sidestx");
+        try
+        {
+            using var s = Connect(server, "sides-tx");
+            s.WaitReady(5000);
+            s.ClaimLo();
+            s.SetRxSides(new[] { "A", "B" });
+            s.SetAntenna("TX/RX", "B");
+            Check(s.Caps.Tx != null && s.Caps.Tx.DualRx, "the synthetic radio states caps.tx.dual_rx: it transmits beside two receivers");
+            s.ClaimTx();
+            long center = 100_000_000 + 20 * OnBin, carrier = center + OnBin;
+            s.SetTx(new TxSettings { CenterHz = center, GainDb = 50, RateHz = 250_000 });
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 20_000, OffsetHz = OnBin, LevelDbfs = -10 });
+            Check(t.Grant.RxPortMoves.SequenceEqual(new[] { "B" }),
+                  $"the grant names RX B - on TX/RX, it hears RX2 through every 2R2T burst - and not RX A, on RX2 ({string.Join(",", t.Grant.RxPortMoves)})");
+            Thread.Sleep(300);
+            s.Sweep(new PanoramaRequest { Bins = 4096 });
+            s.Sweep(new PanoramaRequest { Bins = 4096, Side = "B" });
+            Thread.Sleep(150);
+            var ra = s.Sweep(new PanoramaRequest { Bins = 4096 });
+            var rb = s.Sweep(new PanoramaRequest { Bins = 4096, Side = "B" });
+            double la = LevelAt(ra.Header, ra.Bins, carrier, 2e6), lb = LevelAt(rb.Header, rb.Bins, carrier, 2e6);
+            double wantA = -10 + 50 + SimBackend.DefaultTxCouplingDb, wantB = -10 + 50 + SimBackend.DefaultTxCouplingDbB;
+            Check(Math.Abs(la - wantA) < 1.0 && Math.Abs(lb - wantB) < 1.0,
+                  $"keyed beside two receivers: RX A hears the carrier at {F(la)} dBFS (coupling {SimBackend.DefaultTxCouplingDb}: {F(wantA)}), " +
+                  $"RX B at {F(lb)} (coupling {SimBackend.DefaultTxCouplingDbB}: {F(wantB)})");
+            var r = t.Stop(drain: true);
+            Check(r.WasOpen && r.Acked, $"the 2R2T burst drains on the radio's word: {r}");
+            var tel = s.GetTelemetry().GetObject("radio")?.GetObject("source");
+            Check(tel?.GetDouble("tx_coupling_b_db", double.NaN) == SimBackend.DefaultTxCouplingDbB, "the coupling into RX B is stated in the telemetry");
+        }
+        finally
+        {
+            server.Dispose();
+            backend.Dispose();
+            log.Dispose();
+        }
+    }
+
     /// <summary>What only a board can prove, pinned in the source: the two-channel streamer, the tune through
     /// channel 0 alone, the bandwidth to both chains, and the explicit clock (section 9.23.2 items 1, 8, 9; S3).</summary>
     private static void SidesSourceRules()
@@ -296,5 +339,18 @@ internal static partial class Program
         string? clock = MemberBody(uhd, "private void SetClockFor(");
         Check(clock != null && clock.Contains("_explicitClock = true;") && clock.Contains("u.SetRxRate(rateHz, ch)"),
               "once set, the clock is the sidecar's, and every channel's rate is set again after it");
+        // 2R2T (Q3): TX B silenced at its minimum gain, READ BACK, at TX A's rate, before a two-channel streamer is made.
+        string? open = MemberBody(uhd, "protected override RadioTransmission OpenTransmission(");
+        int gainAt = open?.IndexOf("u.SetTxGain(range.Start, 1)", StringComparison.Ordinal) ?? -1;
+        int refuseAt = open?.IndexOf("TX B could not be silenced", StringComparison.Ordinal) ?? -1;
+        int makeAt = open?.IndexOf("u.CreateTxStreamer(new[] { 0, 1 })", StringComparison.Ordinal) ?? -1;
+        Check(open != null && open.Contains("if (StreamingSides.Length > 1)") && gainAt >= 0 && refuseAt > gainAt && makeAt > refuseAt &&
+              open.Contains("u.SetTxRate(grant.RateHz, 1)"),
+              "with both sides streaming, TX B's gain is set to its minimum and read back (refused otherwise) BEFORE the two-channel streamer is made");
+        string streamer = File.ReadAllText(Path.Combine(root, "src", "ShackLinkUsrp.Uhd", "UhdTxStreamer.cs"));
+        string? send = MemberBody(streamer, "public int Send(");
+        Check(send != null && send.Contains("for (int i = 1; i < Channels.Length; i++) bufs[i] = z;"), "every silenced channel is sent zeros, the same count as the first");
+        string? caps = MemberBody(uhd, "private void RebuildTxCaps(");
+        Check(caps != null && caps.Contains("DualRx = usrp.TxChannelCount >= 2 && _rxChannels >= 2"), "the board states dual_rx only with a second TX chain to silence");
     }
 }

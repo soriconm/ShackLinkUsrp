@@ -93,6 +93,13 @@ internal sealed class SimBackend : RadioBackendBase
 
     public const double DefaultSideBGainDb = -6, DefaultSideBPhaseDeg = 30;
 
+    /// <summary><c>--sim-tx-coupling-b</c>: how the synthetic radio's RX B hears its own transmission (2R2T, section 9.23
+    /// Q3) - the TX sample at L dBFS and a TX gain of G is heard at L + G + this, at RX B's gain of 30 dB. A stated number,
+    /// in the telemetry as <c>tx_coupling_b_db</c>; no isolation between TRX1 and RX B's ports was measured to choose it.</summary>
+    public double TxCouplingDbB { get; init; } = DefaultTxCouplingDbB;
+
+    public const double DefaultTxCouplingDbB = -90;
+
     /// <summary>The B210's TX gain range and grid (UHD's get_tx_gain_range on the board, 0-89.75 in 0.25).</summary>
     public const double TxGainMaxDb = 89.75, TxGainStepDb = 0.25;
 
@@ -188,6 +195,8 @@ internal sealed class SimBackend : RadioBackendBase
             MaxMs = 0,              // the server's ceiling
             QuantumSamples = 0,     // not stated: the synthetic radio has no transport packet
             MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(TxRatePlan.ModelTickHz(wide), rates),
+            // It transmits with both receive sides streaming (2R2T, section 9.23 Q3): RX B hears it at its own coupling.
+            DualRx = true,
         });
     }
 
@@ -323,6 +332,7 @@ internal sealed class SimBackend : RadioBackendBase
         .Set("settle_ms", SettleMs)
         .Set("tx_coupling_db", TxCouplingDb)
         .Set("tx_gain_db", Volatile.Read(ref _txGainDb))
+        .Set("tx_coupling_b_db", TxCouplingDbB)
         .Set("side_b_gain_db", SideBGainDb)
         .Set("side_b_phase_deg", SideBPhaseDeg);
 
@@ -495,8 +505,12 @@ internal sealed class SimBackend : RadioBackendBase
                     // Position p is due at tStart + (p - producedAtRateStart) / rate on this clock: that
                     // instant, in the sidecar's ticks, is what a step at p is stamped with.
                     long baseTicks = SidecarClock.FromTimestamp(clockStartTs + (long)Math.Round(tStart * Stopwatch.Frequency));
+                    // RX B, when it streams, hears the same samples about ITS centre at its own coupling and gain (not the
+                    // scene's stated RX B offset: that is the antenna's, and this path is the board's).
+                    double gainBrx = Math.Pow(10, ((current.AgcB ? 30 : current.GainDbB) - 30) / 20.0);
                     tx.Mix(acc, n, lo, rate, 32767.0 * Math.Pow(10, (Volatile.Read(ref _txGainDb) + TxCouplingDb) / 20.0) * gain, produced,
-                           producedAtRateStart, baseTicks);
+                           producedAtRateStart, baseTicks,
+                           streamB ? accB : null, loB, 32767.0 * Math.Pow(10, (Volatile.Read(ref _txGainDb) + TxCouplingDbB) / 20.0) * gainBrx);
                 }
             }
 

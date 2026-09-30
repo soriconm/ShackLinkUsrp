@@ -653,7 +653,12 @@ internal static partial class Program
         Check(setup != null && setup.IndexOf("SetTxRate(", StringComparison.Ordinal) >= 0 &&
               setup.IndexOf("SetTxRate(", StringComparison.Ordinal) < setup.IndexOf("CreateTxStreamer(", StringComparison.Ordinal),
               "...setting an admitted TX rate before any TX streamer exists (creating one re-applies whatever rate UHD holds)");
-        Check(CountOf(ub, "CreateTxStreamer(") == 2, "a TX streamer is made in two places only: the probe at open and each transmission");
+        // Section 9.23 Q3: each transmission makes ONE streamer - one channel, or two for 2R2T - so the transmission's member
+        // holds two calls and the backend three, all inside the probe and OpenTransmission.
+        string? txOpen = MemberBody(ub, "protected override RadioTransmission OpenTransmission(");
+        Check(CountOf(ub, "CreateTxStreamer(") == 3 && setup != null && CountOf(setup, "CreateTxStreamer(") == 1 &&
+              txOpen != null && CountOf(txOpen, "CreateTxStreamer(") == 2,
+              "a TX streamer is made in two places only: the probe at open and each transmission (one channel, or two for 2R2T)");
     }
 
     private static void TxOptions()
@@ -667,6 +672,11 @@ internal static partial class Program
         try { SidecarOptions.Parse(new[] { "--serial", "KO6ETZB", "--sim-tx-coupling", "-60" }); }
         catch (ArgumentException ex) { why = ex.Message; }
         Check(why != null && why.Contains("--sim"), $"--sim-tx-coupling is refused on a real radio, in words ({why})");
+        Check(d.SimTxCouplingDbB == SimBackend.DefaultTxCouplingDbB &&
+              SidecarOptions.Parse(new[] { "--sim", "--sim-tx-coupling-b", "-75" }).SimTxCouplingDbB == -75,
+              "--sim-tx-coupling-b: RX B's coupling to its own 2R2T transmission, -90 dB unless the command line says");
+        Check(Throws(() => SidecarOptions.Parse(new[] { "--serial", "KO6ETZB", "--sim-tx-coupling-b", "-60" })),
+              "--sim-tx-coupling-b is refused on a real radio");
         Check(Throws(() => SidecarOptions.Parse(new[] { "--sim", "--tx-max-ms", "0" })), "--tx-max-ms 0 is refused: every transmission has a ceiling");
     }
 

@@ -923,6 +923,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
             StartHz = plan != null ? r.StartHz : 0,
             StopHz = plan != null ? r.StopHz : 0,
             Points = plan != null ? r.Points : 0,
+            RxPortMoves = RxPortMovesForBurst(),
         };
         RadioTransmission t;
         try
@@ -946,6 +947,23 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
     }
 
     internal void RaiseTxUnderflow(long n) => TxUnderflow?.Invoke(n);
+
+    /// <summary>
+    /// The receive sides that hear their RX2 port instead of TX/RX for every burst (section 9.23.3 <c>rx_port_moves</c>): the
+    /// B2xx's full-duplex ATR state takes a side's TX/RX port for its transmitter and gives its receiver RX2 (section 9.17 item
+    /// 3). RX A whenever it streams on TX/RX - its transmitter is the one keyed. RX B only with BOTH sides streaming, when
+    /// the transmission is 2R2T and TX B exists (silenced, but its ATR runs); a lone RX B shares no chain with TX A.
+    /// </summary>
+    private string[] RxPortMovesForBurst()
+    {
+        var moves = new List<string>();
+        lock (_stateLock)
+        {
+            if (_streamA && string.Equals(_state.Antenna, "TX/RX", StringComparison.OrdinalIgnoreCase)) moves.Add(RxSides.A);
+            if (_streamA && _streamB && string.Equals(_b.Antenna, "TX/RX", StringComparison.OrdinalIgnoreCase)) moves.Add(RxSides.B);
+        }
+        return moves.ToArray();
+    }
 
     /// <summary>A stepped source's carrier moved: <c>state.tx</c> follows it.</summary>
     internal void OnTransmissionStep(long centerHz, long loHz)

@@ -51,7 +51,7 @@ internal static class Program
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
 
         RadioBackendBase backend = opt.Sim
-            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
+            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb, TxCouplingDbB = opt.SimTxCouplingDbB, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
             : new UhdBackend(log, new UhdBackendOptions
             {
                 Serial = opt.Serial!,
@@ -194,6 +194,7 @@ internal sealed class SidecarOptions
         "  --sim-tx-coupling <dB>      how the synthetic radio hears its own transmission: L dBFS at a TX gain of G is heard at L + G + this (default -80)\n" +
         "  --sim-side-b-gain-db <dB>   what the synthetic radio's RX B hears the scene at, relative to RX A (default -6)\n" +
         "  --sim-side-b-phase-deg <d>  ...and at which phase from RX A (default 30)\n" +
+        "  --sim-tx-coupling-b <dB>    how the synthetic radio's RX B hears its own 2R2T transmission, as --sim-tx-coupling (default -90)\n" +
         "  --tx-max-ms <ms>            the longest any transmission may run, whatever a client asks (default 3600000)\n" +
         "  --tx-starve-ms <ms>         a keyed IQ transmission that receives no block this long is ended (default 500)\n" +
         "  --uhd <dir>                 load uhd.dll from <dir> (default: C:\\Program Files\\UHD\\bin)\n" +
@@ -221,6 +222,7 @@ internal sealed class SidecarOptions
     public int SimFaultAfterMs;
     public int SimSettleMs;
     public double SimTxCouplingDb = SimBackend.DefaultTxCouplingDb;
+    public double SimTxCouplingDbB = SimBackend.DefaultTxCouplingDbB;
     public double SimSideBGainDb = SimBackend.DefaultSideBGainDb;
     public double SimSideBPhaseDeg = SimBackend.DefaultSideBPhaseDeg;
     public bool SimTxCouplingSet;
@@ -271,6 +273,15 @@ internal sealed class SidecarOptions
                         if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out o.SimTxCouplingDb) ||
                             double.IsNaN(o.SimTxCouplingDb) || double.IsInfinity(o.SimTxCouplingDb))
                             throw new ArgumentException($"--sim-tx-coupling needs a number of decibels, not \"{v}\"");
+                        o.SimTxCouplingSet = true;
+                        break;
+                    }
+                case "--sim-tx-coupling-b":
+                    {
+                        string v = Next();
+                        if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out o.SimTxCouplingDbB) ||
+                            double.IsNaN(o.SimTxCouplingDbB) || double.IsInfinity(o.SimTxCouplingDbB))
+                            throw new ArgumentException($"--sim-tx-coupling-b needs a number of decibels, not \"{v}\"");
                         o.SimTxCouplingSet = true;
                         break;
                     }
@@ -353,7 +364,7 @@ internal sealed class SidecarOptions
             if (o.SimSettleMs > 0 && !o.Sim)
                 throw new ArgumentException("--sim-settle-ms is for the synthetic radio (--sim); a real radio's settle is its own");
             if (o.SimTxCouplingSet && !o.Sim)
-                throw new ArgumentException("--sim-tx-coupling is for the synthetic radio (--sim); a real radio's coupling is its own");
+                throw new ArgumentException("--sim-tx-coupling and --sim-tx-coupling-b are for the synthetic radio (--sim); a real radio's coupling is its own");
             try
             {
                 if (o.Sim) UsrpAddress.Sim(o.SimName);

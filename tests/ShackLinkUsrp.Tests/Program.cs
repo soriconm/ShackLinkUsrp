@@ -90,6 +90,7 @@ internal static partial class Program
         Run("9.23 DS2: a ring aligned to the other side's position", RingAlignCases);
         Run("9.23 DS2: the NCO's phase is the radio position's", NcoAnchorCases);
         Run("9.23 DS2: both receive sides of the synthetic radio", SimTwoSides);
+        Run("9.23 DS4: 2R2T - a transmission beside two receivers, heard on both", SimTwoSidesTx);
         Run("9.23 DS2: what only a board can prove, pinned in the source", SidesSourceRules);
 
         try { Directory.Delete(_temp, true); } catch { }

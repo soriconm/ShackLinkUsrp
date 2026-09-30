@@ -434,7 +434,12 @@ public sealed unsafe class UhdUsrp : IDisposable
     /// creating one re-applies whatever TX rate UHD holds (get_tx_stream's rate update), so the caller
     /// sets an admitted rate FIRST. It is NOT registered for <see cref="Dispose"/>: it belongs to the one
     /// thread that drives it, and its owner ends that thread before the device goes.</summary>
-    public UhdTxStreamer CreateTxStreamer(int chan = 0) => Locked(() => new UhdTxStreamer(this, "sc16", "sc16", "", chan));
+    public UhdTxStreamer CreateTxStreamer(int chan = 0) => Locked(() => new UhdTxStreamer(this, "sc16", "sc16", "", new[] { chan }));
+
+    /// <summary>ONE TX streamer over <paramref name="channels"/>: channel <c>channels[0]</c> carries what is sent, every other
+    /// channel is fed zeros (a 2R2T burst, ShackLink docs/usrp_b210_support.md section 9.23 S7 - UHD refuses two receivers
+    /// with one transmitter).</summary>
+    public UhdTxStreamer CreateTxStreamer(int[] channels) => Locked(() => new UhdTxStreamer(this, "sc16", "sc16", "", channels));
 
     // ------------------------------------------------------------------ streaming
 
