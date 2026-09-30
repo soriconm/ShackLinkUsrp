@@ -24,6 +24,14 @@ public readonly record struct ModComponent(double FrequencyHz, double Amplitude,
 /// per component: 2 pi dev a_k (cos phi_k - cos(2 pi f_k t + phi_k)) / (2 pi f_k), so it is exact at every rate with
 /// no discrete-sum error. For a sine that is beta (1 - cos theta): the carrier at L + 20 log10|J0(beta)|, the k-th
 /// pair at L + 20 log10|Jk(beta)|. The envelope is A: an FM signal's peak is its carrier's level.</item>
+/// <item><b>PM</b>: the carrier's phase turned by beta x(t), beta the peak phase deviation in radians - for a sine
+/// the same Bessel lines as an FM of index beta (section 9.21 Q3).</item>
+/// <item><b>DSB</b>: A x(t) at the carrier, which is suppressed: the level is the PEAK (PEP, section 9.21 Q1), each
+/// component's pair at L + 20 log10(a_k / 2).</item>
+/// <item><b>SSB</b>: A x_a(t) / P_a, where x_a is the wave's analytic signal - every component's
+/// -j a_k e^(j(2 pi f_k t + phi_k)), one side of the carrier for USB, its conjugate for LSB - and P_a the peak of its
+/// envelope (the library's). Generated EXACTLY: no Hilbert filter, so the opposite sideband and the carrier are the
+/// sc16 rounding's (section 9.21 Q2), and the level is again the peak. A sine is ONE line at L.</item>
 /// </list>
 /// Every component carries its own phasor, rotated each sample and renormalised on the one sample count, so the
 /// samples are the same however the calls are cut. A signal above full scale, or one whose band leaves the TX
@@ -36,6 +44,10 @@ public sealed class ModGenerator : IIqGenerator
     {
         Am,
         Fm,
+        Pm,
+        Dsb,
+        Usb,
+        Lsb,
     }
 
     private const int RenormEvery = 1024;
@@ -49,6 +61,8 @@ public sealed class ModGenerator : IIqGenerator
     private readonly double[] _sRe, _sIm;       // each component's rotation per sample
     private readonly double[] _fmCoef;          // FM: dev a_k / f_k, the exact integral's coefficient
     private readonly double _fmStart;           // FM: the sum of dev a_k cos(phi_k) / f_k, so the phase starts at 0
+    private readonly double _pmBeta;            // PM: the peak phase deviation, radians
+    private readonly double _ssbScale;          // SSB: 1 / P_a, so the envelope's peak is the level
     private int _sinceRenorm;
 
     public Kind Modulation { get; }
@@ -71,11 +85,20 @@ public sealed class ModGenerator : IIqGenerator
     /// <summary>FM: the peak deviation, Hz (the wave peaks at 1). 0 for AM.</summary>
     public double FmDeviationHz { get; }
 
-    /// <summary>FM: the modulation index dev / af of a sine. 0 for AM.</summary>
-    public double Beta => Modulation == Kind.Fm ? FmDeviationHz / AfHz : 0;
+    /// <summary>FM: the modulation index dev / af of a sine; PM: the peak phase deviation, radians. 0 otherwise.</summary>
+    public double Beta => Modulation == Kind.Fm ? FmDeviationHz / AfHz : Modulation == Kind.Pm ? _pmBeta : 0;
 
-    /// <summary>The one-sided half-width around the carrier: the highest component for AM, Carson's dev + it for FM.</summary>
-    public double HalfBandwidthHz => Modulation == Kind.Am ? TopHz : FmDeviationHz + TopHz;
+    /// <summary>PM: its peak FREQUENCY deviation, Hz, as the library stated it (beta x the wave's peak slope).</summary>
+    public double PmPeakDeviationHz { get; }
+
+    /// <summary>The one-sided half-width around the carrier: the highest component for AM, DSB and SSB, and
+    /// Carson's peak frequency deviation + it for FM and PM.</summary>
+    public double HalfBandwidthHz => Modulation switch
+    {
+        Kind.Fm => FmDeviationHz + TopHz,
+        Kind.Pm => PmPeakDeviationHz + TopHz,
+        _ => TopHz,
+    };
 
     /// <summary>An AM carrier's peak, dBFS: <c>level + 20 log10(1 + m)</c> - TxRules.AmPeakDbfs, with m a
     /// fraction. It holds for every wave, because every wave peaks at 1.</summary>
@@ -96,7 +119,22 @@ public sealed class ModGenerator : IIqGenerator
     public static ModGenerator Fm(double offsetHz, double rateHz, double levelDbfs, IReadOnlyList<ModComponent> wave, double deviationHz) =>
         new(Kind.Fm, offsetHz, rateHz, levelDbfs, wave, 0, deviationHz);
 
-    private ModGenerator(Kind kind, double offsetHz, double rateHz, double levelDbfs, IReadOnlyList<ModComponent> wave, double depth, double deviationHz)
+    /// <summary>PM by <paramref name="betaRad"/> radians peak; <paramref name="peakDeviationHz"/> is its peak frequency
+    /// deviation as the library states it (TxSignal.PeakFrequencyDeviationHz), which the Nyquist assert uses.</summary>
+    public static ModGenerator Pm(double offsetHz, double rateHz, double levelDbfs, IReadOnlyList<ModComponent> wave, double betaRad, double peakDeviationHz) =>
+        new(Kind.Pm, offsetHz, rateHz, levelDbfs, wave, 0, 0, betaRad, peakDeviationHz);
+
+    /// <summary>DSB, carrier suppressed: the level is its peak.</summary>
+    public static ModGenerator Dsb(double offsetHz, double rateHz, double levelDbfs, IReadOnlyList<ModComponent> wave) =>
+        new(Kind.Dsb, offsetHz, rateHz, levelDbfs, wave, 0, 0);
+
+    /// <summary>SSB, generated exactly: <paramref name="analyticPeak"/> is the peak of the wave's analytic envelope (the
+    /// library's TxWaveform.AnalyticPeak), so the level is the peak.</summary>
+    public static ModGenerator Ssb(double offsetHz, double rateHz, double levelDbfs, IReadOnlyList<ModComponent> wave, double analyticPeak, bool upper) =>
+        new(upper ? Kind.Usb : Kind.Lsb, offsetHz, rateHz, levelDbfs, wave, 0, 0, 0, 0, analyticPeak);
+
+    private ModGenerator(Kind kind, double offsetHz, double rateHz, double levelDbfs, IReadOnlyList<ModComponent> wave, double depth, double deviationHz,
+                         double betaRad = 0, double pmPeakDeviationHz = 0, double analyticPeak = 0)
     {
         if (!(rateHz > 0)) throw new ArgumentOutOfRangeException(nameof(rateHz));
         if (wave == null || wave.Count == 0) throw new ArgumentException("a modulated carrier needs a modulating wave", nameof(wave));
@@ -110,8 +148,13 @@ public sealed class ModGenerator : IIqGenerator
         }
         else
         {
-            if (!(deviationHz > 0)) throw new ArgumentOutOfRangeException(nameof(deviationHz), "an FM deviation must be above 0");
-            if (!(levelDbfs <= 0)) throw new ArgumentOutOfRangeException(nameof(levelDbfs), "a carrier above digital full scale is refused, never clipped");
+            if (kind == Kind.Fm && !(deviationHz > 0)) throw new ArgumentOutOfRangeException(nameof(deviationHz), "an FM deviation must be above 0");
+            if (kind == Kind.Pm && !(betaRad > 0 && pmPeakDeviationHz > 0))
+                throw new ArgumentOutOfRangeException(nameof(betaRad), "a PM deviation, and the peak frequency deviation it makes, must be above 0");
+            if ((kind == Kind.Usb || kind == Kind.Lsb) && !(analyticPeak > 0))
+                throw new ArgumentOutOfRangeException(nameof(analyticPeak), "an SSB needs its wave's analytic peak, so its level is its peak");
+            // FM, PM: the envelope is the carrier's level; DSB, SSB: the level IS the peak (PEP).
+            if (!(levelDbfs <= 0)) throw new ArgumentOutOfRangeException(nameof(levelDbfs), "a signal above digital full scale is refused, never clipped");
         }
         Modulation = kind;
         OffsetHz = offsetHz;
@@ -122,6 +165,9 @@ public sealed class ModGenerator : IIqGenerator
         TopHz = _wave.Max(c => c.FrequencyHz);
         AmDepth = kind == Kind.Am ? depth : 0;
         FmDeviationHz = kind == Kind.Fm ? deviationHz : 0;
+        _pmBeta = kind == Kind.Pm ? betaRad : 0;
+        PmPeakDeviationHz = kind == Kind.Pm ? pmPeakDeviationHz : 0;
+        _ssbScale = kind == Kind.Usb || kind == Kind.Lsb ? 1.0 / analyticPeak : 0;
         if (!(Math.Abs(offsetHz) + HalfBandwidthHz < rateHz / 2))
             throw new ArgumentOutOfRangeException(nameof(offsetHz), "the modulated signal must lie inside the TX rate's Nyquist band");
         _amplitude = 32767.0 * Math.Pow(10, levelDbfs / 20.0);
@@ -154,8 +200,8 @@ public sealed class ModGenerator : IIqGenerator
     public void Fill(Span<short> iq, int count)
     {
         double a = _amplitude, pr = _re, pi = _im, sr = _stepRe, si = _stepIm;
-        bool am = Modulation == Kind.Am;
-        double m = AmDepth;
+        var kind = Modulation;
+        double m = AmDepth, beta = _pmBeta, ssb = _ssbScale;
         int nw = _amp.Length;
         var amp = _amp;
         var wRe = _wRe;
@@ -165,31 +211,51 @@ public sealed class ModGenerator : IIqGenerator
         var coef = _fmCoef;
         for (int n = 0; n < count; n++)
         {
-            // The wave (the sum of a_k sin) and, for FM, the cosine sum its exact integral needs; then every
-            // component's phasor turns by its own step.
-            double x = 0, c = 0;
+            // The wave (the sum of a_k sin), the cosine sum an FM's exact integral needs and an SSB's quadrature
+            // (the analytic signal of a_k sin is a_k (sin - j cos)); then every component's phasor turns by its own step.
+            double x = 0, c = 0, h = 0;
             for (int k = 0; k < nw; k++)
             {
                 double wr = wRe[k], wi = wIm[k];
                 x += amp[k] * wi;
                 c += coef[k] * wr;
+                h += amp[k] * wr;
                 wRe[k] = wr * sRe[k] - wi * sIm[k];
                 wIm[k] = wr * sIm[k] + wi * sRe[k];
             }
             double ore, oim;
-            if (am)
+            switch (kind)
             {
-                double env = a * (1.0 + m * x);
-                ore = env * pr;
-                oim = env * pi;
-            }
-            else
-            {
-                // The carrier's phasor turned by the integral of dev x(t), taken exactly per component.
-                double psi = _fmStart - c;
-                double cs = Math.Cos(psi), sn = Math.Sin(psi);
-                ore = a * (pr * cs - pi * sn);
-                oim = a * (pr * sn + pi * cs);
+                case Kind.Am:
+                {
+                    double env = a * (1.0 + m * x);
+                    ore = env * pr;
+                    oim = env * pi;
+                    break;
+                }
+                case Kind.Dsb:
+                    ore = a * x * pr;
+                    oim = a * x * pi;
+                    break;
+                case Kind.Usb:
+                case Kind.Lsb:
+                {
+                    // x_a = x - j h for the upper sideband (positive frequencies), its conjugate for the lower.
+                    double br = a * ssb * x, bi = a * ssb * (kind == Kind.Usb ? -h : h);
+                    ore = br * pr - bi * pi;
+                    oim = br * pi + bi * pr;
+                    break;
+                }
+                default:
+                {
+                    // FM: the carrier's phasor turned by the integral of dev x(t), taken exactly per component.
+                    // PM: turned by beta x(t).
+                    double psi = kind == Kind.Fm ? _fmStart - c : beta * x;
+                    double cs = Math.Cos(psi), sn = Math.Sin(psi);
+                    ore = a * (pr * cs - pi * sn);
+                    oim = a * (pr * sn + pi * cs);
+                    break;
+                }
             }
             // Clamped, never wrapped: at the full-scale peak a hair of rounding would reach 32768.
             iq[2 * n] = (short)Math.Clamp(Math.Round(ore), -32767, 32767);

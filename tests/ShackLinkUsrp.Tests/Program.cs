@@ -80,6 +80,8 @@ internal static partial class Program
         Run("P4b2: what the running gates cannot reach, pinned in the source", TxGeneratedSourceRules);
         Run("9.21 S2: AM and FM modulated by the library's waves", ModWaveformCases);
         Run("9.21 S2: a square AM and a two-tone FM in the synthetic radio's own panorama", SimModWaveLoopback);
+        Run("9.21 S3: DSB, SSB and PM", SidebandPmCases);
+        Run("9.21 S3: DSB, SSB and PM in the synthetic radio's own panorama", SimSidebandPmLoopback);
         Run("9.20: UHD's serial rule, ported (hexadecimal numbers, not strings)", UhdSerialRuleCases);
         Run("9.20: which B2xx to open, and when to refuse", UhdOpenPlanCases);
         Run("9.20: the UHD open path, pinned in the source", UhdOpenSourceRules);

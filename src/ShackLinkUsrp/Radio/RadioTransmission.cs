@@ -96,9 +96,18 @@ internal abstract class RadioTransmission : ITxTransmission
                 return ModGenerator.Am(request.OffsetHz, grant.RateHz, request.LevelDbfs, components, request.AmDepthPercent / 100.0);
             case TxWords.Fm:
                 return ModGenerator.Fm(request.OffsetHz, grant.RateHz, request.LevelDbfs, components, request.FmDeviationHz);
+            case TxWords.Pm:
+                // Degrees on the wire, radians here (section 9.21 Q3); the peak frequency deviation is the library's.
+                return ModGenerator.Pm(request.OffsetHz, grant.RateHz, request.LevelDbfs, components, TxRules.PmBetaRad(request),
+                                       signal!.PeakFrequencyDeviationHz);
+            case TxWords.Dsb:
+                return ModGenerator.Dsb(request.OffsetHz, grant.RateHz, request.LevelDbfs, components);
+            case TxWords.Ssb:
+                return ModGenerator.Ssb(request.OffsetHz, grant.RateHz, request.LevelDbfs, components, wave.AnalyticPeak,
+                                        upper: request.Sideband == TxWords.Usb);
             default:
                 throw new RadioRefusal(ErrorCodes.Unsupported,
-                    $"this sidecar does not modulate \"{request.Modulation}\"; it builds {TxWords.Am} and {TxWords.Fm}");
+                    $"this sidecar does not modulate \"{request.Modulation}\"; it builds {TxWords.Am}, {TxWords.Fm}, {TxWords.Pm}, {TxWords.Dsb} and {TxWords.Ssb}");
         }
     }
 

@@ -157,7 +157,7 @@ internal static partial class Program
             Check(s.Radio.Source == RadioSources.Sim, "before anything is keyed, the radio says it is synthetic");
             var caps = s.Caps.Tx!;
             Check(caps.ModulatingWaveforms.SequenceEqual(TxWaveforms.All) && caps.ModulatingHarmonics == 15 &&
-                  caps.Modulations.SequenceEqual(new[] { TxWords.Am, TxWords.Fm }),
+                  caps.OffersModulation(TxWords.Am) && caps.OffersModulation(TxWords.Fm),
                   $"caps.tx: the waves {string.Join(", ", caps.ModulatingWaveforms)} at {caps.ModulatingHarmonics} harmonics, for {string.Join(" and ", caps.Modulations)}");
             s.ClaimTx();
             const double pbin = 2e6 / 4096;             // the panorama's bin: 488.28125 Hz
