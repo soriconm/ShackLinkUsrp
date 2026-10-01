@@ -312,6 +312,8 @@ internal sealed class UhdBackend : RadioBackendBase
             MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(usrp.GetMasterClockRate(), rates),
             // 2R2T (section 9.23 Q3): a second TX chain to silence is what lets a burst open beside two receivers.
             DualRx = usrp.TxChannelCount >= 2 && _rxChannels >= 2,
+            // TX and RX run on the radio's one clock: a tx event's stamp is when the radio did it (plutosdr 9.2 item 2).
+            Timebase = TxTimebases.Radio,
         }));
         if (rates.Length == 0) _txWhyNot = $"no admitted TX rate divides the wide rate {wideRate:0} S/s";
     }

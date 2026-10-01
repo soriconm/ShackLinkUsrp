@@ -197,6 +197,8 @@ internal sealed class SimBackend : RadioBackendBase
             MaxLoOffsetHz = TxRatePlan.MaxLoOffsetHz(TxRatePlan.ModelTickHz(wide), rates),
             // It transmits with both receive sides streaming (2R2T, section 9.23 Q3): RX B hears it at its own coupling.
             DualRx = true,
+            // One clock paces both directions: a key edge falls at an exact ring position (plutosdr 9.2 item 2).
+            Timebase = TxTimebases.Radio,
         });
     }
 

@@ -18,7 +18,11 @@
     <ProjectReference Include="..\..\src\ShackLinkUsrp\ShackLinkUsrp.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <!-- The owner's Pluto's own PRINT (2026-09-30), copied from ShackLink's IiodWireTest\Fixtures: the fake iiod's context. -->
-    <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- ONE fake board for every gate (ShackLink docs/plutosdr_support.md section 9.15, P4b): ShackLink's IiodWireTest\FakeIiod.cs
+         (MIT, written from section 2.3 and the owner's board's replies, never from libiio) and the owner's Pluto's own PRINT,
+         LINKED by relative path exactly as the protocol library is - never copied, so the two gates cannot drift apart. -->
+    <Compile Include="$(ShackLinkDir)IiodWireTest\FakeIiod.cs" Link="FakeIiod.cs" />
+    <None Include="$(ShackLinkDir)IiodWireTest\Fixtures\pluto-7020-context.xml" Link="Fixtures\pluto-7020-context.xml" CopyToOutputDirectory="PreserveNewest" />
+    <Using Include="IiodWireTest" />
   </ItemGroup>
 </Project>

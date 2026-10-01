@@ -112,6 +112,17 @@ internal static partial class Program
         Run("Pluto P2: close, and a board that goes away (B10)", PlutoCloseAndLoss);
         Run("Pluto P2: the real executable, spawned with --iiod, loads no UHD", PlutoSpawned);
         Run("Pluto P2: what the running gates cannot reach, pinned in the source", PlutoSourceRules);
+        Run("Pluto P4b: the transmitter as it opens - caps from the board, the truth in force, nothing held", PlutoTxCaps);
+        Run("Pluto P4b: set_tx is HELD while idle (Q1), and a gain never set is refused", PlutoTxHold);
+        Run("Pluto P4b: ShackLink's IQ end to end - the key-up at the first buffer, bit for bit, drained on the board's word", PlutoTxIq);
+        Run("Pluto P4b: every other end - abort, starvation, a wedged board, a refused key-up, another writer", PlutoTxEnds);
+        Run("Pluto P4b: the generated sources - a tone, a park, a keyed gain move, a baseband and a tuned sweep", PlutoTxGenerated);
+        Run("Pluto P4b: what is said while a key-up runs - the truth in force, never the plan", PlutoTxKeyUpWindow);
+        Run("Pluto P4b: a board whose transmitter cannot be read still receives, and says it does not transmit", PlutoTxUnreadable);
+        Run("Pluto P4b: a board with no debugfs transmits, and never acknowledges a drain it cannot see", PlutoTxNoOracle);
+        Run("Pluto P4b: another program while keyed - faulted in words, left as it set it (B11)", PlutoTxForeign);
+        Run("Pluto P4b: one clock chain - the TX rates follow the wide rate, which cannot move under a transmission", PlutoTxRate);
+        Run("Pluto P4b: what the running gates cannot reach, pinned in the source", PlutoTxSourceRules);
         Run("Pluto P2: and still nothing here loaded UHD", NoUhdInThisProcess);
 
         try { Directory.Delete(_temp, true); } catch { }

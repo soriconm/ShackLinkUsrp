@@ -23,7 +23,15 @@ internal static partial class Program
     /// <summary>A small buffer keeps the cadence quick (13 ms at 2.5 MS/s); the default is P1's ~33 ms.</summary>
     private const int TestBufferSamples = 32768;
 
-    private static FakeIiod Board(string? context = null) => new FakeIiod(context ?? FakeIiod.BoardContext()).LoadBoardState();
+    /// <summary>The shared fake board as a BACKEND sees it: paced at the board's own cadence, RX and TX alike.</summary>
+    private static FakeIiod AsBoard(FakeIiod f)
+    {
+        f.Paced = true;
+        f.TxPaced = true;
+        return f;
+    }
+
+    private static FakeIiod Board(string? context = null) => AsBoard(new FakeIiod(context ?? FakeIiod.BoardContext()).LoadBoardState());
 
     private static (PlutoBackend backend, UsrpServer server, SidecarLog log) StartPluto(PlutoBackendOptions opt)
     {
@@ -122,8 +130,8 @@ internal static partial class Program
             var rates = c.WideRatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture)).ToArray();
             Check(string.Join(",", rates) == "2.5,4,5,8,10,12.5,15.36,16,20,25,30.72,32,40,50,56,61.44",
                   "B9: every native rate at or above the no-FIR floor, inside the board's own range - 30.72 and 61.44 included: " + string.Join(", ", rates));
-            Check(c.LeaseDecimMin == 1 && c.RxSides != null && c.RxSides.SequenceEqual(new[] { "A" }) && c.OverflowOracle == true && c.Tx == null,
-                  "lease_decim_min 1 (B4), one receive side, a loss oracle, and no transmitter (P4)");
+            Check(c.LeaseDecimMin == 1 && c.RxSides != null && c.RxSides.SequenceEqual(new[] { "A" }) && c.OverflowOracle == true && c.Tx != null,
+                  "lease_decim_min 1 (B4), one receive side, a loss oracle - and, since P4, a transmitter (its caps are PlutoTxTests')");
             Check(c.FreqMinHz == 70_000_000 && c.FreqMaxHz == 6_000_000_000 && c.GainMinDb == -10 && c.GainMaxDb == 73 && c.GainStepDb == 1 &&
                   c.Antennas.Length == 12 && c.Antennas[0] == "A_BALANCED" && c.BandwidthMinHz == 200_000 && c.BandwidthMaxHz == 56e6 && c.Agc,
                   "the RX LO, bandwidth and ports are the board's own statements; the gain is the union of its bands (section 9.2 item 7)");
@@ -177,7 +185,7 @@ internal static partial class Program
         }
 
         string otherSerial = "1044730231960000000000000000000000";
-        using (var wrong = new FakeIiod(FakeIiod.BoardContext().Replace(Serial, otherSerial)).LoadBoardState())
+        using (var wrong = AsBoard(new FakeIiod(FakeIiod.BoardContext().Replace(Serial, otherSerial)).LoadBoardState()))
         using (var right = Board())
         {
             var p = StartPluto(Opts(null, browse: () => new[] { ("127.0.0.1", wrong.Port), ("127.0.0.1", right.Port) }, hint: null));
@@ -189,7 +197,7 @@ internal static partial class Program
             finally { Stop(p); }
         }
 
-        using (var wrong = new FakeIiod(FakeIiod.BoardContext().Replace(Serial, otherSerial)).LoadBoardState())
+        using (var wrong = AsBoard(new FakeIiod(FakeIiod.BoardContext().Replace(Serial, otherSerial)).LoadBoardState()))
         {
             var p = StartPluto(Opts(wrong));
             try
@@ -205,7 +213,7 @@ internal static partial class Program
         }
 
         string noSerial = Regex.Replace(FakeIiod.BoardContext(), "<context-attribute name=\"hw_serial\"[^>]*/>", "");
-        using (var anon = new FakeIiod(noSerial).LoadBoardState())
+        using (var anon = AsBoard(new FakeIiod(noSerial).LoadBoardState()))
         {
             var p = StartPluto(Opts(anon));
             try
@@ -369,7 +377,7 @@ internal static partial class Program
             finally { Stop(p); }
         }
         string noDebugfs = FakeIiod.BoardContext().Replace("<debug-attribute name=\"direct_reg_access\" />", "");
-        using (var fake = new FakeIiod(noDebugfs).LoadBoardState())
+        using (var fake = AsBoard(new FakeIiod(noDebugfs).LoadBoardState()))
         {
             var p = StartPluto(Opts(fake));
             try

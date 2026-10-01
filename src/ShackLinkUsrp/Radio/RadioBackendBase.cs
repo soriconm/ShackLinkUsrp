@@ -773,6 +773,26 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         get { lock (_txLock) return _openTx; }
     }
 
+    /// <summary>
+    /// A radio whose transmitter cannot be SET while idle - a Pluto, whose TX LO is powered down and whose attenuation is at
+    /// its maximum until the key-up (ShackLink docs/plutosdr_support.md section 9.15 Q1) - HOLDS set_tx's centre and gain in
+    /// <c>state.tx.held</c> and writes them at the key-up. The fields beside it stay the TRUTH IN FORCE, so a client that
+    /// reads only them sees a read-back that disagrees with what it asked, and does not key: fail-closed.
+    /// </summary>
+    protected virtual bool HoldsTxUntilKeyed => false;
+
+    /// <summary>A transmission is open and its first sample has gone out.</summary>
+    protected bool TxKeyedNow => OpenTx is { IsFinished: false, IsKeyed: true };
+
+    /// <summary>A holding radio that is not keyed: set_tx's centre and gain go to <c>held</c>, never to the state in force.</summary>
+    private bool HoldingNow => HoldsTxUntilKeyed && !TxKeyedNow;
+
+    /// <summary>For a subclass: the transmitter's state in force changed by the radio itself (a key-up's read-backs, an end).</summary>
+    protected void UpdateTxState(Action<TxState> set)
+    {
+        lock (_txLock) set(_txState);
+    }
+
     /// <summary>For a subclass: the transmitter's read-backs at open. <paramref name="configuredRateHz"/>
     /// is the rate a generated source's own rate is put back to when it ends.</summary>
     protected void InitTxState(Action<TxState> set, double configuredRateHz)
@@ -849,14 +869,21 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         }
         if (s.GainDb != null)
         {
+            bool holding = HoldingNow;
             double eff = ApplyTxGain(s.GainDb.Value);
-            lock (_txLock) _txState.GainDb = eff;
-            Log($"TX gain {eff} dB" + (eff != s.GainDb.Value ? $" (asked {s.GainDb.Value})" : ""));
+            lock (_txLock)
+            {
+                // A holding radio records what the next key-up writes; keyed, what it took is in force as well.
+                if (_txState.Held != null) _txState.Held.GainDb = eff;
+                if (!holding) _txState.GainDb = eff;
+            }
+            Log($"TX gain {eff} dB" + (eff != s.GainDb.Value ? $" (asked {s.GainDb.Value})" : "") +
+                (holding ? " - HELD: written at the key-up" : ""));
         }
         if (s.CenterHz != null || s.LoOffsetHz != null)
         {
             TxState st = GetTxState();
-            long center = s.CenterHz ?? st.CenterHz;
+            long center = s.CenterHz ?? st.NextCenterHz;
             long offset = s.LoOffsetHz ?? st.LoOffsetHz;
             var open = OpenTx;
             if (open != null && !open.IsFinished && open.Request.IsGenerated && s.CenterHz != null)
@@ -869,19 +896,28 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
                 {
                     _txState.CenterHz = park.CenterHz;
                     _txState.LoHz = park.LoHz;
+                    // ...and on a holding radio the next transmission keys there too, as a B2xx's would.
+                    if (_txState.Held != null) _txState.Held.CenterHz = park.CenterHz;
                 }
                 Log($"TX park to {park.CenterHz} Hz by the {(park.Retune == TxWords.RetuneDsp ? "DUC" : "synthesizer")}, LO {park.LoHz} Hz");
             }
             else
             {
+                bool holding = HoldingNow;
                 var tune = ApplyTxTune(center, offset);
                 lock (_txLock)
                 {
-                    _txState.CenterHz = tune.CenterHz;
-                    _txState.LoHz = tune.LoHz;
+                    if (_txState.Held != null) _txState.Held.CenterHz = tune.CenterHz;
+                    if (!holding)
+                    {
+                        _txState.CenterHz = tune.CenterHz;
+                        _txState.LoHz = tune.LoHz;
+                    }
                     _txState.LoOffsetHz = offset;
                 }
-                Log($"TX centre {tune.CenterHz} Hz, LO {tune.LoHz} Hz" + (tune.CenterHz != center ? $" (asked {center})" : ""));
+                Log(holding
+                    ? $"TX centre {tune.CenterHz} Hz HELD: the TX LO is written at the key-up, never while receiving (hazard 6)"
+                    : $"TX centre {tune.CenterHz} Hz, LO {tune.LoHz} Hz" + (tune.CenterHz != center ? $" (asked {center})" : ""));
             }
         }
         return res;
@@ -898,6 +934,10 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
             throw new RadioRefusal(ErrorCodes.Unsupported,
                 $"this sidecar does not build a \"{r.Source}\" source; it builds {string.Join(", ", BuiltSources)}");
         TxState st = GetTxState();
+        // A holding radio keys at what was HELD (section 9.15 Q1): a gain never set is refused - a transmission keys at a
+        // stated level - and the centre and LO are the held centre (the LO sits on the carrier: no DUC to offset it).
+        if (st.Held != null && double.IsNaN(st.Held.GainDb))
+            throw new RadioRefusal(ErrorCodes.BadRequest, "the TX gain was never set (set_tx gain_db): a transmission keys at a stated level");
         double rate = st.RateHz;
         TxStepPlan? plan = null;
         // What a generated source IS, from the rules it was admitted by: its generator is built from exactly this.
@@ -935,14 +975,15 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
                 }
             }
         }
-        long center = r.IsGenerated ? st.CenterHz + r.OffsetHz : st.CenterHz;
-        long lo = st.LoHz;
+        long center = r.IsGenerated ? st.NextCenterHz + r.OffsetHz : st.NextCenterHz;
+        long lo = st.Held != null ? st.NextCenterHz : st.LoHz;
         if (plan != null)
         {
             // The LO parks where the sweep needs it and the first step's carrier stands there before anything
             // is keyed (P4-a': a stepped sweep's LO sits where its steps need it; P4-3 is the tone's and the
-            // inlet's rule). What the client had set is put back when the sweep ends.
-            lock (_txLock) _txTuneToRestore = (st.CenterHz, st.LoOffsetHz);
+            // inlet's rule). What the client had set is put back when the sweep ends. A holding radio only RECORDS
+            // the parked LO here: its key-up writes the grant's.
+            lock (_txLock) _txTuneToRestore = (st.NextCenterHz, st.LoOffsetHz);
             try
             {
                 var parked = plan.Baseband
@@ -965,7 +1006,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
             CenterHz = center,
             LoHz = lo,
             RateHz = rate,
-            GainDb = st.GainDb,
+            GainDb = st.NextGainDb,
             LevelDbfs = r.IsGenerated ? r.LevelDbfs : double.NaN,
             QueueSamples = r.IsGenerated ? 0 : TxRatePlan.QueueSamplesFor(rate),
             MaxBlockSamples = ProtocolConstants.MaxIqBlockSamples,
@@ -987,7 +1028,8 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         }
         lock (_txLock) _openTx = t;
         Interlocked.Increment(ref _txBursts);
-        Log($"transmission opened: {r.Source} at {grant.CenterHz} Hz, {rate:0} S/s, gain {st.GainDb} dB" +
+        Log($"transmission opened: {r.Source} at {grant.CenterHz} Hz, {rate:0} S/s, gain {st.NextGainDb} dB" +
+            (st.Held != null ? " (held: the LO stays down until the first buffer)" : "") +
             (r.IsGenerated ? $", carrier {r.LevelDbfs} dBFS" : $", queue {grant.QueueSamples} samples") +
             (plan == null ? "" : plan.Baseband
                 ? $"; a baseband sweep of {plan.Points} points around {grant.LoHz} Hz, stepped at exact samples"
@@ -1014,9 +1056,11 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         return moves.ToArray();
     }
 
-    /// <summary>A stepped source's carrier moved: <c>state.tx</c> follows it.</summary>
+    /// <summary>A stepped source's carrier moved: <c>state.tx</c> follows it - once it is in force. A holding radio's sweep
+    /// parked before its key-up is only a plan: its LO is still powered down.</summary>
     internal void OnTransmissionStep(long centerHz, long loHz)
     {
+        if (HoldingNow) return;
         lock (_txLock)
         {
             _txState.CenterHz = centerHz;
@@ -1053,11 +1097,16 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         if (restore == null) return;
         try
         {
+            bool holding = HoldingNow;
             var tune = ApplyTxTune(restore.Value.CenterHz, restore.Value.LoOffsetHz);
             lock (_txLock)
             {
-                _txState.CenterHz = tune.CenterHz;
-                _txState.LoHz = tune.LoHz;
+                if (_txState.Held != null) _txState.Held.CenterHz = tune.CenterHz;
+                if (!holding)
+                {
+                    _txState.CenterHz = tune.CenterHz;
+                    _txState.LoHz = tune.LoHz;
+                }
                 _txState.LoOffsetHz = restore.Value.LoOffsetHz;
             }
         }

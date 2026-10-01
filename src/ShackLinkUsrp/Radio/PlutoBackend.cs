@@ -61,8 +61,10 @@ internal sealed record PlutoBackendOptions
 /// <item><b>A third program is watched for</b> (B11): a value this sidecar did not write faults the radio, and no
 /// retry may fight it.</item>
 /// <item><b>The radio slot's wide lease</b> (B4): <c>lease_decim_min = 1</c>.</item>
+/// <item><b>The transmitter</b> (section 9.15, P4): set_tx's centre and gain are HELD and written at the key-up - the first
+/// whole buffer - read back before the LO is powered; every transmission is streamed IQ (B5, never the DDS) through the TX
+/// DMA on a connection of its own, and every end is SafeIdle (B10). Its timebase is the host's (section 9.2 item 2).</item>
 /// </list>
-/// Transmit is P4: this backend states no transmitter.
 /// </summary>
 internal sealed class PlutoBackend : RadioBackendBase
 {
@@ -237,6 +239,19 @@ internal sealed class PlutoBackend : RadioBackendBase
             s.BandwidthHz = bandwidth;
             s.DcOffsetHz = 0;
         }, announce: false);
+
+        // The transmitter's statements, read APART (section 9.15): a board whose TX side cannot be read still receives, and
+        // says it does not transmit.
+        try
+        {
+            OpenTransmitter(radio, radio.ReadTxCapabilities());
+        }
+        catch (Exception ex) when (ex is IiodErrorException || ex is PlutoRefusalException)
+        {
+            Volatile.Write(ref _txCaps, null);
+            _txWhyNot = "the board's transmitter could not be read: " + ex.Message;
+            Log("this board will not transmit: " + _txWhyNot);
+        }
 
         // The flag is sticky (section 9.8: found set from earlier use): cleared now, so the first one counted is ours.
         bool? was = radio.ReadAndClearRxOverflow();
@@ -419,8 +434,18 @@ internal sealed class PlutoBackend : RadioBackendBase
             if (Math.Abs(core - _expCoreRate) > 0.5)
                 return $"the RX DMA delivers {PlutoValues.Num(core)} S/s, and this sidecar set it to {PlutoValues.Num(_expCoreRate)} S/s ({Ad936xNames.RxCore} INPUT {Ad936xNames.Path1} {Ad936xNames.SamplingFrequency})";
             if (!full) return null;
-            var quiet = radio.ReadQuietState().NotSafeIdle();
-            if (quiet.Count > 0) return "while this sidecar holds it idle, " + string.Join("; ", quiet);
+            var q = radio.ReadQuietState();
+            if (_txExpect is { } keyed)
+            {
+                // KEYED (section 9.15 item 10): the transmitter as this sidecar wrote it, and nothing else on.
+                var off = TxNotAsKeyed(q, keyed.LoHz, keyed.AttenuationDb);
+                if (off.Count > 0) return "while this sidecar transmits, " + string.Join("; ", off);
+            }
+            else
+            {
+                var quiet = q.NotSafeIdle();
+                if (quiet.Count > 0) return "while this sidecar holds it idle, " + string.Join("; ", quiet);
+            }
             var (rxFir, txFir) = radio.ReadFirState();
             if (rxFir == true || txFir == true)
                 return $"a FIR was loaded (RX {(rxFir == true ? "on" : "off")}, TX {(txFir == true ? "on" : "off")}), and this sidecar switched it off at open";
@@ -431,6 +456,30 @@ internal sealed class PlutoBackend : RadioBackendBase
         {
             Monitor.Exit(_boardLock);
         }
+    }
+
+    /// <summary>What is not as THIS sidecar keyed it (section 9.15 item 10): the TX LO powered at the LO it wrote, TX1 at the
+    /// attenuation it wrote, every other TX path at the maximum, every DDS scale 0. Empty = as keyed.</summary>
+    private static List<string> TxNotAsKeyed(PlutoState q, long loHz, double attenuationDb)
+    {
+        var r = new List<string>();
+        if (q.TxLoPoweredDown)
+            r.Add($"the TX LO reads powered DOWN, and this sidecar keyed it ({Ad936xNames.Phy} OUTPUT {Ad936xNames.TxLo} {Ad936xNames.Powerdown} = 1)");
+        else if (q.TxLoHz != loHz)
+            r.Add($"the TX LO reads {PlutoValues.Mhz(q.TxLoHz)} MHz, and this sidecar keyed it at {PlutoValues.Mhz(loHz)} MHz " +
+                  $"({Ad936xNames.Phy} OUTPUT {Ad936xNames.TxLo} {Ad936xNames.Frequency})");
+        for (int i = 0; i < q.TxAttenuationDb.Length; i++)
+        {
+            double want = i == 0 ? attenuationDb : Ad936xNames.MaxTxAttenuationDb;
+            if (Math.Abs(q.TxAttenuationDb[i] - want) > Ad936xNames.TxAttenuationStepDb / 2)
+                r.Add($"TX{i + 1} is attenuated {PlutoValues.Num(q.TxAttenuationDb[i])} dB, and this sidecar set {PlutoValues.Num(want)} dB " +
+                      $"({Ad936xNames.Phy} OUTPUT voltage{i} {Ad936xNames.HardwareGain})");
+        }
+        foreach (var t in q.Tones)
+            if (t.Scale != 0)
+                r.Add($"the DDS tone {t.Label} is at scale {PlutoValues.Num(t.Scale)}, {PlutoValues.Mhz(t.FrequencyHz)} MHz from the TX LO " +
+                      $"({Ad936xNames.TxCore} OUTPUT {t.Channel} {Ad936xNames.Scale})");
+        return r;
     }
 
     /// <summary>
@@ -558,8 +607,11 @@ internal sealed class PlutoBackend : RadioBackendBase
 
     protected override double ApplyRate(double hz)
     {
-        // ONE clock chain: the write moves RX and TX together (section 9.2 item 1); the stream is made again around it,
-        // so no buffer at the old rate is written after the pipelines were told the new one.
+        // ONE clock chain: the write moves RX and TX together (section 9.2 item 1). The server refuses set_rate under a
+        // transmission (TX_ACTIVE); this is the backend's own net, because here the wide rate IS the TX DMA's parent clock.
+        if (OpenTx is { IsFinished: false })
+            throw new RadioRefusal(ErrorCodes.TxActive, "the wide rate cannot change while a transmission is open: it is the transmitter's clock too");
+        // The stream is made again around it, so no buffer at the old rate is written after the pipelines were told the new one.
         StopStreaming();
         double got;
         try
@@ -585,6 +637,16 @@ internal sealed class PlutoBackend : RadioBackendBase
                 {
                     double now = Board(r => r.ReadSampleRateHz());
                     UpdateState(s => s.WideRateHz = now, announce: false);
+                    // The TX DMA's list follows the wide rate (section 9.2 item 1): re-read, the configured TX rate kept
+                    // when it is still listed, else the lowest - and said, as the UHD backend says its move.
+                    if (_txLoRange.Max > 0)
+                    {
+                        double was = GetTxState().RateHz;
+                        double txRate = RefreshTxCaps(Radio, was);
+                        if (txRate > 0) InitTxState(s => s.RateHz = txRate, txRate);
+                        if (Math.Abs(txRate - was) >= 0.5)
+                            Log($"TX rate moved from {was:0} to {txRate:0} S/s: the TX DMA lists {string.Join("/", (Volatile.Read(ref _txCaps)?.RatesHz ?? Array.Empty<double>()).Select(r => r.ToString("0", CultureInfo.InvariantCulture)))} S/s at {now:0} S/s");
+                    }
                     StartStreaming();
                 }
                 catch (Exception ex)
@@ -684,22 +746,315 @@ internal sealed class PlutoBackend : RadioBackendBase
             .Set("temperature_c", double.IsNaN(_temperatureC) ? (object?)null : Math.Round(_temperatureC, 1))
             .Set("fir_found", _firFound)
             .Set("foreign_writer", _foreign)
-            .Set("tx_available", false)
-            .Set("tx_why_not", "transmit on a Pluto-class board is P4 (ShackLink docs/plutosdr_support.md section 9.5)");
+            .Set("tx_available", Volatile.Read(ref _txCaps) != null)
+            .Set("tx_why_not", _txWhyNot)
+            .Set("tx_key_ups", Interlocked.Read(ref _txKeyUps))
+            .Set("tx_key_ups_refused", Interlocked.Read(ref _txRefusedKeyUps))
+            .Set("tx_keyed_expect", _txExpect is { } e ? $"LO {e.LoHz} Hz, {e.AttenuationDb} dB" : "idle (SafeIdle)");
     }
 
-    // ------------------------------------------------------------ no transmitter (P4)
+    // ------------------------------------------------------------ the transmitter (ShackLink docs/plutosdr_support.md 9.15)
 
-    private const string NoTx = "this board does not transmit through the sidecar yet (ShackLink docs/plutosdr_support.md section 9.5, P4)";
+    /// <summary>The TX DMA's kernel buffers: four, as RX (section 9.15 item 5).</summary>
+    private int TxBuffersCount => _opt.BuffersCount;
 
-    protected override TxCaps? RadioTxCaps() => null;
-    protected override double ApplyTxRate(double hz) => throw new RadioRefusal(ErrorCodes.Unsupported, NoTx);
-    protected override double ApplyTxGain(double db) => throw new RadioRefusal(ErrorCodes.Unsupported, NoTx);
-    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz) => throw new RadioRefusal(ErrorCodes.Unsupported, NoTx);
-    protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open) =>
-        throw new RadioRefusal(ErrorCodes.Unsupported, NoTx);
-    protected override double TxTickHz => 0;
-    protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo) => throw new RadioRefusal(ErrorCodes.Unsupported, NoTx);
-    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal) =>
-        throw new RadioRefusal(ErrorCodes.Unsupported, NoTx);
+    /// <summary>How long a busy TX DMA is waited for before it is another program's: the time iiod may take to process the
+    /// close of THIS sidecar's previous writer (an abort a moment before).</summary>
+    private const int TxBusyGraceMs = 500;
+
+    private TxCaps? _txCaps;
+    private string _txWhyNot = "the board is not open";
+    private PlutoRange _txLoRange, _txBandwidthRange;
+    private string[] _txPorts = Array.Empty<string>();
+    // What the transmitter's watch expects while KEYED (section 9.15 item 10): null = idle, and the watch expects SafeIdle.
+    private (long LoHz, double AttenuationDb)? _txExpect;
+    private long _txKeyUps, _txRefusedKeyUps;
+
+    /// <summary>Section 9.15 item 3 / Q1: a Pluto cannot apply set_tx's centre and gain while idle - its TX LO is powered down
+    /// and its attenuation at the maximum - so it HOLDS them (state.tx.held) and writes them at the key-up.</summary>
+    protected override bool HoldsTxUntilKeyed => true;
+
+    /// <summary>Called from <see cref="OpenRadio"/> once the board's rate is set: the transmitter's statements, the TX DMA put at
+    /// its LOWEST listed rate (FPGA-only: nothing at RF), and the state in force - the LO powered down, the gain 0 (the maximum
+    /// attenuation), nothing held yet.</summary>
+    private void OpenTransmitter(PlutoRadio radio, PlutoTxCapabilities caps)
+    {
+        _txLoRange = caps.TxLoRange;
+        _txBandwidthRange = caps.TxBandwidthRange;
+        _txPorts = caps.TxPorts;
+        double txRate = RefreshTxCaps(radio, keepRateHz: 0);
+        InitTxState(s =>
+        {
+            s.CenterHz = 0;
+            s.LoHz = 0;
+            s.LoOffsetHz = 0;
+            s.RateHz = txRate;
+            s.GainDb = 0;
+            s.Antenna = _txPorts.Length > 0 ? radio.ReadState().TxPort.Trim() : "";
+            s.Held = new TxHeld();
+        }, txRate);
+        if (_txCaps != null)
+            Log($"transmitter: TX LO {PlutoValues.Mhz(_txLoRange.Min)}-{PlutoValues.Mhz(_txLoRange.Max)} MHz, attenuation 0-89.75 dB in 0.25 dB, " +
+                $"TX DMA {string.Join("/", _txCaps.RatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture)))} MS/s (set to {txRate / 1e6:0.###}), " +
+                $"timebase host; set_tx's centre and gain are HELD and written at the key-up - nothing is sent until a client asks");
+    }
+
+    /// <summary>The TX DMA's rates as the board lists them NOW (they follow the wide rate), and the DMA put at
+    /// <paramref name="keepRateHz"/> when it is still listed, else at the lowest. Returns the rate read back; 0 and no caps
+    /// when the board lists none (it then transmits nothing, said).</summary>
+    private double RefreshTxCaps(PlutoRadio radio, double keepRateHz)
+    {
+        double[] rates;
+        double got;
+        lock (_boardLock)
+        {
+            rates = radio.ReadTxCoreRatesHz();
+            if (rates.Length == 0 || _txLoRange.Max <= 0)
+            {
+                Volatile.Write(ref _txCaps, null);
+                _txWhyNot = rates.Length == 0 ? "the board's TX DMA states no sample rate" : "the board states no TX LO range";
+                Log("this board will not transmit: " + _txWhyNot);
+                return 0;
+            }
+            double want = rates.Any(r => Math.Abs(r - keepRateHz) < 0.5) ? keepRateHz : rates[0];
+            got = radio.SetTxCoreRate(want);
+        }
+        Volatile.Write(ref _txCaps, StateGeneratedSources(new TxCaps
+        {
+            FreqMinHz = (long)Math.Ceiling(_txLoRange.Min),
+            FreqMaxHz = (long)Math.Floor(_txLoRange.Max),
+            // The wire's TX gain is 89.75 + hardwaregain (section 9.2 item 4): 0 = the maximum attenuation, 89.75 = none.
+            GainMinDb = 0,
+            GainMaxDb = Ad936xNames.MaxTxAttenuationDb,
+            GainStepDb = Ad936xNames.TxAttenuationStepDb,
+            RatesHz = rates,
+            Antennas = _txPorts,
+            MaxMs = 0,               // the server's ceiling
+            QuantumSamples = TxBufferSamplesFor(rates[0]),
+            // No DUC and no CORDIC (section 9.15 item 8): the LO sits on the carrier and no offset is offered.
+            MaxLoOffsetHz = 0,
+            DualRx = false,
+            Timebase = TxTimebases.Host,
+        }));
+        _txWhyNot = "";
+        return got;
+    }
+
+    /// <summary>About 25 ms of the TX rate, a power of two, at least 4,096 samples and at most 2^20 (section 9.15 item 5).</summary>
+    internal static int TxBufferSamplesFor(double rateHz) =>
+        (int)Math.Min(1 << 20, Math.Max(4096, 1L << (int)Math.Round(Math.Log2(Math.Max(4096, rateHz * 0.025)))));
+
+    protected override TxCaps? RadioTxCaps() => Volatile.Read(ref _txCaps);
+
+    /// <summary>The TX DMA's rate (FPGA-only: nothing reaches RF), refused unless the DMA lists it, read back.</summary>
+    protected override double ApplyTxRate(double hz)
+    {
+        if (OpenTx is { IsFinished: false })
+            throw new RadioRefusal(ErrorCodes.TxActive, "the TX rate cannot change while a transmission is open");
+        return Board(r => r.SetTxCoreRate(hz));
+    }
+
+    /// <summary>Idle: the gain put on the attenuation's grid and HELD (item 3). Keyed: the attenuation written and read back.</summary>
+    protected override double ApplyTxGain(double db)
+    {
+        double att = PlutoRadio.TxAttenuationOnGrid(Ad936xNames.MaxTxAttenuationDb - db);
+        if (!TxKeyedNow) return Ad936xNames.MaxTxAttenuationDb - att;
+        double got = Board(r =>
+        {
+            double a = r.SetTxAttenuation(att);
+            if (_txExpect is { } e) _txExpect = (e.LoHz, a);
+            return a;
+        });
+        return Ad936xNames.MaxTxAttenuationDb - got;
+    }
+
+    /// <summary>Idle only (the server fixes an IQ transmission's centre for its life; a generated one PARKS): HELD, on the
+    /// carrier, never written - a TX LO write may radiate while the LO is powered down (hazard 6).</summary>
+    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz)
+    {
+        if (loOffsetHz != 0) throw new RadioRefusal(ErrorCodes.Unsupported, "this board places its TX LO on the carrier and offers no LO offset");
+        if (centerHz < _txLoRange.Min || centerHz > _txLoRange.Max)
+            throw new RadioRefusal(ErrorCodes.OutOfRange,
+                $"{centerHz} Hz is outside this board's TX LO range {_txLoRange.Min:0}-{_txLoRange.Max:0} Hz");
+        return (centerHz, centerHz);
+    }
+
+    /// <summary>A keyed generated carrier moved: there is no CORDIC, so it is the synthesizer (rf), read back, and the
+    /// step's instant is when the write returned.</summary>
+    protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open)
+    {
+        if (!open.IsKeyed)
+            throw new RadioRefusal(ErrorCodes.TxActive, "the transmitter is keying up; move it once it is keyed");
+        long lo = Board(r =>
+        {
+            long l = r.RetuneTxLo(centerHz);
+            if (_txExpect is { } e) _txExpect = (l, e.AttenuationDb);
+            return l;
+        });
+        return (lo, lo, TxWords.RetuneRf);
+    }
+
+    /// <summary>No DUC: its reach is ZERO. Stated as the lowest TX rate, which makes <c>TxRatePlan.DspReachHz</c> 0, so a
+    /// tuned sweep puts its LO on every carrier (one window per point).</summary>
+    protected override double TxTickHz => Volatile.Read(ref _txCaps)?.RatesHz.FirstOrDefault() ?? 0;
+
+    /// <summary>Before the key-up (tx_start parks a sweep's first LO): recorded, never written - the key-up writes the grant's
+    /// LO. Keyed: the synthesizer moved, read back.</summary>
+    protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo)
+    {
+        if (!TxKeyedNow || !moveLo) return (carrierHz, loHz);
+        long got = Board(r =>
+        {
+            long l = r.RetuneTxLo(loHz);
+            if (_txExpect is { } e) _txExpect = (l, e.AttenuationDb);
+            return l;
+        });
+        return (carrierHz + (got - loHz), got);
+    }
+
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
+    {
+        var caps = Volatile.Read(ref _txCaps) ?? throw new RadioRefusal(ErrorCodes.Unsupported, "this board does not transmit: " + _txWhyNot);
+        if (!caps.RatesHz.Any(r => Math.Abs(r - grant.RateHz) < 0.5))
+            throw new RadioRefusal(ErrorCodes.OutOfRange, $"the TX DMA does not take {grant.RateHz:0} S/s at the rate in force");
+        if (_foreign)
+            throw new RadioRefusal(ErrorCodes.RadioFault, "another program changed this board; this sidecar transmits nothing on it");
+        var radio = Radio;
+        double now = Board(r => r.ReadTxCoreRateHz());
+        if (Math.Abs(now - grant.RateHz) >= 0.5) now = Board(r => r.SetTxCoreRate(grant.RateHz));
+        PlutoTxStream? stream = null;
+        var busySince = Stopwatch.StartNew();
+        while (stream == null)
+        {
+            try
+            {
+                stream = PlutoTxStream.Open(radio, TxBufferSamplesFor(grant.RateHz), TxBuffersCount, grant.RateHz);
+            }
+            catch (IiodErrorException ex) when (ex.Status == -16)
+            {
+                // iiod releases a writer's buffer when it processes that writer's close, which an abort a moment ago may not
+                // have reached yet: a short wait is no fight with anybody. A DMA still held after it is another program's.
+                if (busySince.ElapsedMilliseconds < TxBusyGraceMs)
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+                throw new RadioRefusal(ErrorCodes.TxActive,
+                    $"another program holds this board's transmitter (its TX DMA is open: -EBUSY, still after {TxBusyGraceMs} ms) - " +
+                    "one writer per device; nothing was keyed");
+            }
+            catch (Exception ex) when (ex is IiodException || ex is PlutoRefusalException)
+            {
+                throw new RadioRefusal(ErrorCodes.RadioFault, "the board's TX DMA could not be opened: " + ex.Message);
+            }
+        }
+        Log($"TX DMA open: {stream.SamplesPerBuffer} samples ({1000.0 * stream.SamplesPerBuffer / grant.RateHz:0.0} ms) x {stream.BuffersCount} " +
+            $"kernel buffers at {grant.RateHz:0} S/s, non-cyclic; the LO stays down until the first buffer");
+        return new PlutoTransmission(this, request, grant, plan, signal, stream);
+    }
+
+    /// <summary>
+    /// THE KEY-UP (section 9.15 item 4), at the transmission's first whole buffer: the HELD gain (as an attenuation) and the
+    /// grant's LO written, read back and then the LO powered - <see cref="PlutoRadio.KeyTx"/>, whose every refusal leaves the
+    /// board quiet. The watch expects the transmitter's state from here; <c>state.tx</c> carries the read-backs in force.
+    /// </summary>
+    internal void KeyUp(PlutoTransmission t)
+    {
+        var st = GetTxState();
+        double gain = st.NextGainDb;
+        if (double.IsNaN(gain))
+            throw new RadioRefusal(ErrorCodes.BadRequest, "the TX gain was never set (set_tx gain_db): a transmission keys at a stated level");
+        double att = PlutoRadio.TxAttenuationOnGrid(Ad936xNames.MaxTxAttenuationDb - gain);
+        double bw = TxBandwidthFor(WideRateHz);
+        TxKeyReport rep;
+        try
+        {
+            rep = Board(r =>
+            {
+                var x = r.KeyTx(t.Grant.LoHz, att, bw);
+                _txExpect = (x.LoHz, x.AttenuationDb);
+                return x;
+            });
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _txRefusedKeyUps);
+            Log("KEY-UP REFUSED - nothing was powered, and the library left the board quiet: " + ex.Message);
+            throw;
+        }
+        Interlocked.Increment(ref _txKeyUps);
+        long landed = rep.LoHz - t.Grant.LoHz;
+        UpdateTxState(s =>
+        {
+            s.CenterHz = t.Grant.CenterHz + landed;
+            s.LoHz = rep.LoHz;
+            s.GainDb = Ad936xNames.MaxTxAttenuationDb - rep.AttenuationDb;
+        });
+        Log($"KEY-UP: TX LO {PlutoValues.Mhz(rep.LoHz)} MHz ({landed} Hz from {PlutoValues.Mhz(t.Grant.LoHz)} - the synthesizer's landing), " +
+            $"attenuation {rep.AttenuationDb} dB (gain {Ad936xNames.MaxTxAttenuationDb - rep.AttenuationDb}), bandwidth {rep.BandwidthHz:0} Hz, " +
+            "each read back; the LO powered");
+    }
+
+    /// <summary>The TX analog bandwidth: the RX rule (the wide rate itself), inside the board's TX range.</summary>
+    private double TxBandwidthFor(double wideRateHz)
+    {
+        double bw = wideRateHz;
+        if (_txBandwidthRange.Max > 0) bw = Math.Min(bw, _txBandwidthRange.Max);
+        if (_txBandwidthRange.Min > 0) bw = Math.Max(bw, _txBandwidthRange.Min);
+        return bw;
+    }
+
+    internal bool? ReadAndClearTxUnderflow()
+    {
+        PlutoRadio? r;
+        lock (_boardLock) r = _radio;
+        return r?.ReadAndClearTxUnderflow();
+    }
+
+    /// <summary>
+    /// The end of EVERY transmission (section 9.15 item 7; B10): SafeIdle, read back - on the control connection, or a fresh
+    /// one when that one broke - and the state in force idle again. "" when the board reads back quiet; otherwise the words,
+    /// LOUDLY in the log. A board another program changed is LEFT as that program set it (B11).
+    /// </summary>
+    internal string TxEndSafeIdle(bool keyed)
+    {
+        UpdateTxState(s =>
+        {
+            s.CenterHz = 0;
+            s.LoHz = 0;
+            s.GainDb = 0;
+        });
+        if (_foreign)
+        {
+            lock (_boardLock) _txExpect = null;
+            Log("transmission ended: no SafeIdle - another program changed this board, and it is left as that program set it");
+            return "";
+        }
+        try
+        {
+            // ONE hold of the board for both: the watch may never see "idle expected" while the board is still keyed - it
+            // would read our own transmission as another program's (section 9.15 item 10).
+            lock (_boardLock)
+            {
+                _txExpect = null;
+                var r = _radio;
+                if (r == null) return "the board was already closed";
+                if (!r.Control.IsBroken) r.SafeIdle();
+                else
+                {
+                    using var fresh = PlutoRadio.Open(r.Host, r.Port, _opt.Serial, 2000);
+                    fresh.SafeIdle();
+                }
+            }
+            Log(keyed ? "transmission ended: SafeIdle written, the board reads back quiet (TX LO powered down, 89.75 dB)"
+                      : "transmission ended before any key-up: SafeIdle written all the same, and read back quiet");
+            return "";
+        }
+        catch (Exception ex)
+        {
+            string text = $"SafeIdle did NOT take after the transmission: {ex.Message} - the board may still be transmitting";
+            Log("LOUD: " + text);
+            return text;
+        }
+    }
 }
