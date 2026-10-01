@@ -14,6 +14,7 @@
   <ItemGroup>
     <!-- AnyCPU, whatever this project builds as: the configuration follows (Directory.Build.props). -->
     <ProjectReference Include="$(UsrpProtocolProject)" SetPlatform="Platform=AnyCPU" />
+    <ProjectReference Include="$(IioProject)" SetPlatform="Platform=AnyCPU" />
     <ProjectReference Include="..\ShackLinkUsrp.Uhd\ShackLinkUsrp.Uhd.csproj" />
     <ProjectReference Include="..\ShackLinkUsrp.Dsp\ShackLinkUsrp.Dsp.csproj" />
   </ItemGroup>

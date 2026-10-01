@@ -32,6 +32,8 @@ internal static partial class Program
         Rendezvous.RootOverride = Path.Combine(_temp, "state");
         Thread.CurrentThread.CurrentCulture = new CultureInfo("de-DE");
         if (args.Length > 0 && args[0] == "--live") return LiveRun(args);
+        // --only <text>: run the cases whose name contains it (a way to iterate, never how the gate is run).
+        if (args.Length > 1 && args[0] == "--only") _only = args[1];
         var sw = Stopwatch.StartNew();
 
         Run("ring", RingCases);
@@ -98,6 +100,19 @@ internal static partial class Program
         Run("9.23 DS2: both receive sides of the synthetic radio", SimTwoSides);
         Run("9.23 DS4: 2R2T - a transmission beside two receivers, heard on both", SimTwoSidesTx);
         Run("9.23 DS2: what only a board can prove, pinned in the source", SidesSourceRules);
+        Run("Pluto P2: the command line - --iiod, its refusals, and the library's spawn line", PlutoCommandLine);
+        Run("Pluto P2: the open - SafeIdle first, the sidecar's rate, the board's own caps (B9, B10)", PlutoOpen);
+        Run("Pluto P2: found by its serial - a stale address re-found, another board never written (B6)", PlutoFind);
+        Run("Pluto P2: a FIR another program loaded - found, said, switched off (section 9.8)", PlutoFir);
+        Run("Pluto P2: levels - the 12-bit samples x16 to sc16 full scale (section 9.2 item 8)", PlutoLevels);
+        Run("Pluto P2: the wide lease - the board's samples bit for bit, following the LO (B4)", PlutoWideLease);
+        Run("Pluto P2: the loss oracle - a polled register, and a board that has none (section 9.2 item 5)", PlutoLossOracle);
+        Run("Pluto P2: a third program - every value this sidecar did not write faults the radio (B11)", PlutoForeignWriter);
+        Run("Pluto P2: the radio's settings, each read back, and the watch quiet through them", PlutoSetters);
+        Run("Pluto P2: close, and a board that goes away (B10)", PlutoCloseAndLoss);
+        Run("Pluto P2: the real executable, spawned with --iiod, loads no UHD", PlutoSpawned);
+        Run("Pluto P2: what the running gates cannot reach, pinned in the source", PlutoSourceRules);
+        Run("Pluto P2: and still nothing here loaded UHD", NoUhdInThisProcess);
 
         try { Directory.Delete(_temp, true); } catch { }
         Console.WriteLine();
@@ -105,8 +120,11 @@ internal static partial class Program
         return _fail == 0 ? 0 : 1;
     }
 
+    private static string? _only;
+
     private static void Run(string name, Action body)
     {
+        if (_only != null && !name.Contains(_only, StringComparison.OrdinalIgnoreCase)) return;
         Console.WriteLine();
         Console.WriteLine("== " + name);
         try { body(); }
@@ -870,13 +888,14 @@ internal static partial class Program
 
     // ---------------------------------------------------------------- live (an instrument, never a gate)
 
-    /// <summary><c>--live &lt;serial&gt; [--uhd dir] [--otw sc16|sc8] [--rate S/s] [--seconds n] [--allow-known-codec-fault]</c>:
-    /// spawn the real sidecar on a real radio through the client library and report what arrived.
-    /// Always exits 0 unless it cannot run; the numbers are the result.</summary>
+    /// <summary><c>--live &lt;serial&gt;|iiod:&lt;hw_serial&gt; [--iiod host[:port]] [--uhd dir] [--otw sc16|sc8] [--rate S/s] [--seconds n]
+    /// [--allow-known-codec-fault]</c>: spawn the real sidecar on a real radio through the client library and report what
+    /// arrived. <c>iiod:</c> names a Pluto-class board by its serial (ShackLink docs/plutosdr_support.md 9.10), with
+    /// <c>--iiod</c> as its stored address (none = browse). Always exits 0 unless it cannot run; the numbers are the result.</summary>
     private static int LiveRun(string[] args)
     {
         string serial = args.Length > 1 ? args[1] : "";
-        string? uhd = null, otw = null;
+        string? uhd = null, otw = null, iiod = null;
         double rate = 10e6;
         int seconds = 10;
         bool fault = false;
@@ -886,11 +905,14 @@ internal static partial class Program
             {
                 case "--uhd": uhd = args[++i]; break;
                 case "--otw": otw = args[++i]; break;
+                case "--iiod": iiod = args[++i]; break;
                 case "--rate": rate = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--seconds": seconds = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--allow-known-codec-fault": fault = true; break;
             }
         }
+        bool pluto = serial.StartsWith("iiod:", StringComparison.OrdinalIgnoreCase);
+        var address = pluto ? UsrpAddress.Iiod(serial.Substring(5)) : UsrpAddress.Local(serial);
         var extra = new List<string> { "--state-dir", Rendezvous.Root };
         if (otw != null) { extra.Add("--otw"); extra.Add(otw); }
         var opts = new UsrpSessionOptions
@@ -899,11 +921,11 @@ internal static partial class Program
             SidecarExe = SidecarExe(),
             SpawnTimeoutMs = 20000,
             RequestTimeoutMs = 20000,
-            Launch = new SidecarLaunch { UhdDirectory = uhd, AllowKnownCodecFault = fault, WideRateHz = rate, LingerSeconds = 2, ExtraArgs = extra.ToArray() },
+            Launch = new SidecarLaunch { UhdDirectory = uhd, AllowKnownCodecFault = fault, WideRateHz = rate, LingerSeconds = 2, IiodAddress = iiod, ExtraArgs = extra.ToArray() },
             Log = l => Console.WriteLine("  [session] " + l),
         };
         var sw = Stopwatch.StartNew();
-        using var s = UsrpSession.Open(UsrpAddress.Local(serial), opts);
+        using var s = UsrpSession.Open(address, opts);
         Console.WriteLine($"joined/spawned in {sw.ElapsedMilliseconds} ms: pid {s.SidecarPid}, port {s.Port}, state {s.Hello.State.Readiness}");
         string ready = s.WaitReady(60000);
         Console.WriteLine($"radio {ready} after {sw.Elapsed.TotalSeconds:0.0} s: {s.Radio.Product} {s.Radio.Serial} '{s.Radio.Name}' ({s.Radio.Source})" +
@@ -951,6 +973,18 @@ internal static partial class Program
             Interlocked.Add(ref samples, h.Count);
             if ((h.Flags & IqFlags.Discontinuity) != 0) { Interlocked.Increment(ref disc); Interlocked.Add(ref leaseDropped, h.Dropped); }
         };
+        // A Pluto's radio slot will hold a WIDE lease (decimation 1, B4): the board's whole stream, counted against the clock.
+        LeaseStream? wide = pluto ? s.OpenLease(new LeaseRequest { CenterHz = st.LoHz, Decimation = 1 }) : null;
+        long wideSamples = 0, wideDisc = 0;
+        if (wide != null)
+        {
+            wide.Connection.IqBlockReceived += (conn, h, data) =>
+            {
+                Interlocked.Add(ref wideSamples, h.Count);
+                if ((h.Flags & IqFlags.Discontinuity) != 0) Interlocked.Increment(ref wideDisc);
+            };
+            wide.Connection.StartReader();
+        }
         pano.Connection.StartReader();
         lease.Connection.StartReader();
         var run = Stopwatch.StartNew();
@@ -958,6 +992,19 @@ internal static partial class Program
         double t = run.Elapsed.TotalSeconds;
         var tel = s.GetTelemetry();
         var src = tel.GetObject("radio")?.GetObject("source");
+        if (pluto)
+        {
+            Console.WriteLine($"over {t:0.0} s at {st.WideRateHz / 1e6:0.##} MS/s from {src?.GetString("address")} (iiod {src?.GetString("iiod_version")}, firmware {src?.GetString("firmware")}):");
+            Console.WriteLine($"  board: {src?.GetLong("buffers")} buffers of {src?.GetLong("buffer_samples")} samples = {src?.GetLong("samples") / t / 1e6:0.000} MS/s since open, " +
+                              $"{src?.GetLong("buffers_overflow_flagged")} overflow-flagged (oracle {src?["overflow_oracle"]}), ADC clock {src?["adc_clock_hz"]}, " +
+                              $"{src?["temperature_c"]} C, watch {src?.GetLong("watch_full")} full + {src?.GetLong("watch_quick")} quick, FIR found: '{src?.GetString("fir_found")}'");
+            Console.WriteLine($"  wide lease: {Interlocked.Read(ref wideSamples) / t / 1e6:0.000} MS/s delivered, {Interlocked.Read(ref wideDisc)} discontinuities");
+            Console.WriteLine($"  panorama: {rows} rows, {rowFfts / Math.Max(1, rows)} FFTs per row, {rowOverflows} overflows, median bin {rowMedian:0.0} dBFS");
+            Console.WriteLine($"  lease {lease.Grant.RateHz / 1000:0} kHz: {samples / t / 1000:0.0} kS/s delivered, {blocks} blocks, {disc} discontinuities");
+            foreach (var l in s.GetLog(40)) Console.WriteLine("  | " + l);
+            wide?.Dispose();
+            return 0;
+        }
         Console.WriteLine($"over {t:0.0} s at {st.WideRateHz / 1e6:0.##} MS/s ({src?.GetString("otw_format")}):");
         Console.WriteLine($"  panorama: {rows} rows ({rows / t:0.0}/s), {rowFfts / Math.Max(1, rows)} FFTs per row of {st.WideRateHz / 10 / 8192:0} possible, " +
                           $"{rowDropped} wide samples missed, {rowOverflows} overflows, median bin {rowMedian:0.0} dBFS");
@@ -1079,6 +1126,9 @@ internal static partial class Program
                      ("the sidecar's own assembly", Path.Combine(exeDir, "ShackLinkUsrp.dll")),
                      ("the protocol library it ships beside it", Path.Combine(exeDir, "ShackLinkUsrp.Protocol.dll")),
                      ("the protocol library this gate ran in process", typeof(UsrpServer).Assembly.Location),
+                     // Referenced from ShackLink's tree the same way, so built the same way (ShackLink plutosdr 9.9).
+                     ("the iiod library it ships beside it", Path.Combine(exeDir, "ShackLinkIio.dll")),
+                     ("the iiod library this gate ran in process", typeof(ShackLinkIio.Ad936x.PlutoRadio).Assembly.Location),
                  })
         {
             bool? optimized = JitOptimized(path);

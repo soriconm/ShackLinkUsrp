@@ -45,13 +45,23 @@ internal static class Program
 
     private static int RunServer(SidecarOptions opt)
     {
-        string key = opt.Sim ? "sim-" + opt.SimName : opt.Serial!;
+        // The rendezvous key is the address grammar's (one owner): sim-<name>, iiod-<hw_serial> or the B2xx serial.
+        string key = opt.Address().RendezvousKey!;
         if (opt.StateDirectory != null) Rendezvous.RootOverride = opt.StateDirectory;
         using var log = new SidecarLog(Rendezvous.LogPathFor(key), console: opt.Console);
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
 
         RadioBackendBase backend = opt.Sim
             ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb, TxCouplingDbB = opt.SimTxCouplingDbB, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
+            : opt.Iiod != null
+            // A Pluto-class board: no UHD is loaded for it (ShackLink docs/plutosdr_support.md section 9.1 B2).
+            ? new PlutoBackend(log, new PlutoBackendOptions
+            {
+                Serial = opt.Address().Serial,
+                AddressHint = opt.Iiod == SidecarLocator.IiodBrowse ? null : opt.Iiod,
+                WideRateHz = opt.RateHz,
+                LoHz = opt.LoHz,
+            })
             : new UhdBackend(log, new UhdBackendOptions
             {
                 Serial = opt.Serial!,
@@ -208,7 +218,10 @@ internal static class Program
 internal sealed class SidecarOptions
 {
     public const string Usage =
-        "ShackLinkUsrp --serial <serial> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list [--json <file>]\n" +
+        "ShackLinkUsrp --serial <serial> | --serial <hw_serial> --iiod <host[:port]|mdns> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list [--json <file>]\n" +
+        "  --iiod <host[:port]|mdns>   a Pluto-class board behind iiod, by its hw_serial: tried at this address first (a HINT), then\n" +
+        "                              re-found by an _iio._tcp browse matched on the serial; mdns = no address known, browse at once.\n" +
+        "                              Loads no UHD, and takes none of UHD's options\n" +
         "  --list                      UHD's find: every B2xx it can claim, loading firmware into a cold one\n" +
         "  --json <file>               (with --list) write the answer there as one JSON object, whatever happened\n" +
         "  --sim-fault-after <ms>      (tests) the synthetic radio faults this long after it starts streaming\n" +
@@ -239,6 +252,8 @@ internal sealed class SidecarOptions
         "  --state-dir <dir>           rendezvous and log root (default %LocalAppData%\\ShackLinkUsrp; tests redirect it)";
 
     public string? Serial;
+    /// <summary><c>--iiod</c>: a Pluto-class board's address hint, or <see cref="SidecarLocator.IiodBrowse"/>; null = not one.</summary>
+    public string? Iiod;
     public bool Sim;
     public string SimName = UsrpAddress.DefaultSimName;
     public int SimFaultAfterMs;
@@ -260,6 +275,7 @@ internal sealed class SidecarOptions
     public string? DeviceArgs;
     public bool AllowKnownCodecFault;
     public string OtwFormat = "sc16";
+    public bool OtwSet;
     public double RateHz = 10e6;
     public long LoHz = 100_000_000;
     public long DcOffsetHz;
@@ -287,6 +303,7 @@ internal sealed class SidecarOptions
             switch (a)
             {
                 case "--serial": o.Serial = Next(); break;
+                case "--iiod": o.Iiod = Next().Trim(); break;
                 case "--sim": o.Sim = true; break;
                 case "--sim-name": o.SimName = Next(); break;
                 case "--sim-fault-after": o.SimFaultAfterMs = Int(a, Next()); break;
@@ -343,6 +360,7 @@ internal sealed class SidecarOptions
                 case "--allow-known-codec-fault": o.AllowKnownCodecFault = true; break;
                 case "--otw":
                     o.OtwFormat = Next();
+                    o.OtwSet = true;
                     if (o.OtwFormat != "sc16" && o.OtwFormat != "sc8") throw new ArgumentException("--otw is sc16 or sc8");
                     break;
                 case "--rate": o.RateHz = Double(a, Next()); break;
@@ -391,10 +409,26 @@ internal sealed class SidecarOptions
                 throw new ArgumentException("--sim-settle-ms is for the synthetic radio (--sim); a real radio's settle is its own");
             if (o.SimTxCouplingSet && !o.Sim)
                 throw new ArgumentException("--sim-tx-coupling and --sim-tx-coupling-b are for the synthetic radio (--sim); a real radio's coupling is its own");
+            if (o.Iiod != null)
+            {
+                if (o.Sim) throw new ArgumentException("--iiod is a real board; the synthetic radio is --sim");
+                if (o.Iiod != SidecarLocator.IiodBrowse && !PlutoDiscovery.TryParseHostPort(o.Iiod, out _, out _))
+                    throw new ArgumentException($"--iiod needs host[:port] (an IPv6 host as [addr]:port) or {SidecarLocator.IiodBrowse}, not \"{o.Iiod}\"");
+                // UHD's options mean nothing to an iiod radio: refused, never silently ignored.
+                var uhdOnly = new List<string>();
+                if (o.UhdDirectory != null) uhdOnly.Add("--uhd");
+                if (o.ImagesDirectory != null) uhdOnly.Add("--images");
+                if (o.FpgaPath != null) uhdOnly.Add("--fpga");
+                if (o.DeviceArgs != null) uhdOnly.Add("--args");
+                if (o.AllowKnownCodecFault) uhdOnly.Add("--allow-known-codec-fault");
+                if (o.OtwSet) uhdOnly.Add("--otw");
+                if (o.DcOffsetHz != 0) uhdOnly.Add("--dc-offset");
+                if (uhdOnly.Count > 0)
+                    throw new ArgumentException($"{string.Join(", ", uhdOnly)} {(uhdOnly.Count == 1 ? "is a" : "are")} UHD option{(uhdOnly.Count == 1 ? "" : "s")}; an iiod board (--iiod) loads no UHD");
+            }
             try
             {
-                if (o.Sim) UsrpAddress.Sim(o.SimName);
-                else UsrpAddress.Local(o.Serial!);
+                o.Address();
             }
             catch (FormatException ex)
             {
@@ -403,6 +437,10 @@ internal sealed class SidecarOptions
         }
         return o;
     }
+
+    /// <summary>The radio this command line names, in the address grammar - the ONE spelling of its rendezvous key.</summary>
+    public UsrpAddress Address() =>
+        Sim ? UsrpAddress.Sim(SimName) : Iiod != null ? UsrpAddress.Iiod(Serial!) : UsrpAddress.Local(Serial!);
 
     private static double Double(string opt, string v) =>
         double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) && d > 0

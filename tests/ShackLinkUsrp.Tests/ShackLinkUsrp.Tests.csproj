@@ -13,7 +13,12 @@
   <ItemGroup>
     <!-- AnyCPU, whatever this project builds as: the configuration follows (Directory.Build.props). -->
     <ProjectReference Include="$(UsrpProtocolProject)" SetPlatform="Platform=AnyCPU" />
+    <ProjectReference Include="$(IioProject)" SetPlatform="Platform=AnyCPU" />
     <ProjectReference Include="..\..\src\ShackLinkUsrp.Dsp\ShackLinkUsrp.Dsp.csproj" />
     <ProjectReference Include="..\..\src\ShackLinkUsrp\ShackLinkUsrp.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The owner's Pluto's own PRINT (2026-09-30), copied from ShackLink's IiodWireTest\Fixtures: the fake iiod's context. -->
+    <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

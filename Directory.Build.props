@@ -27,6 +27,10 @@
     <!-- The sibling checkout of ShackLink (C:\Dev\ShackLink). Override with -p:ShackLinkDir=... -->
     <ShackLinkDir Condition="'$(ShackLinkDir)' == ''">$(MSBuildThisFileDirectory)..\ShackLink\</ShackLinkDir>
     <UsrpProtocolProject>$(ShackLinkDir)ShackLinkUsrp.Protocol\ShackLinkUsrp.Protocol.csproj</UsrpProtocolProject>
+    <!-- The managed iiod client a Pluto-class board is reached through (MIT, netstandard2.0, BCL-only; ShackLink
+         docs/plutosdr_support.md section 9.1 B3). Referenced EXACTLY as the protocol library is - directly, from
+         every project that reaches it, platform pinned to AnyCPU - for the reasons given below. -->
+    <IioProject>$(ShackLinkDir)ShackLinkIio\ShackLinkIio.csproj</IioProject>
     <!-- That library is not in this solution, and when a solution is built MSBuild strips Configuration
          and Platform from a reference it does not list, so the reference builds in its DEFAULT
          configuration: every Release sidecar shipped the Debug library, JIT optimizer off (ShackLink

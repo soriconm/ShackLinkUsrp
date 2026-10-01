@@ -114,10 +114,15 @@ internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
         return centerHz;
     }
 
+    /// <summary>A WIDE lease (decimation 1, one side - ShackLink docs/plutosdr_support.md section 9.6): the side's
+    /// whole stream, centred on the side. It follows every move of that centre, and its samples are the ring's own.</summary>
+    public bool IsWide => Decimation == 1 && _ctx.Length == 1;
+
     private void OnRadioRetuned(int side, long loHz, long position)
     {
         lock (_pendingLock)
         {
+            if (IsWide) Interlocked.Exchange(ref _center, loHz);
             _lo[side] = loHz;
             _changePending = true;
             _radioMoved = true;
@@ -291,10 +296,14 @@ internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
                 if (!ring.WaitFor(pos + chunk, 100)) { ready = false; break; }
             if (!ready) continue;
 
+            // A wide lease on its side's centre shifts nothing and decimates by 1: its samples are the ring's own,
+            // bit for bit - no NCO, no filter, no float round trip (which would cost a 32767/32768 gain and LSBs).
+            bool passthrough = IsWide && ncoCenter == ncoLo[0];
             bool lapped = false;
             for (int s = 0; s < n; s++)
             {
                 if (!rings[s].TryRead(pos, chunk, raw)) { lapped = true; break; }
+                if (passthrough) continue;
                 // The phase is the radio position's, not this lease's history (Nco.AnchorAt): every chunk.
                 ncos[s].AnchorAt(pos);
                 ncos[s].Mix(raw, chunk, re[s], im[s]);
@@ -314,8 +323,8 @@ internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
             }
             pos += chunk;
 
-            int produced = 0;
-            for (int s = 0; s < n; s++)
+            int produced = passthrough ? chunk : 0;
+            for (int s = 0; s < n && !passthrough; s++)
             {
                 int got = firs[s].Process(re[s], im[s], chunk, outRe[s], outIm[s], 0);
                 if (s == 0) produced = got;
@@ -340,10 +349,18 @@ internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
                     blockCenter = ncoCenter;
                 }
                 int o = fill * 2 * n;
-                for (int s = 0; s < n; s++)
+                if (passthrough)
                 {
-                    block[o + 2 * s] = ToSc16(outRe[s][i]);
-                    block[o + 2 * s + 1] = ToSc16(outIm[s][i]);
+                    block[o] = raw[2 * i];
+                    block[o + 1] = raw[2 * i + 1];
+                }
+                else
+                {
+                    for (int s = 0; s < n; s++)
+                    {
+                        block[o + 2 * s] = ToSc16(outRe[s][i]);
+                        block[o + 2 * s + 1] = ToSc16(outIm[s][i]);
+                    }
                 }
                 fill++;
                 outIndex++;
