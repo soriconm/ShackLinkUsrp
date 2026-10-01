@@ -1,0 +1,176 @@
+DIAGNOSTIC ONLY - never shipped. Applies to UHD 4.10.0.0 (C:\Dev\USRP_B210\uhd-4.10-diagnostic).
+ShackLink docs/usrp_b210_support.md 9.30: the AD9361 TX quadrature calibration surveyed on a B210.
+
+UHD_TXQC_LOG=<file>  one line per TX quad cal run: the chip's convergence flags (0x0A7 TX1, 0x0A8 TX2)
+                     and the correction words left in 0x08E..0x09D, with why it ran (window | chains).
+UHD_TXQC_RESET=1     pulse the cal's soft reset before each run (ADI's order).
+UHD_TXQC_SWEEP=1     after each stock run, all 32 RX NCO phase offsets, then the stock 0x15 again.
+All unset: UHD's own register writes (one redundant 0x0A0 write). Driven by ShackLinkUsrp.UhdProbe --txqc.
+
+diff --git a/host/lib/usrp/common/ad9361_driver/ad9361_device.cpp b/host/lib/usrp/common/ad9361_driver/ad9361_device.cpp
+index 030d754..ab7c42a 100644
+--- a/host/lib/usrp/common/ad9361_driver/ad9361_device.cpp
++++ b/host/lib/usrp/common/ad9361_driver/ad9361_device.cpp
+@@ -18,8 +18,53 @@
+ #include <boost/scoped_array.hpp>
+ #include <chrono>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
+ #include <thread>
+ 
++// ---------------------------------------------------------------------------
++// DIAGNOSTIC (ShackLink TX quad-cal survey, 2026-10-01) - never shipped.
++// UHD_TXQC_LOG=<file>  append one line per TX quadrature calibration run: the
++//                      chip's own convergence flags (0x0A7/0x0A8) and the
++//                      correction words it left (0x08E..0x09D).
++// UHD_TXQC_RESET=1     pulse the cal's soft reset before each run (ADI's order).
++// UHD_TXQC_SWEEP=1     after each stock run, run all 32 RX NCO phase offsets
++//                      (ADI's phase search), then the stock 0x15 again.
++// All unset: the register writes are UHD's own (one redundant 0x0A0 write).
++// ---------------------------------------------------------------------------
++namespace {
++const char* g_txqc_reason = "unknown";
++int g_txqc_seq            = 0;
++
++const char* txqc_env(const char* name)
++{
++    const char* v = std::getenv(name);
++    return (v != nullptr && *v != '\0') ? v : nullptr;
++}
++
++bool txqc_flag(const char* name)
++{
++    const char* v = txqc_env(name);
++    return v != nullptr && std::string(v) == "1";
++}
++
++void txqc_append(const std::string& line)
++{
++    const char* path = txqc_env("UHD_TXQC_LOG");
++    if (path == nullptr) {
++        return;
++    }
++    FILE* f = std::fopen(path, "a");
++    if (f == nullptr) {
++        return;
++    }
++    std::fputs(line.c_str(), f);
++    std::fputc('\n', f);
++    std::fclose(f);
++}
++} // namespace
++
+ ////////////////////////////////////////////////////////////
+ // the following macros evaluate to a compile time constant
+ // macros By Tom Torfs - donated to the public domain
+@@ -912,17 +957,70 @@ void ad9361_device_t::_tx_quadrature_cal_routine()
+     _io_iface->poke8(0x0a4, 0xf0); // Cal setting conut
+     _io_iface->poke8(0x0ae, 0x00); // Cal LPF gain index (split mode)
+ 
+-    /* Now, calibrate the TX quadrature! */
+-    size_t count = 0;
+-    _io_iface->poke8(0x016, 0x10);
+-    while (_io_iface->peek8(0x016) & 0x10) {
+-        if (count > 100) {
+-            throw uhd::runtime_error(
+-                "[ad9361_device_t] TX Quadrature Calibration Failure");
+-            break;
++    // DIAGNOSTIC: one line per run, written only when UHD_TXQC_LOG is set.
++    const bool txqc_reset = txqc_flag("UHD_TXQC_RESET");
++    auto txqc_snapshot = [&](const char* step, uint8_t phase, size_t polls, double ms) {
++        if (txqc_env("UHD_TXQC_LOG") == nullptr) {
++            return;
+         }
+-        count++;
+-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++        std::string corr;
++        for (int r = 0x08E; r <= 0x09D; r++) {
++            corr += str(boost::format("%s%02X") % (corr.empty() ? "" : ",")
++                        % unsigned(_io_iface->peek8(r)));
++        }
++        const unsigned att1 = (unsigned(_io_iface->peek8(0x074) & 0x01) << 8)
++                              | _io_iface->peek8(0x073);
++        const unsigned att2 = (unsigned(_io_iface->peek8(0x076) & 0x01) << 8)
++                              | _io_iface->peek8(0x075);
++        txqc_append(str(
++            boost::format("TXQC seq=%d why=%s step=%s port=%c phase=%u reset=%d polls=%u "
++                          "ms=%.1f tx_hz=%.0f req_tx_hz=%.0f last_cal_hz=%.0f rx_hz=%.0f "
++                          "bbbw=%.0f tfir=%d maxcal=%.0f a0=%02X a1=%02X a3=%02X st1=%02X "
++                          "st2=%02X aa=%02X ac=%02X txfilt=%02X rxfilt=%02X ensm=%02X "
++                          "att1=%u att2=%u corr=%s")
++            % g_txqc_seq % g_txqc_reason % step % ((_regs.inputsel & 0x40) ? 'B' : 'A')
++            % unsigned(phase) % (txqc_reset ? 1 : 0) % polls % ms % _tx_freq
++            % _req_tx_freq % _last_tx_cal_freq % _rx_freq % _baseband_bw % _tfir_factor
++            % max_cal_freq % unsigned(_io_iface->peek8(0x0a0))
++            % unsigned(_io_iface->peek8(0x0a1)) % unsigned(_io_iface->peek8(0x0a3))
++            % unsigned(_io_iface->peek8(0x0a7)) % unsigned(_io_iface->peek8(0x0a8))
++            % unsigned(_io_iface->peek8(0x0aa)) % unsigned(_io_iface->peek8(0x0ac))
++            % unsigned(_io_iface->peek8(0x002)) % unsigned(_io_iface->peek8(0x003))
++            % unsigned(_io_iface->peek8(0x017)) % att1 % att2 % corr));
++    };
++    auto txqc_run = [&](uint8_t phase, const char* step) {
++        _io_iface->poke8(0x0a0, phase | (nco_freq >> 1));
++        if (txqc_reset) {
++            _io_iface->poke8(0x0a1, 0x7B | 0x04); // soft reset, then the same control
++            _io_iface->poke8(0x0a1, 0x7B);
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++
++        /* Now, calibrate the TX quadrature! */
++        size_t count = 0;
++        _io_iface->poke8(0x016, 0x10);
++        while (_io_iface->peek8(0x016) & 0x10) {
++            if (count > 100) {
++                txqc_snapshot("TIMEOUT", phase, count, -1.0);
++                throw uhd::runtime_error(
++                    "[ad9361_device_t] TX Quadrature Calibration Failure");
++                break;
++            }
++            count++;
++            std::this_thread::sleep_for(std::chrono::milliseconds(10));
++        }
++        const double ms = std::chrono::duration<double, std::milli>(
++                              std::chrono::steady_clock::now() - t0)
++                              .count();
++        txqc_snapshot(step, phase, count, ms);
++    };
++
++    txqc_run(0x15, "stock");
++    if (txqc_flag("UHD_TXQC_SWEEP")) {
++        for (uint8_t p = 0; p < 32; p++) {
++            txqc_run(p, "sweep");
++        }
++        txqc_run(0x15, "restore");
+     }
+ }
+ 
+@@ -944,6 +1042,7 @@ void ad9361_device_t::_calibrate_tx_quadrature()
+     /* This calibration must be done in a certain order, and for both TX_A
+      * and TX_B, separately. Store the original setting so that we can
+      * restore it later. */
++    g_txqc_seq++; // DIAGNOSTIC
+     uint8_t orig_reg_inputsel = _regs.inputsel;
+ 
+     /***********************************************************************
+@@ -2055,8 +2154,10 @@ void ad9361_device_t::set_active_chains(bool tx1, bool tx2, bool rx1, bool rx2)
+      * require user intervention (currently triggered by tuning difference that
+      * is > 100 MHz). Late calibration provides better performance.
+      */
+-    if (tx1 | tx2)
++    if (tx1 | tx2) {
++        g_txqc_reason = "chains"; // DIAGNOSTIC
+         _calibrate_tx_quadrature();
++    }
+ 
+     /* Put back into FDD state if necessary */
+     if (set_back_to_fdd)
+@@ -2171,6 +2272,7 @@ double ad9361_device_t::tune(direction_t direction, const double value)
+ 
+             _last_rx_cal_freq = tune_freq;
+         } else {
++            g_txqc_reason = "window"; // DIAGNOSTIC
+             _calibrate_tx_quadrature();
+             _last_tx_cal_freq = tune_freq;
+         }

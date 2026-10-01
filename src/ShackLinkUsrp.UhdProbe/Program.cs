@@ -14,6 +14,7 @@ namespace ShackLinkUsrp.UhdProbe;
 ///
 ///   --uhd DIR  --allow-known-codec-fault  --images DIR  --args "serial=..."  --load altered|native|dlldir
 ///   --find | --info | --stream [--rate 10e6] [--freq 100e6] [--gain 30] [--seconds 5] [--otw sc16|sc8]
+///   --txqc (TxQcProbe: the AD9361 TX quad cal under the TXQC diagnostic uhd.dll; UHD_TXQC_LOG set; nothing sent)
 ///                              [--lo-offset 0] [--buffer SAMPLES]
 /// </summary>
 internal static class Program
@@ -25,7 +26,7 @@ internal static class Program
         var a = new Args(argv);
         if (a.Has("--help") || a.Mode.Length == 0)
         {
-            Console.WriteLine("usage: ShackLinkUsrp.UhdProbe (--find | --info | --stream) [--uhd DIR] [--allow-known-codec-fault] " +
+            Console.WriteLine("usage: ShackLinkUsrp.UhdProbe (--find | --info | --stream | --txqc) [--uhd DIR] [--allow-known-codec-fault] " +
                               "[--images DIR] [--args \"serial=...\"] [--load altered|native|dlldir] [--rate HZ] [--freq HZ] " +
                               "[--gain DB] [--seconds S] [--otw sc16|sc8] [--lo-offset HZ] [--buffer SAMPLES]");
             return a.Has("--help") ? 0 : 2;
@@ -62,6 +63,7 @@ internal static class Program
                 "--find" => Find(args),
                 "--info" => Info(args),
                 "--stream" => Stream(args, a),
+                "--txqc" => TxQcProbe.Run(args, a.Get, a.GetDouble),
                 _ => 2,
             };
         }
@@ -256,7 +258,7 @@ internal static class Program
         public Args(string[] v)
         {
             _v = v;
-            Mode = v.FirstOrDefault(x => x is "--find" or "--info" or "--stream") ?? "";
+            Mode = v.FirstOrDefault(x => x is "--find" or "--info" or "--stream" or "--txqc") ?? "";
         }
 
         public bool Has(string name) => _v.Any(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase));
