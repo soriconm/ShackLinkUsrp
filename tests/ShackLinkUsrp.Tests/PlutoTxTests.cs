@@ -99,13 +99,19 @@ internal static partial class Program
             Check(c != null && c.GainMinDb == 0 && c.GainMaxDb == 89.75 && c.GainStepDb == 0.25 && c.FreqMinHz == 46_875_001 && c.FreqMaxHz == 6_000_000_000,
                   "gain 0-89.75 in 0.25 (the wire's 89.75 + hardwaregain); the TX LO 46.875001 MHz-6 GHz, as the board states it");
             Check(c != null && c.MaxLoOffsetHz == 0 && !c.DualRx && c.Offers(TxSourceKinds.Iq) && c.Offers(TxSourceKinds.Tone) && c.Offers(TxSourceKinds.Mod) &&
-                  c.Offers(TxSourceKinds.Step) && c.QuantumSamples == PlutoBackend.TxBufferSamplesFor(312_500),
-                  $"no LO offset (no DUC), one side, all four sources (B5: streamed IQ, never the DDS), the quantum a TX kernel buffer ({c?.QuantumSamples})");
+                  c.Offers(TxSourceKinds.Step) && c.QuantumSamples == PlutoBackend.TxBufferSamplesFor(2_500_000) / 8 && c.QuantumSamples == 8192,
+                  $"no LO offset (no DUC), one side, all four sources (B5: streamed IQ, never the DDS), the quantum one TX DMA buffer in SOURCE samples " +
+                  $"at the lowest rate ({c?.QuantumSamples}: 65,536 at the wide rate, interpolated from 8,192)");
+            Check(c != null && c.MaxWideRateHz == 4_000_000,
+                  $"caps.tx.max_wide_rate_hz: 4 MS/s, the wide rate this board was MEASURED to transmit at beside its own receiver (section 9.21) [{c?.MaxWideRateHz}]");
             var st = s.GetState().Tx!;
             Check(st.CenterHz == 0 && st.LoHz == 0 && st.GainDb == 0 && st.RateHz == 312_500 && st.Held != null && st.Held.CenterHz == 0 && double.IsNaN(st.Held.GainDb),
-                  "state.tx at open: the truth in force (LO powered down = 0, gain 0 = the maximum attenuation), the lowest TX rate, and NOTHING held");
-            Check(fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "312500" && BoardQuiet(fake),
-                  "the TX DMA was put at 312.5 kS/s (FPGA-only), and the board reads quiet");
+                  "state.tx at open: the truth in force (LO powered down = 0, gain 0 = the maximum attenuation), the lowest SOURCE rate, and NOTHING held");
+            Check(fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "2500000" && BoardQuiet(fake),
+                  "the TX DMA was put at the WIDE rate, 2.5 MS/s - the one setting the owner's board's DMA runs right at (section 9.20) - and the board reads quiet");
+            Check(!fake.AttributeWrites().Any(w => w.StartsWith(FakeIiod.Dds + "|OUTPUT|voltage", StringComparison.Ordinal) && w.Contains("|sampling_frequency=") &&
+                                                    !w.EndsWith("=2500000", StringComparison.Ordinal)),
+                  "...and NEVER at the wide/8 it lists: every write of the DMA's rate was the wide rate");
             Check(!fake.AttributeWrites().Any(w => w.StartsWith(TxLoFreq + "=", StringComparison.Ordinal)),
                   "the TX LO's FREQUENCY was never written while receiving (hazard 6: a quad-cal may clear the powerdown)");
             var tel = s.GetTelemetry().GetObject("radio")?.GetObject("source");
@@ -146,8 +152,8 @@ internal static partial class Program
             Check(st.Held != null && st.Held.CenterHz == TxCentre && st.Held.GainDb == 59.75 && st.CenterHz == 0 && st.LoHz == 0 && st.GainDb == 0,
                   "set_tx while idle: held {145.5 MHz, 59.75 dB on the grid}, and the truth in force unchanged (0, 0, 0) - fail-closed (Q1)");
             var w = TxWritesOf(fake).Skip(before).ToList();
-            Check(w.All(x => x.Contains("|sampling_frequency=")) && BoardQuiet(fake),
-                  $"...and NOTHING of the centre or gain reached the board: only the TX DMA's rate (FPGA-only) [{string.Join(" | ", w)}]");
+            Check(w.Count == 0 && BoardQuiet(fake),
+                  $"...and NOTHING reached the board: not the centre, not the gain, and not even the source's rate - the TX DMA stays at the wide rate [{string.Join(" | ", w)}]");
             Check(RefusedTx(() => s.SetTx(new TxSettings { GainDb = 95 }))?.Code == ErrorCodes.OutOfRange, "a gain above 89.75 is refused OUT_OF_RANGE");
             var off = RefusedTx(() => s.SetTx(new TxSettings { LoOffsetHz = 100_000 }));
             Check(off?.Code == ErrorCodes.Unsupported && off.Message.Contains("no LO offset"), "an LO offset is refused: there is no DUC to place one [" + off?.Message + "]");
@@ -219,8 +225,13 @@ internal static partial class Program
             Check(pdCmd >= 0 && close > pdCmd && fake.TxReleases == 1, "SafeIdle FIRST, then the TX buffer CLOSEd (item 7)");
 
             var bufs = TxBuffersOf(fake);
-            Check(bufs.Count > 0 && bufs.All(b => !b.LoPoweredDown && b.LoHz == TxCentre && b.AttenuationDb == 30 && b.RateHz == 312_500),
-                  $"every one of the {bufs.Count} buffers went out with the LO powered at 145.5 MHz, 30 dB, 312.5 kS/s - the board's own record");
+            Check(bufs.Count > 0 && bufs.All(b => !b.LoPoweredDown && b.LoHz == TxCentre && b.AttenuationDb == 30 && b.RateHz == 2_500_000 && b.ConsumedRateHz == 2_500_000),
+                  $"every one of the {bufs.Count} buffers went out with the LO powered at 145.5 MHz, 30 dB, the TX DMA at the WIDE rate (2.5 MS/s, stated and " +
+                  "consumed - section 9.21) - the board's own record");
+            double went = (bufs[^1].DoneTs - bufs[0].StartTs) / (double)Stopwatch.Frequency, owedS = bufs.Sum(b => b.Payload.Length / 4) / 2_500_000.0;
+            Check(Math.Abs(went - owedS) < 0.05 * owedS && owedS > 1.0 && owedS < 1.15,
+                  $"the board CONSUMED it in real time: {F(went, "0.000")} s for {F(owedS, "0.000")} s of samples at 2.5 MS/s - one second of the client's " +
+                  "samples took one second of air, plus the padding and the filter's tail");
             var outAt = bufs.SelectMany(b => fake.TxStatesDuring(b)).ToList();
             Check(outAt.Count >= bufs.Count && outAt.All(x => !x.LoPoweredDown && x.LoHz == TxCentre && x.AttenuationDb == 30),
                   "...and every buffer was CONSUMED - went OUT - at that state, not merely pushed at it (the fake's DMA, paced)");
@@ -229,8 +240,25 @@ internal static partial class Program
             Check(quietAt != null && quietAt.Timestamp >= last.DoneTs,
                   $"the DRAIN: the last sample left before SafeIdle powered the LO down ({(quietAt == null ? "never" : F((quietAt.Timestamp - last.DoneTs) * 1000.0 / Stopwatch.Frequency, "0.0") + " ms after")})");
             var sent = TxSamplesOf(fake);
-            bool exact = sent.Length >= iq.Length && sent.AsSpan(0, iq.Length).SequenceEqual(iq) && sent.Skip(iq.Length).All(v => v == 0);
-            Check(exact, $"the board received the client's samples BIT FOR BIT ({total} of them), then only the last buffer's zero padding");
+            int D = TxUpsampler.DelayInput;
+            bool exact = sent.Length >= 2 * 8 * (total + D);
+            for (int n = 0; exact && n < total; n++)
+                exact = sent[2 * 8 * (n + D)] == iq[2 * n] && sent[2 * 8 * (n + D) + 1] == iq[2 * n + 1];
+            Check(exact, $"x8 at the board: every 8th sample it received IS the client's, BIT FOR BIT, all {total} of them ({D} source samples late, the filter's centre)");
+            int quietFrom = 2 * 8 * (total + 2 * D + 1);
+            Check(sent.Length > quietFrom && sent.Skip(quietFrom).All(v => v == 0) && sent.Skip(2 * 8 * (total + D)).Take(quietFrom - 2 * 8 * (total + D)).Any(v => v != 0),
+                  "...then the filter's tail - pushed out before the end, never cut - then only zeros");
+            double img = WorstImageDbc(sent, 8192, 65536, 2_500_000, 312_500, 25_000, 8);
+            Check(img <= -74, $"IMAGE REJECTION, measured in what the board was sent: the strongest image of the 25 kHz tone (k x 312.5 kHz +- 25 kHz) at {F(img, "0.0")} dBc - " +
+                              "no worse than the 12-bit DAC's own floor (74 dB), the HDL interpolator's job done here");
+            var stuffed = new short[iq.Length * 8];
+            for (int n = 0; n < total; n++)
+            {
+                stuffed[16 * n] = iq[2 * n];
+                stuffed[16 * n + 1] = iq[2 * n + 1];
+            }
+            double raw = WorstImageDbc(stuffed, 8192, 65536, 2_500_000, 312_500, 25_000, 8);
+            Check(raw > -3, $"ORACLE: the same measurement on the tone ZERO-STUFFED x8 - the interpolation undone - reads its images at {F(raw, "0.0")} dBc: it sees images when they are there");
             Check(WaitTx(events, TxStates.Keyed, null, 1000) && WaitTx(events, TxStates.Idle, EndReasons.Drained, 2000),
                   "tx keyed, then idle (drained), said to every client");
             var after = s.GetState().Tx!;
@@ -345,7 +373,8 @@ internal static partial class Program
             string? loNow = fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage1", "frequency");
             Check(keyedEv && loNow == "145500000", $"a tone keys at its start (event {keyedEv}), the LO at the held centre ({loNow})");
             Thread.Sleep(400);
-            var first = TxBuffersOf(fake).First();
+            // The SECOND buffer: the first opens with the interpolator's start (its history is zeros), which is no tone yet.
+            var first = TxBuffersOf(fake).Skip(1).First();
             var x = new short[first.Payload.Length / 2];
             Buffer.BlockCopy(first.Payload, 0, x, 0, first.Payload.Length);
             double turn = 0;
@@ -359,7 +388,11 @@ internal static partial class Program
                 turn += dd;
             }
             double hz = turn / pairs / (2 * Math.PI) * first.RateHz;
-            Check(Math.Abs(hz - 50_000) < 50, $"the samples ARE the tone: {F(hz, "0")} Hz from the LO at {first.RateHz:0} S/s (the lowest rate that holds it)");
+            Check(Math.Abs(hz - 50_000) < 50 && first.RateHz == 2_500_000 && t.Grant.RateHz == 312_500,
+                  $"the samples ARE the tone: {F(hz, "0")} Hz from the LO, generated at {t.Grant.RateHz:0} S/s (the lowest rate that holds it) and sent at the " +
+                  $"DMA's {first.RateHz:0} - a generated source is interpolated x8 too");
+            var genImg = WorstImageDbc(TxSamplesOf(fake), 8192, 65536, 2_500_000, 312_500, 50_000, 8);
+            Check(genImg <= -74, $"...its images measured in what the board was sent: {F(genImg, "0.0")} dBc");
 
             // A park while keyed: no CORDIC, so the synthesizer - rf - read back; the next transmission keys there too.
             var park = s.SetTx(new TxSettings { CenterHz = TxCentre + 1_000_000 });
@@ -376,6 +409,11 @@ internal static partial class Program
                   "...and the watch, expecting THIS transmitter's state, has not read it as another program's");
             var rt = t.Stop(drain: true);
             Check(rt.Acked && BoardQuiet(fake), $"a generated source drains on the board's word too: {rt}");
+            var endBuf = TxBuffersOf(fake).Last();
+            var endS = new short[endBuf.Payload.Length / 2];
+            Buffer.BlockCopy(endBuf.Payload, 0, endS, 0, endBuf.Payload.Length);
+            Check(endS.Skip(endS.Length - 2 * 8 * TxUpsampler.TapsPerPhase).All(v => v == 0) && endS.Take(2 * 8 * TxUpsampler.HalfLength).Any(v => v != 0),
+                  "...and its interpolated TAIL went out first: the last buffer the board was sent opens with the tail and ends in zeros - never a carrier cut mid-filter");
 
             // A BASEBAND sweep: the steps generated at exact samples, the LO written ONCE. (The tone's own "drained" is not this.)
             lock (events) events.Clear();
@@ -417,6 +455,22 @@ internal static partial class Program
             var moved = tunedBufs.Where(b => fake.TxStatesDuring(b).Any(st => st.LoHz != b.LoHz || st.LoPoweredDown)).ToList();
             Check(moved.Count == 0,
                   $"...and every one was CONSUMED at it too: no LO move while a buffer was going out - each step waited for the DMA to run dry ({moved.Count} of {tunedBufs.Count} left at another LO)");
+            // ...and the interpolator's TAIL of a step went out at that step's LO: the first buffer at a new LO starts from a SETTLED filter,
+            // so its every-8th samples are the new step's from zero history - the first DelayInput of them exactly zero, nothing carried over.
+            var carried = new List<int>();
+            for (int i = 1; i < tunedBufs.Count; i++)
+            {
+                if (tunedBufs[i].LoHz == tunedBufs[i - 1].LoHz) continue;
+                var pl = tunedBufs[i].Payload;
+                for (int j = 0; j < TxUpsampler.DelayInput; j++)
+                    if (BitConverter.ToInt16(pl, 4 * 8 * j) != 0 || BitConverter.ToInt16(pl, 4 * 8 * j + 2) != 0)
+                    {
+                        carried.Add(i);
+                        break;
+                    }
+            }
+            Check(carried.Count == 0 && tunedBufs.Select(b => b.LoHz).Distinct().Count() == 3,
+                  $"...and each step's interpolated tail left at ITS OWN LO before the next moved: every step's first buffer starts from a settled filter ({carried.Count} carried the last step's samples over)");
             Check(s.GetState().Tx!.Held!.CenterHz == TxCentre + 1_000_000 && BoardQuiet(fake), "afterwards the held centre is what the client had set, and the board is quiet");
             tuned.Dispose();
             ev.Dispose();
@@ -554,24 +608,266 @@ internal static partial class Program
             s.WaitReady(5000);    // re-reads the caps, which follow the wide rate
             var c = s.Caps.Tx;
             Check(c != null && c.RatesHz.SequenceEqual(new[] { 1_250_000.0, 10_000_000.0 }), "a rate change re-reads the TX DMA's list: 1.25 and 10 MS/s at 10 MS/s");
-            Check(s.GetState().Tx!.RateHz == 1_250_000 && fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "1250000" &&
+            Check(s.GetState().Tx!.RateHz == 1_250_000 && fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "10000000" &&
                   LogText(p.backend).Contains("TX rate moved from 312500 to 1250000"),
-                  "...the TX rate the new one does not list moved to the lowest it does, set on the DMA, and said");
+                  "...the source rate the new one does not list moved to the lowest it does, said - and the DMA put at the NEW WIDE rate, 10 MS/s");
             s.ClaimTx();
             s.SetTx(new TxSettings { CenterHz = TxCentre, GainDb = 30 });
+            // Q5 (section 9.21): at 10 MS/s this board's transmitter starves beside its own receiver - refused before anything opens.
+            int opens = fake.TxOpens;
+            var q5 = RefusedTx(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 }));
+            Check(q5?.Code == ErrorCodes.OutOfRange && q5.Message.Contains("4000000") && q5.Message.Contains("lower the radio's rate") &&
+                  fake.TxOpens == opens && BoardQuiet(fake),
+                  "a key-up at a 10 MS/s wide rate is REFUSED in words naming the remedy - the TX DMA never opened, the board quiet: " + q5?.Message);
+            RadioRefusal? own5 = null;
+            try { p.backend.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 }); }
+            catch (RadioRefusal ex) { own5 = ex; }
+            Check(own5?.Code == ErrorCodes.OutOfRange && fake.TxOpens == opens,
+                  "...and the backend refuses it ITSELF, asked past the server: " + own5?.Message);
+            s.SetRate(4e6);
+            s.WaitReady(5000);
+            Check(s.Caps.Tx!.RatesHz.SequenceEqual(new[] { 500_000.0, 4_000_000.0 }) && fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "4000000",
+                  "at 4 MS/s: the source rates 500 kS/s and 4 MS/s, the DMA at 4 MS/s");
             var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 });
-            var r = RefusedTx(() => s.SetRate(5e6));
+            Check(WaitFor(() => fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage1", "powerdown") == "0", 2000), "...and the same key-up is admitted and keys");
+            var r = RefusedTx(() => s.SetRate(2.5e6));
             Check(r?.Code == ErrorCodes.TxActive, "set_rate under a transmission is refused TX_ACTIVE: the wide rate is the transmitter's clock too");
             // The backend's OWN net, reached past the server (which refuses first and would hide its absence).
             RadioRefusal? own = null;
-            try { p.backend.SetRate(5e6); }
+            try { p.backend.SetRate(2.5e6); }
             catch (RadioRefusal ex) { own = ex; }
-            Check(own?.Code == ErrorCodes.TxActive && p.backend.GetState().WideRateHz == 10e6,
+            Check(own?.Code == ErrorCodes.TxActive && p.backend.GetState().WideRateHz == 4e6,
                   "...and the backend refuses it ITSELF, asked directly: the board's rate never moves under its transmitter: " + own?.Message);
-            t.Stop(drain: true);
-            Check(BoardQuiet(fake), "quiet after");
+            var rt = t.Stop(drain: true);
+            Check(rt.Acked && rt.Underflows == 0 && BoardQuiet(fake),
+                  $"4 MS/s each way runs CLEAN on the board as measured, and so on the fake: drained on the board's word, no underflow: {rt}");
         }
         finally { Stop(p); }
+    }
+
+    // ---------------------------------------------------------------- P4e: the interpolation (section 9.21, Q4)
+
+    /// <summary>A sc16 level at <paramref name="f"/>: a 4-term Blackman-Harris window, a DFT evaluated in double precision at exactly that
+    /// frequency, normalised to the window's sum - dB re full scale.</summary>
+    private static double LevelDb(short[] iq, int start, int count, double fs, double f)
+    {
+        double sr = 0, si = 0, wsum = 0;
+        double c0 = Math.Cos(-2 * Math.PI * f / fs), s0 = Math.Sin(-2 * Math.PI * f / fs), cr = 1, ci = 0;
+        for (int n = 0; n < count; n++)
+        {
+            double a = 2 * Math.PI * n / (count - 1);
+            double w = 0.35875 - 0.48829 * Math.Cos(a) + 0.14128 * Math.Cos(2 * a) - 0.01168 * Math.Cos(3 * a);
+            double x = iq[2 * (start + n)] / 32768.0, y = iq[2 * (start + n) + 1] / 32768.0;
+            sr += w * (x * cr - y * ci);
+            si += w * (x * ci + y * cr);
+            wsum += w;
+            double t = cr * c0 - ci * s0;
+            ci = cr * s0 + ci * c0;
+            cr = t;
+            if ((n & 4095) == 4095)
+            {
+                // re-anchor the rotation: no drift over 65,536 steps
+                double ph = -2 * Math.PI * f / fs * (n + 1);
+                cr = Math.Cos(ph);
+                ci = Math.Sin(ph);
+            }
+        }
+        return 20 * Math.Log10(Math.Sqrt(sr * sr + si * si) / wsum + 1e-15);
+    }
+
+    /// <summary>The strongest image of a tone at <paramref name="f"/> - at k x <paramref name="fsIn"/> +- f, k = 1..L-1, each searched
+    /// two bins either side - relative to the tone: dBc, negative. What x<paramref name="l"/> interpolation leaves of the source.</summary>
+    private static double WorstImageDbc(short[] iq, int start, int count, double fsOut, double fsIn, double f, int l)
+    {
+        double tone = LevelDb(iq, start, count, fsOut, f);
+        double bin = fsOut / count, worst = -400;
+        for (int k = 1; k < l; k++)
+            foreach (double centre in new[] { k * fsIn + f, k * fsIn - f })
+            {
+                double at = centre > fsOut / 2 ? centre - fsOut : centre;
+                for (double d = -2; d <= 2; d += 0.5)
+                    worst = Math.Max(worst, LevelDb(iq, start, count, fsOut, at + d * bin));
+            }
+        return worst - tone;
+    }
+
+    /// <summary>A source at the WIDE rate needs nothing done: its samples go to the board as they are, bit for bit, in real time.</summary>
+    private static void PlutoTxAtTheWideRate()
+    {
+        using var fake = Board();
+        var p = StartPlutoTx(Opts(fake));
+        try
+        {
+            using var s = Connect(p.server, "pluto-tx-wide");
+            s.WaitReady(15000);
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = TxCentre, GainDb = 40, RateHz = 2_500_000 });
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 30_000 });
+            const int total = 1_250_000;     // half a second at 2.5 MS/s
+            var iq = new short[2 * total];
+            new ToneGenerator(300_000, 2_500_000, -6).Fill(iq, total);
+            t.Stream!.Write(iq, 0, total);
+            var r = t.Stop(drain: true);
+            var sent = TxSamplesOf(fake);
+            var bufs = TxBuffersOf(fake);
+            Check(r.Acked && r.Samples == total && sent.Length >= iq.Length && sent.AsSpan(0, iq.Length).SequenceEqual(iq) && sent.Skip(iq.Length).All(v => v == 0),
+                  $"a source at the wide rate goes to the board BIT FOR BIT ({total} samples), then only the last buffer's padding: {r}");
+            double went = (bufs[^1].DoneTs - bufs[0].StartTs) / (double)Stopwatch.Frequency;
+            Check(bufs.All(b => b.ConsumedRateHz == 2_500_000) && Math.Abs(went - sent.Length / 2 / 2_500_000.0) < 0.03,
+                  $"...consumed at 2.5 MS/s in {F(went, "0.000")} s");
+        }
+        finally { Stop(p); }
+    }
+
+    /// <summary>The filter's tail: what is still to come out of a source's last samples leaves BEFORE the end - when the zeros padding
+    /// the last buffer cannot hold it (the stream ends within a filter's length of a buffer's edge), one more buffer of zeros; when the
+    /// stream ends exactly on the edge, that buffer alone, as the final push the drain is timed from.</summary>
+    private static void PlutoTxTail()
+    {
+        foreach (int shortBy in new[] { 10, 0 })
+        {
+            using var fake = Board();
+            var p = StartPlutoTx(Opts(fake));
+            try
+            {
+                using var s = Connect(p.server, "pluto-tx-tail");
+                s.WaitReady(15000);
+                s.ClaimTx();
+                s.SetTx(new TxSettings { CenterHz = TxCentre, GainDb = 40, RateHz = 312_500 });
+                int total = 8192 * 10 - shortBy;
+                var iq = new short[2 * total];
+                new ToneGenerator(20_000, 312_500, -6).Fill(iq, total);
+                var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 30_000 });
+                t.Stream!.Write(iq, 0, total);
+                var r = t.Stop(drain: true);
+                var sent = TxSamplesOf(fake);
+                int D = TxUpsampler.DelayInput;
+                int lastExact = 2 * 8 * (total - 1 + D), quietFrom = 2 * 8 * (total + 2 * D);
+                bool exact = sent.Length > lastExact && sent[lastExact] == iq[2 * (total - 1)] && sent[lastExact + 1] == iq[2 * (total - 1) + 1];
+                bool tailWhole = sent.Length >= quietFrom && sent.Skip(2 * 8 * (total + D)).Take(quietFrom - 2 * 8 * (total + D)).Any(v => v != 0) &&
+                                 sent.Skip(quietFrom).All(v => v == 0);
+                Check(r.Acked && exact && tailWhole && TxBuffersOf(fake).Count == 11,
+                      $"a stream {(shortBy == 0 ? "ending EXACTLY on a buffer's edge" : $"ending {shortBy} samples short of one")}: its last sample out exactly, its tail " +
+                      $"whole in an 11th buffer of zeros, then quiet - and the drain acknowledged after it ({TxBuffersOf(fake).Count} buffers): {r}");
+            }
+            finally { Stop(p); }
+        }
+    }
+
+    /// <summary>A tuned step whose boundary falls 23 samples short of a buffer's edge (498 ms at 312.5 kS/s is 155,625 samples: 19 buffers
+    /// of 8,192 less 23): the 23 zeros padding that buffer cannot hold the interpolator's tail (29 inputs), so ONE more buffer of zeros
+    /// goes out at THAT step's LO before the LO moves - 20 buffers at the first LO, never 19 with the tail's last part at the next.</summary>
+    private static void PlutoTxTunedTail()
+    {
+        using var fake = Board();
+        var p = StartPlutoTx(Opts(fake));
+        try
+        {
+            using var s = Connect(p.server, "pluto-tx-tuned-tail");
+            s.WaitReady(15000);
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = TxCentre, GainDb = 40 });
+            var events = TxEvents(s, out var ev);
+            var tuned = s.StartTx(new TxStartRequest
+            {
+                Source = TxSourceKinds.Step, MaxMs = 30_000, StartHz = 145_000_000, StopHz = 148_000_000, Points = 2,
+                Spacing = TxWords.Lin, DwellMs = 498, LevelDbfs = -10,
+            });
+            Check(WaitTx(events, TxStates.Idle, EndReasons.Drained, 6000), "a two-step tuned sweep runs to its end");
+            var bufs = TxBuffersOf(fake);
+            var first = bufs.Where(b => b.LoHz == 145_000_000).ToList();
+            var tail = first.Count > 0 ? first[^1] : null;
+            var ts = new short[tail == null ? 0 : tail.Payload.Length / 2];
+            if (tail != null) Buffer.BlockCopy(tail.Payload, 0, ts, 0, tail.Payload.Length);
+            Check(tuned.Grant.RateHz == 312_500 && first.Count == 20 && ts.Take(2 * 8 * TxUpsampler.HalfLength).Any(v => v != 0) && ts.Skip(2 * 8 * TxUpsampler.TapsPerPhase).All(v => v == 0),
+                  $"the first step: 19 buffers of its own and a 20th of the interpolator's TAIL, all at 145 MHz, before the LO moved ({first.Count} at 145 MHz)");
+            tuned.Dispose();
+            ev.Dispose();
+        }
+        finally { Stop(p); }
+    }
+
+    /// <summary>The drain's deadline is the board's queue at the rate the DMA really runs at - the WIDE rate - plus the margin: four
+    /// 65,536-sample buffers at 2.5 MS/s are 105 ms, so a board that never says its DMA ran dry is given 355 ms, never the 1,089 its
+    /// source's rate would make of it.</summary>
+    private static void PlutoTxDrainDeadline()
+    {
+        using var fake = Board();
+        fake.TxUnderflowFlagStuck = true;
+        var p = StartPlutoTx(Opts(fake));
+        try
+        {
+            using var s = Connect(p.server, "pluto-tx-deadline");
+            s.WaitReady(15000);
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = TxCentre, GainDb = 40, RateHz = 312_500 });
+            var iq = new short[2 * 50_000];
+            new ToneGenerator(20_000, 312_500, -10).Fill(iq, 50_000);
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 30_000 });
+            t.Stream!.Write(iq, 0, 50_000);
+            var r = t.Stop(drain: true);
+            Check(!r.Acked && r.Text.Contains($"did not run dry within {105 + PlutoTransmission.DrainMarginMs} ms") && BoardQuiet(fake),
+                  $"a board whose DMA never says it ran dry: NOT acknowledged, after the queue's time at the WIDE rate plus the margin (355 ms), and quiet: {r}");
+        }
+        finally { Stop(p); }
+    }
+
+    /// <summary>TxUpsampler alone: exact on every 8th sample, the same output however the input is cut into calls, flat to 0.4 of the input
+    /// rate, its first image at the stopband's edge, and every clip counted.</summary>
+    private static void PlutoUpsamplerUnit()
+    {
+        const int n = 40_000, L = 8, D = TxUpsampler.HalfLength;
+        var rng = new Random(20261001);
+        var x = new short[2 * n];
+        for (int i = 0; i < x.Length; i++) x[i] = (short)rng.Next(-12000, 12000);
+        var whole = new short[2 * n * L];
+        new TxUpsampler(L).Process(x, n, whole);
+        bool exact = true;
+        for (int i = D; i < n && exact; i++) exact = whole[2 * L * i] == x[2 * (i - D)] && whole[2 * L * i + 1] == x[2 * (i - D) + 1];
+        Check(exact, $"every 8th output IS the input, bit for bit, {D} input samples late (a Nyquist filter's zero-phase branch is one tap of exactly 1)");
+
+        var pieces = new short[2 * n * L];
+        var up = new TxUpsampler(L);
+        for (int at = 0; at < n;)
+        {
+            int k = Math.Min(n - at, 1 + rng.Next(3000));
+            up.Process(x.AsSpan(2 * at, 2 * k), k, pieces.AsSpan(2 * L * at, 2 * L * k));
+            at += k;
+        }
+        Check(pieces.AsSpan().SequenceEqual(whole), "PHASE-CONTINUOUS: cut into calls of random length, the output is identical sample for sample");
+
+        foreach (double frac in new[] { 0.1, 0.4 })
+        {
+            double fsIn = 312_500, f = frac * fsIn;
+            var tone = new short[2 * 20_000];
+            new ToneGenerator(f, fsIn, -6).Fill(tone, 20_000);
+            var o = new short[2 * 20_000 * L];
+            new TxUpsampler(L).Process(tone, 20_000, o);
+            double inDb = LevelDb(tone, 2048, 8192, fsIn, f), outDb = LevelDb(o, 16_384, 65_536, fsIn * L, f);
+            double img = WorstImageDbc(o, 16_384, 65_536, fsIn * L, fsIn, f, L);
+            Check(Math.Abs(outDb - inDb) < 0.01 && img <= (frac == 0.4 ? -80 : -85),
+                  $"a tone at {F(frac, "0.0")} of the input rate: level {F(outDb - inDb, "0.0000")} dB from the input's, worst image {F(img, "0.0")} dBc " +
+                  (frac == 0.4 ? "(at the passband's EDGE: its first image sits on the stopband's edge, 0.6 - computed -86 dB)" : ""));
+        }
+
+        // A sine at a quarter of the input rate, sampled 45 degrees off its peaks: every sample at full scale, its true peak 3 dB above it.
+        var loud = new short[2 * 64];
+        for (int i = 0; i < 64; i++) loud[2 * i] = (short)(i % 4 < 2 ? 32767 : -32767);
+        var lo = new short[2 * 64 * L];
+        var clip = new TxUpsampler(L);
+        clip.Process(loud, 64, lo);
+        Check(clip.Clipped > 0 && lo.All(v => v >= short.MinValue && v <= short.MaxValue), $"an overshoot past full scale is CLIPPED and COUNTED ({clip.Clipped}), never wrapped");
+
+        var settle = new TxUpsampler(L);
+        var one = new short[] { 1000, 0 };
+        var zeros = new short[2 * TxUpsampler.TapsPerPhase];
+        var sink = new short[2 * TxUpsampler.TapsPerPhase * L];
+        settle.Process(one, 1, sink);
+        bool notYet = !settle.Settled;
+        settle.Process(zeros, TxUpsampler.TapsPerPhase - 1, sink);
+        bool stillNot = !settle.Settled;
+        settle.Process(zeros, 1, sink);
+        Check(notYet && stillNot && settle.Settled, $"Settled only after {TxUpsampler.TapsPerPhase} zero inputs - when nothing of an earlier sample is still to come out");
     }
 
     // ---------------------------------------------------------------- what only the source can show
@@ -593,5 +889,9 @@ internal static partial class Program
         int expect = backend.IndexOf("_txExpect = null;\n                var r = _radio;", StringComparison.Ordinal);
         if (expect < 0) expect = backend.IndexOf("_txExpect = null;\r\n                var r = _radio;", StringComparison.Ordinal);
         Check(expect > 0, "the watch's expectation is cleared and SafeIdle written under ONE hold of the board (no window where our own carrier reads as another program's)");
+        Check(CountOf(backend, "SetTxCoreRate(") == 2 && CountOf(backend, "SetTxCoreRate(wide)") == 2,
+              "section 9.21 (Q4): the TX DMA's rate is SET in two places, and both set it to the WIDE rate - never a source's wide/8");
+        Check(CountOf(tx, "new TxUpsampler(") == 1 && CountOf(tx, "_up?.Process(samples, n, dma)") == 1,
+              "...and a wide/8 source reaches the DMA through ONE interpolator per transmission, every buffer through it");
     }
 }

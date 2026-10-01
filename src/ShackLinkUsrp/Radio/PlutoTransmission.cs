@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ShackLinkIio.Ad936x;
 using ShackLinkIio.Protocol;
+using ShackLinkUsrp.Dsp;
 using ShackLinkUsrp.Wire;
 
 namespace ShackLinkUsrp.Radio;
@@ -29,6 +30,12 @@ namespace ShackLinkUsrp.Radio;
 /// holds up to <see cref="PlutoTxStream.BuffersCount"/> buffers of the previous step: the write waits until the DMA has run
 /// DRY, so the previous step's samples all left at the previous LO. Each tuned step therefore costs a gap of zeros, and is
 /// announced with the instant the write returned (<c>timing</c> = bound).</item>
+/// <item><b>The TX DMA runs at the WIDE rate, always</b> (section 9.21, the owner's Q4 of section 9.20: the board's DMA consumes about
+/// 1.5 x the wide rate at the wide/8 it lists). A transmission at wide/8 - the source's samples, a client's or generated, at the
+/// grant's rate - is interpolated x8 here (<see cref="TxUpsampler"/>: every 8th output IS the source's sample, the images in the
+/// stopband), phase-continuous across buffers. Every count the wire sees stays in the SOURCE's samples; the board's queue, its
+/// padding and its drain are the DMA's, at the wide rate. Before a transmission ends and before a tuned step's LO moves, the
+/// filter's tail is pushed out first (a buffer of zeros when the padding did not hold it), so it leaves at the LO it belongs to.</item>
 /// </list>
 /// </summary>
 internal sealed class PlutoTransmission : RadioTransmission
@@ -42,21 +49,36 @@ internal sealed class PlutoTransmission : RadioTransmission
     private readonly PlutoBackend _pluto;
     private readonly PlutoTxStream _stream;
     private readonly Thread _sender;
+    private readonly double _dmaRateHz;
+    private readonly int _factor;
+    private readonly TxUpsampler? _up;
     private int _streamClosed;
 
-    public PlutoTransmission(PlutoBackend backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal, PlutoTxStream stream)
+    /// <param name="dmaRateHz">The rate the TX DMA runs at - the wide rate, read back.</param>
+    /// <param name="factor">DMA samples per source sample: 1 at the wide rate, 8 at wide/8.</param>
+    public PlutoTransmission(PlutoBackend backend, TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal, PlutoTxStream stream,
+                             double dmaRateHz, int factor)
         : base(backend, request, grant, plan, signal)
     {
+        if (factor < 1 || stream.SamplesPerBuffer % factor != 0)
+            throw new ArgumentOutOfRangeException(nameof(factor), "a DMA buffer holds a whole number of source samples");
         _pluto = backend;
         _stream = stream;
+        _dmaRateHz = dmaRateHz;
+        _factor = factor;
+        _up = factor > 1 ? new TxUpsampler(factor) : null;
         _sender = new Thread(SenderLoop) { IsBackground = true, Name = "PlutoTx", Priority = ThreadPriority.Highest };
         _sender.Start();
     }
 
-    /// <summary>The board's queue in samples: what may still be in flight after a push returns.</summary>
+    /// <summary>Outputs the interpolator clipped to full scale (0 at the wide rate, where nothing is interpolated).</summary>
+    internal long InterpolatorClipped => _up?.Clipped ?? 0;
+
+    /// <summary>The board's queue in DMA samples: what may still be in flight after a push returns.</summary>
     private long QueueSamples => (long)_stream.BuffersCount * _stream.SamplesPerBuffer;
 
-    private long QueueMs => (long)Math.Ceiling(1000.0 * QueueSamples / Grant.RateHz);
+    /// <summary>The queue's time, at the rate the DMA really runs at (the wide rate), never the source's.</summary>
+    private long QueueMs => (long)Math.Ceiling(1000.0 * QueueSamples / _dmaRateHz);
 
     /// <summary>An abort ends a push the board is holding: the TX connection goes, and the sender writes SafeIdle on the
     /// control connection.</summary>
@@ -70,11 +92,13 @@ internal sealed class PlutoTransmission : RadioTransmission
 
     private void SenderLoop()
     {
-        int n = _stream.SamplesPerBuffer;
+        int dmaN = _stream.SamplesPerBuffer;
+        int n = dmaN / _factor;                          // source samples per DMA buffer
         var bytes = new byte[_stream.BytesPerBuffer];   // once, reused
         var samples = new short[n * 2];
+        var dma = _up == null ? samples : new short[dmaN * 2];
         bool keyed = false, acked = false, completed = false, firstFlag = true;
-        long handed = 0;          // TX samples pushed to the board, counted from the key-up
+        long handed = 0;          // SOURCE samples pushed to the board, counted from the key-up
         string text = "";
         try
         {
@@ -88,13 +112,48 @@ internal sealed class PlutoTransmission : RadioTransmission
                 if (Plan != null) NoteStep(KeyedTicks, TxStepPlan.TimingSample);
             }
 
+            // One DMA buffer of the interpolated (or, at the wide rate, the source's own) samples to the board. A FINAL push clears
+            // the underflow flag first - the drain's word is the flag rising after it; any other push reads it after.
+            void Push(bool final)
+            {
+                // The board's own sc16 is the wire's: little-endian I then Q, unchanged (section 2.5).
+                MemoryMarshal.AsBytes(dma.AsSpan()).CopyTo(bytes);
+                if (final)
+                {
+                    _pluto.ReadAndClearTxUnderflow();
+                    firstFlag = false;
+                }
+                _stream.WriteBuffer(bytes);
+                if (!final)
+                {
+                    bool? under = _pluto.ReadAndClearTxUnderflow();
+                    if (under == true && !firstFlag) NoteUnderflow();
+                    firstFlag = false;
+                }
+            }
+
+            // The interpolator's tail - what is still to come out of the source's last samples - pushed as a buffer of zeros, so it
+            // leaves before the end, or before a tuned step's LO moves. Nothing at the wide rate, where nothing is interpolated.
+            bool TailOwed() => _up != null && !_up.Settled;
+            void PushTail(bool final)
+            {
+                Array.Clear(samples);
+                _up!.Process(samples, n, dma);
+                Push(final);
+            }
+
             while (!AbortRequested)
             {
                 int filled = 0;
                 bool last = false;
                 if (Generator != null)
                 {
-                    if (DrainRequested) break;
+                    if (DrainRequested)
+                    {
+                        // A generated source told to drain ends at a buffer: its interpolated tail still goes out, as the final push.
+                        if (keyed && TailOwed()) PushTail(final: true);
+                        break;
+                    }
                     // A generated source keys at its start: its samples are the sidecar's own and never wait.
                     if (!keyed) KeyUpNow();
                     while (filled < n)
@@ -116,8 +175,10 @@ internal sealed class PlutoTransmission : RadioTransmission
                                     NoteStep(TicksOfStep(NextStep), TxStepPlan.TimingSample);
                                     continue;
                                 }
-                                // A tuned step: what is filled goes out at THIS LO, then the DMA runs dry, then the LO moves.
+                                // A tuned step: what is filled goes out at THIS LO - its interpolated tail too, ONE flush before every
+                                // LO move - then the DMA runs dry, then the LO moves.
                                 if (filled > 0) break;
+                                if (TailOwed()) PushTail(final: false);
                                 TunedStep();
                                 continue;
                             }
@@ -149,34 +210,32 @@ internal sealed class PlutoTransmission : RadioTransmission
                         }
                     }
                     if (AbortRequested) break;
-                    if (filled == 0 && last) break;
                 }
                 if (filled == 0)
                 {
-                    if (last) break;
+                    if (last)
+                    {
+                        // The source ended on a buffer's edge (a stream, or a sweep that completed there): its interpolated tail
+                        // still goes out, as the final push.
+                        if (keyed && TailOwed()) PushTail(final: true);
+                        break;
+                    }
                     continue;
                 }
                 if (filled < n) Array.Clear(samples, filled * 2, (n - filled) * 2);
 
                 // An IQ transmission keys at its first WHOLE buffer (or its only, shorter one): nothing radiates before it.
                 if (!keyed) KeyUpNow();
-                // The board's own sc16 is the wire's: little-endian I then Q, unchanged (section 2.5).
-                MemoryMarshal.AsBytes(samples.AsSpan()).CopyTo(bytes);
-                if (last)
-                {
-                    // The drain's word comes from the flag rising AFTER this, the last push: clear it first.
-                    _pluto.ReadAndClearTxUnderflow();
-                    firstFlag = false;
-                }
-                _stream.WriteBuffer(bytes);
+                // x8 to the DMA's rate, continuing from the previous buffer (section 9.21); at the wide rate the samples go as they are.
+                _up?.Process(samples, n, dma);
+                // The end's tail: when the zeros padding this buffer did not hold it, one more buffer of zeros. (A tuned step's is
+                // flushed by the step itself, before its LO moves.)
+                bool tail = last && TailOwed();
+                // The drain's word comes from the flag rising AFTER the last push: that push clears it first.
+                Push(final: last && !tail);
                 handed += filled;
                 NoteSamples(filled);
-                if (!last)
-                {
-                    bool? under = _pluto.ReadAndClearTxUnderflow();
-                    if (under == true && !firstFlag) NoteUnderflow();
-                    firstFlag = false;
-                }
+                if (tail) PushTail(final: last);
                 if (last) break;
             }
 

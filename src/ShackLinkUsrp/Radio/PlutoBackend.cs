@@ -64,6 +64,10 @@ internal sealed record PlutoBackendOptions
 /// <item><b>The transmitter</b> (section 9.15, P4): set_tx's centre and gain are HELD and written at the key-up - the first
 /// whole buffer - read back before the LO is powered; every transmission is streamed IQ (B5, never the DDS) through the TX
 /// DMA on a connection of its own, and every end is SafeIdle (B10). Its timebase is the host's (section 9.2 item 2).</item>
+/// <item><b>The TX DMA runs at the WIDE rate, always</b> (section 9.21, the owner's Q4): the owner's board's DMA consumes about 1.5 x the
+/// wide rate at the wide/8 it lists and reads back (section 9.20), so a source a client sends at wide/8 is interpolated x8 by the sender
+/// (<c>TxUpsampler</c>). And a key-up is refused above <see cref="MaxTxWideRateHz"/> (Q5): the board's transmitter starves beside
+/// its own receiver above it, measured.</item>
 /// </list>
 /// </summary>
 internal sealed class PlutoBackend : RadioBackendBase
@@ -637,15 +641,16 @@ internal sealed class PlutoBackend : RadioBackendBase
                 {
                     double now = Board(r => r.ReadSampleRateHz());
                     UpdateState(s => s.WideRateHz = now, announce: false);
-                    // The TX DMA's list follows the wide rate (section 9.2 item 1): re-read, the configured TX rate kept
-                    // when it is still listed, else the lowest - and said, as the UHD backend says its move.
+                    // The TX DMA's list follows the wide rate (section 9.2 item 1): re-read, the DMA put at the NEW wide rate
+                    // (section 9.21), the configured source rate kept when it is still offered, else the lowest - and said, as the
+                    // UHD backend says its move.
                     if (_txLoRange.Max > 0)
                     {
                         double was = GetTxState().RateHz;
                         double txRate = RefreshTxCaps(Radio, was);
                         if (txRate > 0) InitTxState(s => s.RateHz = txRate, txRate);
                         if (Math.Abs(txRate - was) >= 0.5)
-                            Log($"TX rate moved from {was:0} to {txRate:0} S/s: the TX DMA lists {string.Join("/", (Volatile.Read(ref _txCaps)?.RatesHz ?? Array.Empty<double>()).Select(r => r.ToString("0", CultureInfo.InvariantCulture)))} S/s at {now:0} S/s");
+                            Log($"TX rate moved from {was:0} to {txRate:0} S/s: at {now:0} S/s the source rates are {string.Join("/", (Volatile.Read(ref _txCaps)?.RatesHz ?? Array.Empty<double>()).Select(r => r.ToString("0", CultureInfo.InvariantCulture)))} S/s, the TX DMA at the wide rate");
                     }
                     StartStreaming();
                 }
@@ -750,6 +755,9 @@ internal sealed class PlutoBackend : RadioBackendBase
             .Set("tx_why_not", _txWhyNot)
             .Set("tx_key_ups", Interlocked.Read(ref _txKeyUps))
             .Set("tx_key_ups_refused", Interlocked.Read(ref _txRefusedKeyUps))
+            .Set("tx_dma_rate_hz", _txDmaRateHz)
+            .Set("tx_max_wide_rate_hz", MaxTxWideRateHz)
+            .Set("tx_interp_clipped", Volatile.Read(ref _lastTx)?.InterpolatorClipped ?? 0)
             .Set("tx_keyed_expect", _txExpect is { } e ? $"LO {e.LoHz} Hz, {e.AttenuationDb} dB" : "idle (SafeIdle)");
     }
 
@@ -763,6 +771,8 @@ internal sealed class PlutoBackend : RadioBackendBase
     private const int TxBusyGraceMs = 500;
 
     private TxCaps? _txCaps;
+    // The rate the TX DMA was set to and read back at - the wide rate (section 9.21); 0 = it transmits nothing.
+    private double _txDmaRateHz;
     private string _txWhyNot = "the board is not open";
     private PlutoRange _txLoRange, _txBandwidthRange;
     private string[] _txPorts = Array.Empty<string>();
@@ -795,30 +805,71 @@ internal sealed class PlutoBackend : RadioBackendBase
         }, txRate);
         if (_txCaps != null)
             Log($"transmitter: TX LO {PlutoValues.Mhz(_txLoRange.Min)}-{PlutoValues.Mhz(_txLoRange.Max)} MHz, attenuation 0-89.75 dB in 0.25 dB, " +
-                $"TX DMA {string.Join("/", _txCaps.RatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture)))} MS/s (set to {txRate / 1e6:0.###}), " +
-                $"timebase host; set_tx's centre and gain are HELD and written at the key-up - nothing is sent until a client asks");
+                $"source rates {string.Join("/", _txCaps.RatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture)))} MS/s (set to {txRate / 1e6:0.###}), " +
+                $"the TX DMA at the wide rate {_txDmaRateHz / 1e6:0.###} MS/s ALWAYS - a wide/8 source is interpolated x8 here (section 9.21) - " +
+                $"keying only at a wide rate of {MaxTxWideRateHz / 1e6:0.###} MS/s or less; timebase host; set_tx's centre and gain are HELD and " +
+                "written at the key-up - nothing is sent until a client asks");
     }
 
-    /// <summary>The TX DMA's rates as the board lists them NOW (they follow the wide rate), and the DMA put at
-    /// <paramref name="keepRateHz"/> when it is still listed, else at the lowest. Returns the rate read back; 0 and no caps
-    /// when the board lists none (it then transmits nothing, said).</summary>
+    /// <summary>
+    /// The highest WIDE rate this board transmits at (<c>caps.tx.max_wide_rate_hz</c>, the owner's Q5 of section 9.20): MEASURED on the
+    /// owner's board on 2026-10-01 (section 9.21) - zeros streamed to the TX DMA at the wide rate beside a receiving stream at the same
+    /// rate, the TX LO powered down: 2.5 and 4 MS/s each way clean for 60 s, 5 MS/s each way the transmitter starved (92.3 %, 37
+    /// underflow polls). The radio slot's wide receive stream stays open through a transmission (section 9.6), so above this a key-up is
+    /// refused in words naming the remedy - lower the radio's rate. A ceiling of the board's own, said at the key-up; never a rate
+    /// hidden from the rate list (B9).
+    /// </summary>
+    public const double MaxTxWideRateHz = 4_000_000;
+
+    /// <summary>The source rates a transmission may run at: the wide rate itself, and wide/8, which THIS sidecar interpolates x8
+    /// (section 9.21) - the TX DMA only ever runs at the wide rate. Its samples per source sample; 0 for any other.</summary>
+    internal static int InterpolationFor(double sourceRateHz, double wideRateHz)
+    {
+        if (!(sourceRateHz > 0) || !(wideRateHz > 0)) return 0;
+        double f = wideRateHz / sourceRateHz;
+        int k = (int)Math.Round(f);
+        return (k == 1 || k == 8) && Math.Abs(f - k) < 1e-9 * k ? k : 0;
+    }
+
+    /// <summary>
+    /// The transmitter as the board lists it NOW (its DMA's rates follow the wide rate), and the TX DMA put at the WIDE rate - always,
+    /// the one setting the owner's board's DMA runs right at (section 9.20: at the wide/8 it lists and reads back it consumes about
+    /// 1.5 x the wide rate). The source rates offered are the DMA's own list, each of which this sidecar reaches exactly (x1 or x8,
+    /// <see cref="InterpolationFor"/>); <c>quantum_samples</c> stays in SOURCE samples. Returns the source rate in force -
+    /// <paramref name="keepRateHz"/> while it is still offered, else the lowest; 0 and no caps when the board lists none, or its DMA will
+    /// not run at the wide rate (it then transmits nothing, said).
+    /// </summary>
     private double RefreshTxCaps(PlutoRadio radio, double keepRateHz)
     {
-        double[] rates;
-        double got;
+        double[] listed, rates;
+        double wide, dma;
         lock (_boardLock)
         {
-            rates = radio.ReadTxCoreRatesHz();
-            if (rates.Length == 0 || _txLoRange.Max <= 0)
+            listed = radio.ReadTxCoreRatesHz();
+            wide = radio.ReadSampleRateHz();
+            rates = listed.Where(r => InterpolationFor(r, wide) > 0).OrderBy(r => r).ToArray();
+            string? why = listed.Length == 0 ? "the board's TX DMA states no sample rate"
+                        : _txLoRange.Max <= 0 ? "the board states no TX LO range"
+                        : !rates.Any(r => InterpolationFor(r, wide) == 1) ? $"the board's TX DMA does not list the wide rate {PlutoValues.Num(wide)} S/s (it lists {string.Join(", ", listed.Select(PlutoValues.Num))})"
+                        : null;
+            if (why == null)
+            {
+                // Section 9.21 (Q4): the DMA at the wide rate, read back - never at the wide/8 a client may send at.
+                dma = radio.SetTxCoreRate(wide);
+                if (Math.Abs(dma - wide) >= 0.5) why = $"the board's TX DMA reads back {PlutoValues.Num(dma)} S/s for the wide rate {PlutoValues.Num(wide)} S/s";
+            }
+            else dma = 0;
+            if (why != null)
             {
                 Volatile.Write(ref _txCaps, null);
-                _txWhyNot = rates.Length == 0 ? "the board's TX DMA states no sample rate" : "the board states no TX LO range";
+                _txDmaRateHz = 0;
+                _txWhyNot = why;
                 Log("this board will not transmit: " + _txWhyNot);
                 return 0;
             }
-            double want = rates.Any(r => Math.Abs(r - keepRateHz) < 0.5) ? keepRateHz : rates[0];
-            got = radio.SetTxCoreRate(want);
+            _txDmaRateHz = dma;
         }
+        double want = rates.Any(r => Math.Abs(r - keepRateHz) < 0.5) ? keepRateHz : rates[0];
         Volatile.Write(ref _txCaps, StateGeneratedSources(new TxCaps
         {
             FreqMinHz = (long)Math.Ceiling(_txLoRange.Min),
@@ -830,28 +881,37 @@ internal sealed class PlutoBackend : RadioBackendBase
             RatesHz = rates,
             Antennas = _txPorts,
             MaxMs = 0,               // the server's ceiling
-            QuantumSamples = TxBufferSamplesFor(rates[0]),
+            // One TX DMA buffer, in SOURCE samples at the lowest rate (the DMA's buffer holds that times its interpolation).
+            QuantumSamples = TxBufferSamplesFor(dma) / InterpolationFor(rates[0], wide),
             // No DUC and no CORDIC (section 9.15 item 8): the LO sits on the carrier and no offset is offered.
             MaxLoOffsetHz = 0,
             DualRx = false,
             Timebase = TxTimebases.Host,
+            MaxWideRateHz = MaxTxWideRateHz,
         }));
         _txWhyNot = "";
-        return got;
+        return want;
     }
 
-    /// <summary>About 25 ms of the TX rate, a power of two, at least 4,096 samples and at most 2^20 (section 9.15 item 5).</summary>
+    /// <summary>About 25 ms of the TX DMA's rate, a power of two, at least 4,096 samples and at most 2^20 (section 9.15 item 5). Asked at
+    /// the WIDE rate, the DMA's: a power of two of at least 4,096 holds a whole number of wide/8 source samples.</summary>
     internal static int TxBufferSamplesFor(double rateHz) =>
         (int)Math.Min(1 << 20, Math.Max(4096, 1L << (int)Math.Round(Math.Log2(Math.Max(4096, rateHz * 0.025)))));
 
     protected override TxCaps? RadioTxCaps() => Volatile.Read(ref _txCaps);
 
-    /// <summary>The TX DMA's rate (FPGA-only: nothing reaches RF), refused unless the DMA lists it, read back.</summary>
+    /// <summary>The SOURCE's rate - what a client sends at, or a generator runs at - refused unless offered. Nothing is written: the TX
+    /// DMA runs at the wide rate whatever the source's (section 9.21), and a wide/8 source is interpolated x8 by the sender.</summary>
     protected override double ApplyTxRate(double hz)
     {
         if (OpenTx is { IsFinished: false })
             throw new RadioRefusal(ErrorCodes.TxActive, "the TX rate cannot change while a transmission is open");
-        return Board(r => r.SetTxCoreRate(hz));
+        var caps = Volatile.Read(ref _txCaps) ?? throw new RadioRefusal(ErrorCodes.Unsupported, "this board does not transmit: " + _txWhyNot);
+        var hit = caps.RatesHz.Where(r => Math.Abs(r - hz) < 0.5).ToArray();
+        if (hit.Length == 0)
+            throw new RadioRefusal(ErrorCodes.OutOfRange,
+                $"{hz:0} S/s is not a TX rate at the rate in force; this board takes {string.Join(", ", caps.RatesHz.Select(r => r.ToString("0", CultureInfo.InvariantCulture)))} S/s");
+        return hit[0];
     }
 
     /// <summary>Idle: the gain put on the attenuation's grid and HELD (item 3). Keyed: the attenuation written and read back.</summary>
@@ -915,20 +975,30 @@ internal sealed class PlutoBackend : RadioBackendBase
     protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
         var caps = Volatile.Read(ref _txCaps) ?? throw new RadioRefusal(ErrorCodes.Unsupported, "this board does not transmit: " + _txWhyNot);
+        // Q5 (section 9.21): the backend's own net - the server refused first, through the same ONE rule, before anything opened.
+        var wideNo = TxRules.WideRateRefusal(caps, WideRateHz);
+        if (wideNo != null) throw new RadioRefusal(wideNo.Code, wideNo.Text, wideNo.Extra);
         if (!caps.RatesHz.Any(r => Math.Abs(r - grant.RateHz) < 0.5))
-            throw new RadioRefusal(ErrorCodes.OutOfRange, $"the TX DMA does not take {grant.RateHz:0} S/s at the rate in force");
+            throw new RadioRefusal(ErrorCodes.OutOfRange, $"this board does not transmit at {grant.RateHz:0} S/s at the rate in force");
         if (_foreign)
             throw new RadioRefusal(ErrorCodes.RadioFault, "another program changed this board; this sidecar transmits nothing on it");
+        double wide = WideRateHz;
+        int factor = InterpolationFor(grant.RateHz, wide);
+        if (factor == 0)
+            throw new RadioRefusal(ErrorCodes.OutOfRange, $"{grant.RateHz:0} S/s is neither the wide rate {wide:0} S/s nor an eighth of it");
         var radio = Radio;
-        double now = Board(r => r.ReadTxCoreRateHz());
-        if (Math.Abs(now - grant.RateHz) >= 0.5) now = Board(r => r.SetTxCoreRate(grant.RateHz));
+        // Q4 (section 9.21): the TX DMA at the WIDE rate, read back, whatever the source's rate - another program may have moved it.
+        double dma = Board(r => r.ReadTxCoreRateHz());
+        if (Math.Abs(dma - wide) >= 0.5) dma = Board(r => r.SetTxCoreRate(wide));
+        if (Math.Abs(dma - wide) >= 0.5)
+            throw new RadioRefusal(ErrorCodes.RadioFault, $"the board's TX DMA reads back {dma:0} S/s for the wide rate {wide:0} S/s; nothing was keyed");
         PlutoTxStream? stream = null;
         var busySince = Stopwatch.StartNew();
         while (stream == null)
         {
             try
             {
-                stream = PlutoTxStream.Open(radio, TxBufferSamplesFor(grant.RateHz), TxBuffersCount, grant.RateHz);
+                stream = PlutoTxStream.Open(radio, TxBufferSamplesFor(dma), TxBuffersCount, dma);
             }
             catch (IiodErrorException ex) when (ex.Status == -16)
             {
@@ -948,10 +1018,15 @@ internal sealed class PlutoBackend : RadioBackendBase
                 throw new RadioRefusal(ErrorCodes.RadioFault, "the board's TX DMA could not be opened: " + ex.Message);
             }
         }
-        Log($"TX DMA open: {stream.SamplesPerBuffer} samples ({1000.0 * stream.SamplesPerBuffer / grant.RateHz:0.0} ms) x {stream.BuffersCount} " +
-            $"kernel buffers at {grant.RateHz:0} S/s, non-cyclic; the LO stays down until the first buffer");
-        return new PlutoTransmission(this, request, grant, plan, signal, stream);
+        Log($"TX DMA open: {stream.SamplesPerBuffer} samples ({1000.0 * stream.SamplesPerBuffer / dma:0.0} ms) x {stream.BuffersCount} " +
+            $"kernel buffers at the wide rate {dma:0} S/s, non-cyclic; the source at {grant.RateHz:0} S/s" +
+            (factor > 1 ? $", interpolated x{factor} here" : "") + "; the LO stays down until the first buffer");
+        var t = new PlutoTransmission(this, request, grant, plan, signal, stream, dma, factor);
+        Volatile.Write(ref _lastTx, t);
+        return t;
     }
+
+    private PlutoTransmission? _lastTx;
 
     /// <summary>
     /// THE KEY-UP (section 9.15 item 4), at the transmission's first whole buffer: the HELD gain (as an attenuation) and the

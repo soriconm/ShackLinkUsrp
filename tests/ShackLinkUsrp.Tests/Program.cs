@@ -123,6 +123,11 @@ internal static partial class Program
         Run("Pluto P4b: another program while keyed - faulted in words, left as it set it (B11)", PlutoTxForeign);
         Run("Pluto P4b: one clock chain - the TX rates follow the wide rate, which cannot move under a transmission", PlutoTxRate);
         Run("Pluto P4b: what the running gates cannot reach, pinned in the source", PlutoTxSourceRules);
+        Run("Pluto P4e: a source at the wide rate goes to the board as it is, bit for bit, in real time", PlutoTxAtTheWideRate);
+        Run("Pluto P4e: the interpolator's tail leaves before the end - short of a buffer's edge, and exactly on it", PlutoTxTail);
+        Run("Pluto P4e: the interpolator by itself - exact every 8th sample, phase-continuous across calls, its images, its clip count", PlutoUpsamplerUnit);
+        Run("Pluto P4e: the drain's deadline is the board's queue at the WIDE rate, the DMA's", PlutoTxDrainDeadline);
+        Run("Pluto P4e: a tuned step's interpolated tail leaves at ITS LO before the LO moves", PlutoTxTunedTail);
         Run("Pluto P2: and still nothing here loaded UHD", NoUhdInThisProcess);
 
         try { Directory.Delete(_temp, true); } catch { }
