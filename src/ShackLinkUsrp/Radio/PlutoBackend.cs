@@ -813,13 +813,15 @@ internal sealed class PlutoBackend : RadioBackendBase
 
     /// <summary>
     /// The highest WIDE rate this board transmits at (<c>caps.tx.max_wide_rate_hz</c>, the owner's Q5 of section 9.20): MEASURED on the
-    /// owner's board on 2026-10-01 (section 9.21) - zeros streamed to the TX DMA at the wide rate beside a receiving stream at the same
-    /// rate, the TX LO powered down: 2.5 and 4 MS/s each way clean for 60 s, 5 MS/s each way the transmitter starved (92.3 %, 37
-    /// underflow polls). The radio slot's wide receive stream stays open through a transmission (section 9.6), so above this a key-up is
-    /// refused in words naming the remedy - lower the radio's rate. A ceiling of the board's own, said at the key-up; never a rate
-    /// hidden from the rate list (B9).
+    /// owner's board on 2026-10-01 - zeros streamed to the TX DMA at the wide rate beside a receiving stream at the same rate, the TX LO
+    /// powered down. 2.5 MS/s each way ran clean for 1,560 s over three runs (section 9.22). 4 MS/s, stated here first (section 9.21,
+    /// one 60 s run), starved both 120 s runs, from 76.7 s and 41 s: the board's Ethernet MAC drops PC-to-board frames when both
+    /// directions are busy, and a lost tail frame waits out Windows' 300 ms retransmission timeout against a 131 ms TX queue. So the
+    /// owner's Q7 (section 9.22): 2.5 MS/s, the highest rate the board earned for a long over. The radio slot's wide receive stream stays
+    /// open through a transmission (section 9.6), so above this a key-up is refused in words naming the remedy - lower the radio's rate.
+    /// A ceiling of the board's own, said at the key-up; never a rate hidden from the rate list (B9).
     /// </summary>
-    public const double MaxTxWideRateHz = 4_000_000;
+    public const double MaxTxWideRateHz = 2_500_000;
 
     /// <summary>The source rates a transmission may run at: the wide rate itself, and wide/8, which THIS sidecar interpolates x8
     /// (section 9.21) - the TX DMA only ever runs at the wide rate. Its samples per source sample; 0 for any other.</summary>
