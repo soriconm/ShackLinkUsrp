@@ -128,6 +128,10 @@ internal static partial class Program
         Run("Pluto P4e: the interpolator by itself - exact every 8th sample, phase-continuous across calls, its images, its clip count", PlutoUpsamplerUnit);
         Run("Pluto P4e: the drain's deadline is the board's queue at the WIDE rate, the DMA's", PlutoTxDrainDeadline);
         Run("Pluto P4e: a tuned step's interpolated tail leaves at ITS LO before the LO moves", PlutoTxTunedTail);
+        Run("Pluto U3: --iiod usb:<hw_serial> - the serial the address's, never a second spelling (9.26 D14)", PlutoUsbCommandLine);
+        Run("Pluto U3: the board over its own USB pipes - its ceilings, the open's substitution, set_rate refused, the route said (9.26 D14-D16, D20)", PlutoUsbOpen);
+        Run("Pluto U3: the network routes' ceilings - Ethernet and the board's USB network, told by the classifier (9.26 D11, D15)", PlutoRouteLimits);
+        Run("Pluto U3: a keyed radio's broken control connection - SafeIdle through pipe 0 again, never a fourth (9.26 D17)", PlutoUsbSafeIdleOnItsOwnPipe);
         Run("Pluto P2: and still nothing here loaded UHD", NoUhdInThisProcess);
 
         try { Directory.Delete(_temp, true); } catch { }

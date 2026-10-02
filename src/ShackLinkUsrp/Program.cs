@@ -58,7 +58,8 @@ internal static class Program
             ? new PlutoBackend(log, new PlutoBackendOptions
             {
                 Serial = opt.Address().Serial,
-                AddressHint = opt.Iiod == SidecarLocator.IiodBrowse ? null : opt.Iiod,
+                AddressHint = opt.Iiod == SidecarLocator.IiodBrowse || opt.IiodUsb ? null : opt.Iiod,
+                Usb = opt.IiodUsb,
                 WideRateHz = opt.RateHz,
                 LoHz = opt.LoHz,
             })
@@ -218,9 +219,10 @@ internal static class Program
 internal sealed class SidecarOptions
 {
     public const string Usage =
-        "ShackLinkUsrp --serial <serial> | --serial <hw_serial> --iiod <host[:port]|mdns> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list [--json <file>]\n" +
+        "ShackLinkUsrp --serial <serial> | --serial <hw_serial> --iiod <host[:port]|mdns|usb:<hw_serial>> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list [--json <file>]\n" +
         "  --iiod <host[:port]|mdns>   a Pluto-class board behind iiod, by its hw_serial: tried at this address first (a HINT), then\n" +
         "                              re-found by an _iio._tcp browse matched on the serial; mdns = no address known, browse at once.\n" +
+        "  --iiod usb:<hw_serial>      ...or over the board's OWN USB pipes through WinUSB: no address, no browse; the serial is --serial's\n" +
         "                              Loads no UHD, and takes none of UHD's options\n" +
         "  --list                      UHD's find: every B2xx it can claim, loading firmware into a cold one\n" +
         "  --json <file>               (with --list) write the answer there as one JSON object, whatever happened\n" +
@@ -252,8 +254,13 @@ internal sealed class SidecarOptions
         "  --state-dir <dir>           rendezvous and log root (default %LocalAppData%\\ShackLinkUsrp; tests redirect it)";
 
     public string? Serial;
-    /// <summary><c>--iiod</c>: a Pluto-class board's address hint, or <see cref="SidecarLocator.IiodBrowse"/>; null = not one.</summary>
+    /// <summary><c>--iiod</c>: a Pluto-class board's address hint, <see cref="SidecarLocator.IiodBrowse"/>, or
+    /// <c>usb:&lt;hw_serial&gt;</c> (<see cref="IiodUsb"/>); null = not one.</summary>
     public string? Iiod;
+
+    /// <summary><c>--iiod usb:&lt;hw_serial&gt;</c>: over the board's own USB pipes (ShackLink docs/plutosdr_support.md 9.26 D14). Tested
+    /// BEFORE host[:port], the longer-prefix rule.</summary>
+    public bool IiodUsb => Iiod != null && Iiod.StartsWith(SidecarLocator.IiodUsbPrefix, StringComparison.OrdinalIgnoreCase);
     public bool Sim;
     public string SimName = UsrpAddress.DefaultSimName;
     public int SimFaultAfterMs;
@@ -412,8 +419,15 @@ internal sealed class SidecarOptions
             if (o.Iiod != null)
             {
                 if (o.Sim) throw new ArgumentException("--iiod is a real board; the synthetic radio is --sim");
-                if (o.Iiod != SidecarLocator.IiodBrowse && !PlutoDiscovery.TryParseHostPort(o.Iiod, out _, out _))
-                    throw new ArgumentException($"--iiod needs host[:port] (an IPv6 host as [addr]:port) or {SidecarLocator.IiodBrowse}, not \"{o.Iiod}\"");
+                if (o.IiodUsb)
+                {
+                    // The serial is the ADDRESS's, never a second spelling of it: a usb: form naming another board is refused.
+                    string usbSerial = o.Iiod.Substring(SidecarLocator.IiodUsbPrefix.Length).Trim();
+                    if (o.Serial == null || !string.Equals(usbSerial, o.Serial.Trim(), StringComparison.OrdinalIgnoreCase))
+                        throw new ArgumentException($"--iiod {o.Iiod} names a board other than --serial {o.Serial}: the USB form is usb:<the same hw_serial>");
+                }
+                else if (o.Iiod != SidecarLocator.IiodBrowse && !PlutoDiscovery.TryParseHostPort(o.Iiod, out _, out _))
+                    throw new ArgumentException($"--iiod needs host[:port] (an IPv6 host as [addr]:port), {SidecarLocator.IiodBrowse} or {SidecarLocator.IiodUsbPrefix}<hw_serial>, not \"{o.Iiod}\"");
                 // UHD's options mean nothing to an iiod radio: refused, never silently ignored.
                 var uhdOnly = new List<string>();
                 if (o.UhdDirectory != null) uhdOnly.Add("--uhd");

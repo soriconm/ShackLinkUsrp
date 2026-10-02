@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using ShackLinkIio.Ad936x;
 using ShackLinkIio.Protocol;
+using ShackLinkIio.Usb;
 using ShackLinkUsrp.Client;
 using ShackLinkUsrp.Host;
 using ShackLinkUsrp.Server;
@@ -21,6 +22,18 @@ internal sealed record PlutoBackendOptions
 
     /// <summary><c>host[:port]</c> where the board was last reached - a HINT, tried first; null = none, browse at once.</summary>
     public string? AddressHint { get; init; }
+
+    /// <summary>Over the board's OWN USB pipes (<c>--iiod usb:&lt;serial&gt;</c>, ShackLink docs/plutosdr_support.md section 9.26 D14):
+    /// no address and no browse; a board that cannot be opened there is refused in the words of the one that opens it.</summary>
+    public bool Usb { get; init; }
+
+    /// <summary>The USB route for a serial; null = the board's own, through WinUSB (<see cref="IiodUsbRoute.ForSerial"/>). The gate's
+    /// seam: the fake board's USB face.</summary>
+    public Func<string, IiodRoute>? OpenUsbRoute { get; init; }
+
+    /// <summary>Which route a network address is (section 9.26 D11); null = the library's classifier (<see cref="PlutoRoutes"/>).
+    /// The gate's seam: a fake board on 127.0.0.1 stands for any of them.</summary>
+    public Func<string, PlutoRoute>? ClassifyAddress { get; init; }
 
     /// <summary>The rate the board is OPENED at - the sidecar's choice, never the board's own (section 9.9 item 2).</summary>
     public double WideRateHz { get; init; } = 10e6;
@@ -68,6 +81,9 @@ internal sealed record PlutoBackendOptions
 /// wide rate at the wide/8 it lists and reads back (section 9.20), so a source a client sends at wide/8 is interpolated x8 by the sender
 /// (<c>TxUpsampler</c>). And a key-up is refused above <see cref="MaxTxWideRateHz"/> (Q5): the board's transmitter starves beside
 /// its own receiver above it, measured.</item>
+/// <item><b>Its ceilings are its ROUTE's</b> (section 9.26 D15): Ethernet, its own USB pipes, or its USB network, each measured
+/// (<see cref="LimitsFor"/>). A wide rate above the route's receive ceiling is refused by set_rate and SUBSTITUTED at the open, out
+/// loud; a key-up above its transmit ceiling is refused.</item>
 /// </list>
 /// </summary>
 internal sealed class PlutoBackend : RadioBackendBase
@@ -103,6 +119,8 @@ internal sealed class PlutoBackend : RadioBackendBase
     private double _expRate, _expCoreRate;
     private long _buffers, _samples, _flagged, _watches, _quickWatches;
     private double _temperatureC = double.NaN;
+    // How the board is reached (section 9.26 D11), known once FindBoard has found it: the limits are this route's.
+    private volatile int _route = (int)PlutoRoute.Ethernet;
 
     public PlutoBackend(SidecarLog log, PlutoBackendOptions opt)
         : base(log, InfoFor(opt.Serial, "Pluto-class board (iiod)", ""), InitialCaps(), ringSamples: 1 << 24,
@@ -189,13 +207,27 @@ internal sealed class PlutoBackend : RadioBackendBase
 
         var caps = radio.ReadCapabilities();
         bool oracle = radio.HasLossRegisters;
+        var offered = OfferedRates(caps.SampleRateRange.Min, caps.SampleRateRange.Max);
+        // Section 9.26 D16: a rate above what this route carries is SUBSTITUTED at the open (set_rate refuses it): a slot stored at
+        // 10 MS/s from its Ethernet days must still open over USB, because the remedy - a lower rate on the SDR tab - needs it open.
+        double openAt = _opt.WideRateHz, rxLimit = MaxRxWideRateHz;
+        if (openAt > rxLimit + 0.5)
+        {
+            double within = RateRules.HighestWithin(offered, rxLimit);
+            if (within > 0)
+            {
+                Log($"asked to open at {openAt:0} S/s, above the {rxLimit:0} S/s this board was measured to carry over {PlutoRoutes.Words(Route)} " +
+                    $"(ShackLink docs/plutosdr_support.md 9.26 D16): opening at {within:0} S/s instead; set_rate above {rxLimit:0} S/s is refused in words");
+                openAt = within;
+            }
+        }
         double rate, coreRate;
         long lo;
         double gain, bandwidth;
         string antenna;
         lock (_boardLock)
         {
-            rate = radio.SetSampleRate(_opt.WideRateHz);
+            rate = radio.SetSampleRate(openAt);
             coreRate = radio.ReadRxCoreRateHz();
             if (Math.Abs(coreRate - rate) > 0.5)
                 throw new InvalidOperationException($"the RX DMA delivers {coreRate:0} S/s where the AD936x runs at {rate:0} S/s: its /8 decimator could not be bypassed");
@@ -219,7 +251,7 @@ internal sealed class PlutoBackend : RadioBackendBase
             GainMinDb = GainUnionMinDb,
             GainMaxDb = GainUnionMaxDb,
             GainStepDb = caps.RxGainRange.Step > 0 ? caps.RxGainRange.Step : 1,
-            WideRatesHz = OfferedRates(caps.SampleRateRange.Min, caps.SampleRateRange.Max),
+            WideRatesHz = offered,
             LeaseDecimMin = 1,
             LeaseDecimMax = 4096,
             MaxLeases = 8,
@@ -231,6 +263,9 @@ internal sealed class PlutoBackend : RadioBackendBase
             BandwidthMaxHz = caps.RxBandwidthRange.Max,
             RxSides = RxSides.OnlyA,
             OverflowOracle = oracle,
+            // Section 9.26 D15: what this route carries, and which route that is.
+            MaxWideRateHz = rxLimit,
+            Link = PlutoRoutes.Words(Route),
         };
         UpdateRfLo(lo);
         UpdateState(s =>
@@ -262,6 +297,8 @@ internal sealed class PlutoBackend : RadioBackendBase
         Log($"{rate:0} S/s (ADC clock {(double.IsNaN(_adcClockHz) ? "not stated" : _adcClockHz.ToString("0", CultureInfo.InvariantCulture) + " Hz")}), " +
             $"LO {lo} Hz, gain {gain} dB (manual), {antenna}, bandwidth {bandwidth:0} Hz; rates offered " +
             string.Join("/", Caps.WideRatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture))) + " MS/s");
+        Log($"route: {PlutoRoutes.Words(Route)} ({radio.Route.Name}) - it carries {rxLimit / 1e6:0.###} MS/s of receive and keys at a wide rate of " +
+            $"{MaxTxWideRateHz / 1e6:0.###} MS/s or less, both measured (ShackLink docs/plutosdr_support.md 9.25, 9.26 D15)");
         Log(oracle
             ? $"loss oracle: the RX core's status register, read after every buffer{(was == true ? " (its overflow flag was already set, from before this sidecar; cleared)" : "")}"
             : "loss oracle: NONE - this board has no debugfs, so lost samples cannot be seen and the overflow counter says nothing (caps.overflow_oracle false)");
@@ -275,6 +312,7 @@ internal sealed class PlutoBackend : RadioBackendBase
     /// </summary>
     private PlutoRadio FindBoard()
     {
+        if (_opt.Usb) return FindBoardOverUsb();
         var tried = new List<string>();
         string? hintHost = null;
         int hintPort = 0;
@@ -283,7 +321,7 @@ internal sealed class PlutoBackend : RadioBackendBase
             if (!PlutoDiscovery.TryParseHostPort(_opt.AddressHint, out hintHost, out hintPort))
                 throw new InvalidOperationException($"\"{_opt.AddressHint}\" is not host[:port]");
             var r = TryOpen(hintHost, hintPort, out string why);
-            if (r != null) return r;
+            if (r != null) return Reached(r);
             tried.Add($"at the stored address {_opt.AddressHint}: {why}");
             Log($"the stored address {_opt.AddressHint} did not reach board {_opt.Serial} ({why}); re-finding it by its serial with an _iio._tcp browse");
         }
@@ -298,7 +336,7 @@ internal sealed class PlutoBackend : RadioBackendBase
             {
                 Log($"found board {_opt.Serial} at {host}:{port} by an _iio._tcp browse" +
                     (hintHost == null ? "" : $" - the stored address {_opt.AddressHint} is stale; the launch profile can be updated to it"));
-                return r;
+                return Reached(r);
             }
             tried.Add($"{host}:{port}: {why}");
         }
@@ -309,6 +347,42 @@ internal sealed class PlutoBackend : RadioBackendBase
         throw new InvalidOperationException($"no board stating hw_serial {_opt.Serial} answered: " +
                                             (tried.Count == 0 ? "" : string.Join("; ", tried) + "; ") + browse);
     }
+
+    /// <summary>A board reached over the network: which route that is (section 9.26 D11) - its Ethernet port, or its own USB network
+    /// (RNDIS), which the ADAPTER tells and the address does not.</summary>
+    private PlutoRadio Reached(PlutoRadio r)
+    {
+        var classify = _opt.ClassifyAddress ?? PlutoRoutes.ClassifyAddress;
+        PlutoRoute route;
+        try { route = classify(r.Host); }
+        catch { route = PlutoRoute.Ethernet; }
+        _route = (int)(route == PlutoRoute.UsbNetwork ? PlutoRoute.UsbNetwork : PlutoRoute.Ethernet);
+        return r;
+    }
+
+    /// <summary>
+    /// Section 9.26 D14: the board over its OWN USB pipes, by its serial - no address, no browse. A board that is not on USB, whose IIO
+    /// interface has no usable driver, or that another program holds, is refused in the words of the one that opens it (WinUsbLocator,
+    /// the device: "held over USB by another program" is the foreign rule's, D6, and ShackLink never retries it).
+    /// </summary>
+    private PlutoRadio FindBoardOverUsb()
+    {
+        IiodRoute route = (_opt.OpenUsbRoute ?? IiodUsbRoute.ForSerial)(_opt.Serial);
+        try
+        {
+            var r = PlutoRadio.Open(route, _opt.Serial, _opt.ConnectTimeoutMs);
+            _route = (int)PlutoRoute.UsbPipes;
+            Log($"found board {_opt.Serial} over its own USB pipes ({route.Name}): no address, no browse, no firewall rule");
+            return r;
+        }
+        catch (Exception ex) when (ex is IiodException || ex is PlutoRefusalException || ex is IOException)
+        {
+            throw new InvalidOperationException($"board {_opt.Serial} over its own USB pipes ({route.Name}): {ex.Message}");
+        }
+    }
+
+    /// <summary>How the board is reached (section 9.26 D11).</summary>
+    internal PlutoRoute Route => (PlutoRoute)_route;
 
     private IReadOnlyList<(string Host, int Port)> DefaultBrowse() =>
         PlutoDiscovery.MdnsCandidates(_opt.BrowseTimeoutMs).Select(c => (c.Host, c.Port)).ToList();
@@ -506,20 +580,26 @@ internal sealed class PlutoBackend : RadioBackendBase
         Fault(text);
     }
 
-    /// <summary>SafeIdle on the control connection, or on a fresh one when that one broke; what happened, in the log.</summary>
+    /// <summary>SafeIdle on the control connection, or on a re-opened one when that one broke; what happened, in the log. Under the
+    /// board's lock, as <see cref="TxEndSafeIdle"/> is: a broken control connection sends the transmission's end AND the receive pump's
+    /// fault here at once, and on USB two re-opens at once cannot both have pipe 0 (section 9.26 D17) - the second would be refused
+    /// and say SafeIdle was never written, when the first had written it.</summary>
     private void TrySafeIdle(string when)
     {
-        PlutoRadio? r;
-        lock (_boardLock) r = _radio;
-        if (r == null) return;
         try
         {
             SafeIdleReport report;
-            if (!r.Control.IsBroken) report = r.SafeIdle();
-            else
+            lock (_boardLock)
             {
-                using var fresh = PlutoRadio.Open(r.Host, r.Port, _opt.Serial, 2000);
-                report = fresh.SafeIdle();
+                var r = _radio;
+                if (r == null) return;
+                if (!r.Control.IsBroken) report = r.SafeIdle();
+                else
+                {
+                    // Section 9.26 D17: the control connection again - over USB its OWN pipe, never a fourth (a keyed radio holds all three).
+                    using var fresh = r.ReopenControl(2000);
+                    report = fresh.SafeIdle();
+                }
             }
             Log($"SafeIdle at {when}: the board reads back quiet" + (report.WasQuiet ? "" : " (it was NOT: " + string.Join("; ", report.Found) + ")"));
         }
@@ -615,6 +695,9 @@ internal sealed class PlutoBackend : RadioBackendBase
         // transmission (TX_ACTIVE); this is the backend's own net, because here the wide rate IS the TX DMA's parent clock.
         if (OpenTx is { IsFinished: false })
             throw new RadioRefusal(ErrorCodes.TxActive, "the wide rate cannot change while a transmission is open: it is the transmitter's clock too");
+        // Section 9.26 D15: above what this route carries - the server refused first, through the same ONE rule; this is the backend's net.
+        var over = RateRules.WideRateRefusal(Caps, hz);
+        if (over != null) throw new RadioRefusal(over.Code, over.Text, over.Extra);
         // The stream is made again around it, so no buffer at the old rate is written after the pipelines were told the new one.
         StopStreaming();
         double got;
@@ -698,8 +781,8 @@ internal sealed class PlutoBackend : RadioBackendBase
                 .Set("text", "the AD936x's quadrature (I/Q balance) tracking"))
             .Add(new JsonObject().Set("key", "xo_correction").Set("type", "int").Set("value", xo)
                 .Set("text", "the reference every frequency is computed from, in Hz (40 MHz nominal; 1 ppm is 40 Hz)"))
-            .Add(new JsonObject().Set("key", "iiod").Set("type", "string").Set("value", $"{r.Host}:{r.Port}").Set("read_only", true)
-                .Set("text", "where this board was reached - a handle, not its identity"))
+            .Add(new JsonObject().Set("key", "iiod").Set("type", "string").Set("value", r.Route.Name).Set("read_only", true)
+                .Set("text", $"where this board was reached, over {PlutoRoutes.Words(Route)} - a handle, not its identity"))
             .Add(new JsonObject().Set("key", "firmware").Set("type", "string").Set("value", r.Identity.Firmware).Set("read_only", true));
     }
 
@@ -734,7 +817,9 @@ internal sealed class PlutoBackend : RadioBackendBase
         lock (_boardLock) r = _radio;
         return new JsonObject()
             .Set("kind", "iiod")
-            .Set("address", r == null ? "" : $"{r.Host}:{r.Port}")
+            .Set("address", r == null ? "" : r.Route.Name)
+            .Set("route", PlutoRoutes.Token(Route))
+            .Set("rx_max_wide_rate_hz", MaxRxWideRateHz)
             .Set("iiod_version", r?.Identity.Iiod?.ToString() ?? "")
             .Set("firmware", r?.Identity.Firmware ?? "")
             .Set("model", r?.Identity.Model ?? "")
@@ -812,16 +897,40 @@ internal sealed class PlutoBackend : RadioBackendBase
     }
 
     /// <summary>
-    /// The highest WIDE rate this board transmits at (<c>caps.tx.max_wide_rate_hz</c>, the owner's Q5 of section 9.20): MEASURED on the
-    /// owner's board on 2026-10-01 - zeros streamed to the TX DMA at the wide rate beside a receiving stream at the same rate, the TX LO
-    /// powered down. 2.5 MS/s each way ran clean for 1,560 s over three runs (section 9.22). 4 MS/s, stated here first (section 9.21,
-    /// one 60 s run), starved both 120 s runs, from 76.7 s and 41 s: the board's Ethernet MAC drops PC-to-board frames when both
-    /// directions are busy, and a lost tail frame waits out Windows' 300 ms retransmission timeout against a 131 ms TX queue. So the
-    /// owner's Q7 (section 9.22): 2.5 MS/s, the highest rate the board earned for a long over. The radio slot's wide receive stream stays
-    /// open through a transmission (section 9.6), so above this a key-up is refused in words naming the remedy - lower the radio's rate.
-    /// A ceiling of the board's own, said at the key-up; never a rate hidden from the rate list (B9).
+    /// ETHERNET, transmit (<c>caps.tx.max_wide_rate_hz</c>, the owner's Q5 of section 9.20): MEASURED on the owner's board on 2026-10-01 -
+    /// zeros streamed to the TX DMA at the wide rate beside a receiving stream at the same rate, the TX LO powered down. 2.5 MS/s each way
+    /// ran clean for 1,560 s over three runs (section 9.22). 4 MS/s, stated here first (section 9.21, one 60 s run), starved both 120 s
+    /// runs, from 76.7 s and 41 s: the board's Ethernet MAC drops PC-to-board frames when both directions are busy, and a lost tail frame
+    /// waits out Windows' 300 ms retransmission timeout against a 131 ms TX queue. So the owner's Q7 (section 9.22): 2.5 MS/s. The radio
+    /// slot's wide receive stream stays open through a transmission (section 9.6), so above this a key-up is refused in words naming the
+    /// remedy - lower the radio's rate. A ceiling of the board's own, said at the key-up; never a rate hidden from the rate list (B9).
     /// </summary>
-    public const double MaxTxWideRateHz = 2_500_000;
+    public const double EthernetMaxTxWideRateHz = 2_500_000;
+
+    /// <summary>ETHERNET, receive (Q13, section 9.25.1): 10 MS/s clean for ten minutes (section 9.12), the ceiling about 12.</summary>
+    public const double EthernetMaxRxWideRateHz = 10_000_000;
+
+    /// <summary>The board's OWN USB PIPES (Q13, section 9.25): 4 MS/s each way held for 600 s and 5 did not; receive alone held 7 and
+    /// 7.5 MS/s for 60 s under a 7.68 MS/s plateau, so 7. Under B9's list that admits 5 MS/s (section 9.26 F15).</summary>
+    public const double UsbPipesMaxTxWideRateHz = 4_000_000, UsbPipesMaxRxWideRateHz = 7_000_000;
+
+    /// <summary>Its USB NETWORK, RNDIS (Q14, section 9.26): receive 5 MS/s clean and 10 delivered 6.40; both ways 2.5 clean and 4 failed
+    /// at once, with the board's CPU at 76-100 % (section 9.25).</summary>
+    public const double UsbNetworkMaxTxWideRateHz = 2_500_000, UsbNetworkMaxRxWideRateHz = 5_000_000;
+
+    /// <summary>The ONE table of a route's ceilings (section 9.26 D15): the receive wide rate it carries, and the wide rate it keys at.</summary>
+    internal static (double Rx, double Tx) LimitsFor(PlutoRoute route) => route switch
+    {
+        PlutoRoute.UsbPipes => (UsbPipesMaxRxWideRateHz, UsbPipesMaxTxWideRateHz),
+        PlutoRoute.UsbNetwork => (UsbNetworkMaxRxWideRateHz, UsbNetworkMaxTxWideRateHz),
+        _ => (EthernetMaxRxWideRateHz, EthernetMaxTxWideRateHz),
+    };
+
+    /// <summary>The highest WIDE rate this board transmits at over the route it is reached by (<c>caps.tx.max_wide_rate_hz</c>).</summary>
+    public double MaxTxWideRateHz => LimitsFor(Route).Tx;
+
+    /// <summary>The highest WIDE rate this board's receive carries over the route it is reached by (<c>caps.max_wide_rate_hz</c>).</summary>
+    public double MaxRxWideRateHz => LimitsFor(Route).Rx;
 
     /// <summary>The source rates a transmission may run at: the wide rate itself, and wide/8, which THIS sidecar interpolates x8
     /// (section 9.21) - the TX DMA only ever runs at the wide rate. Its samples per source sample; 0 for any other.</summary>
@@ -1089,8 +1198,8 @@ internal sealed class PlutoBackend : RadioBackendBase
     }
 
     /// <summary>
-    /// The end of EVERY transmission (section 9.15 item 7; B10): SafeIdle, read back - on the control connection, or a fresh
-    /// one when that one broke - and the state in force idle again. "" when the board reads back quiet; otherwise the words,
+    /// The end of EVERY transmission (section 9.15 item 7; B10): SafeIdle, read back - on the control connection, or on it re-opened
+    /// when it broke (over USB the same pipe, never a fourth: section 9.26 D17) - and the state in force idle again. "" when the board reads back quiet; otherwise the words,
     /// LOUDLY in the log. A board another program changed is LEFT as that program set it (B11).
     /// </summary>
     internal string TxEndSafeIdle(bool keyed)
@@ -1119,7 +1228,8 @@ internal sealed class PlutoBackend : RadioBackendBase
                 if (!r.Control.IsBroken) r.SafeIdle();
                 else
                 {
-                    using var fresh = PlutoRadio.Open(r.Host, r.Port, _opt.Serial, 2000);
+                    // Section 9.26 D17: on USB the transmitter still holds pipes 1 and 2, so a fresh connection would be a fourth.
+                    using var fresh = r.ReopenControl(2000);
                     fresh.SafeIdle();
                 }
             }
