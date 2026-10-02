@@ -535,6 +535,17 @@ internal static partial class Program
                   "AGC off is manual, and the gain in force is what the AGC left, read back (52 dB)");
             st = s.SetAntenna("B_BALANCED");
             Check(st.Antenna == "B_BALANCED" && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "B_BALANCED", "an RX port the board lists");
+            // ShackLink docs/plutosdr_support.md 9.30: a board whose device tree LOCKS its RX input refuses every listed port but the
+            // one in force (EINVAL). The client was told "the board refused WRITE ... rf_port_select 11" - the value's byte count.
+            lock (fake.Lock) fake.RxPortLocked = true;
+            string? lockedSaid = null;
+            try { s.SetAntenna("C_BALANCED"); }
+            catch (Exception ex) { lockedSaid = ex.Message; }
+            Check(lockedSaid != null && lockedSaid.Contains("locks the RX input") && lockedSaid.Contains("stays B_BALANCED") && !lockedSaid.Contains("rf_port_select 11") &&
+                  fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "B_BALANCED" && s.GetState().Antenna == "B_BALANCED",
+                  "a port a device-tree lock refuses: refused to the client in words naming the lock and the port in force, which stays: " + lockedSaid);
+            Check(p.backend.WaitReady(1000), "...and the radio is still up: a refused port is a refusal, not a fault");
+            lock (fake.Lock) fake.RxPortLocked = false;
             st = s.SetBandwidth(1e6);
             Check(st.BandwidthHz == 1e6 && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_bandwidth") == "1000000", "the analog bandwidth, read back");
             st = s.SetLo(433_920_000);
