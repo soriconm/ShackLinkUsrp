@@ -300,6 +300,56 @@ internal static partial class Program
         finally { Stop(p); }
     }
 
+    // ---------------------------------------------------------------- the RX LO another program powered down (section 9.29)
+
+    private static void PlutoRxLoFoundDown()
+    {
+        // SoapyPlutoSDR writes powerdown 1 to the RX LO when its receive stream closes, and the bit is sticky: the sidecar that
+        // opened next streamed a DC spike at every frequency. The fake now hears its tone only while the RX LO is powered.
+        using (var fake = Board())
+        {
+            fake.Set(FakeIiod.Phy, "OUTPUT", "altvoltage0", "powerdown", "1");
+            fake.ToneRfHz = 100_100_000;
+            fake.ToneAmplitude = 2048 * 0.1;
+            var p = StartPluto(Opts(fake));
+            try
+            {
+                Check(p.backend.WaitReady(15000), "a board whose RX LO another program powered down opens");
+                Check(fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage0", "powerdown") == "0", "...with its RX LO powered up");
+                Check(LogText(p.backend).Contains("RX LO: found powered DOWN - another program left it so"), "...and said in words");
+                var writes = fake.AttributeWrites();
+                int safeIdle = writes.FindIndex(w => w.EndsWith("altvoltage1|powerdown=1", StringComparison.Ordinal));
+                int up = writes.FindIndex(w => w.EndsWith("altvoltage0|powerdown=0", StringComparison.Ordinal));
+                Check(safeIdle >= 0 && up > safeIdle, "SafeIdle still came first; the RX LO after it");
+
+                using var s = Connect(p.server, "pluto-rxlo");
+                s.WaitReady(10000);
+                s.ClaimLo();
+                using var pano = s.OpenPanorama(new PanoramaRequest { Bins = 4096, Fps = 10, Integration = IntegrationKind.Average, Window = WindowKind.Hann });
+                var rows = new List<(RowHeader h, short[] b)>();
+                pano.Connection.RowReceived += (c, h, bins) => { lock (rows) rows.Add((h, (short[])bins.Clone())); };
+                pano.Connection.StartReader();
+                Check(WaitFor(() => { lock (rows) return rows.Count >= 4; }, 6000), "rows arrive");
+                (RowHeader h, short[] b) last;
+                lock (rows) last = rows[^1];
+                double level = LevelAt(last.h, last.b, 100_100_000, 2.5e6);
+                Check(Math.Abs(level + 20) < 0.5, $"...and the -20 dBFS tone is HEARD: it reads {F(level)} dBFS (with the RX LO left down, nothing)");
+            }
+            finally { Stop(p); }
+        }
+        using (var fake = Board())
+        {
+            var p = StartPluto(Opts(fake));
+            try
+            {
+                Check(p.backend.WaitReady(15000), "a board whose RX LO is powered opens");
+                Check(!fake.AttributeWrites().Any(w => w.Contains("altvoltage0|powerdown=")) && !LogText(p.backend).Contains("RX LO: found"),
+                      "...and its RX LO is neither written nor mentioned: only a board found wrong is put right");
+            }
+            finally { Stop(p); }
+        }
+    }
+
     private static void PlutoWideLease()
     {
         using var fake = Board();   // the ramp: I = n mod 2048, Q = -I
@@ -433,6 +483,9 @@ internal static partial class Program
 
         Case("another program moves the RX LO", f => f.Set(FakeIiod.Phy, "OUTPUT", "altvoltage0", "frequency", "433920000"),
              PlutoBackend.ForeignWriterPhrase + " under the sidecar: the RX LO reads 433.920 MHz, and this sidecar last set 100.000 MHz (ad9361-phy OUTPUT altvoltage0 frequency)");
+        Case("another program powers the RX LO down (SoapyPlutoSDR closing its stream, section 9.29)",
+             f => f.Set(FakeIiod.Phy, "OUTPUT", "altvoltage0", "powerdown", "1"),
+             "the RX LO reads powered DOWN, and this sidecar receives on it (ad9361-phy OUTPUT altvoltage0 powerdown = 1)");
         Case("another program changes the rate", f => f.Set(FakeIiod.Phy, "INPUT", "voltage0", "sampling_frequency", "20000000"),
              "the sample rate reads 20000000 S/s, and this sidecar last set 2500000 S/s");
         Case("another program powers the TX LO", f => f.Set(FakeIiod.Phy, "OUTPUT", "altvoltage1", "powerdown", "0"),

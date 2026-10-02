@@ -105,6 +105,7 @@ internal static partial class Program
         Run("Pluto P2: found by its serial - a stale address re-found, another board never written (B6)", PlutoFind);
         Run("Pluto P2: a FIR another program loaded - found, said, switched off (section 9.8)", PlutoFir);
         Run("Pluto P2: levels - the 12-bit samples x16 to sc16 full scale (section 9.2 item 8)", PlutoLevels);
+        Run("Pluto: an RX LO another program powered down - found, powered up, said, and the tone heard (section 9.29)", PlutoRxLoFoundDown);
         Run("Pluto P2: the wide lease - the board's samples bit for bit, following the LO (B4)", PlutoWideLease);
         Run("Pluto P2: the loss oracle - a polled register, and a board that has none (section 9.2 item 5)", PlutoLossOracle);
         Run("Pluto P2: a third program - every value this sidecar did not write faults the radio (B11)", PlutoForeignWriter);

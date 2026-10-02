@@ -67,6 +67,9 @@ internal sealed record PlutoBackendOptions
 /// close and on every fault path except one: a board another program changed is that program's (B11).</item>
 /// <item><b>A FIR another program loaded is found and switched off, out loud</b> (section 9.8; the owner's choice,
 /// 2026-09-30): this backend's rates assume none.</item>
+/// <item><b>An RX LO another program powered down is found and powered up, out loud</b> (ShackLink
+/// docs/plutosdr_support.md 9.29): SoapyPlutoSDR leaves it down whenever its receive stream closes, and a receiver with its LO
+/// down hears only a DC spike. Once streaming, its going down is another program's write (B11).</item>
 /// <item><b>Levels have one owner</b> (section 9.2 item 8): the 12-bit samples are scaled by 16 into sc16 full
 /// scale before the ring, so no client carries a Pluto correction.</item>
 /// <item><b>The loss oracle is a polled register</b> (section 9.2 item 5), read after every buffer; a board without
@@ -204,6 +207,12 @@ internal sealed class PlutoBackend : RadioBackendBase
             _firFound = fir.Found;
             Log($"FIR: {fir.Found}; switched off, read back off on both chains, and the board states rates {fir.RangeAfter} again");
         }
+
+        // Section 9.29: the RX LO is FOUND powered down when another program left it so (SoapyPlutoSDR does, whenever its
+        // receive stream closes), and a receiver with its LO down hears only a DC spike. Powered up, read back, said.
+        if (radio.PowerUpRxLo())
+            Log("RX LO: found powered DOWN - another program left it so (SoapyPlutoSDR powers it down when its receive stream closes) - " +
+                "powered up, read back");
 
         var caps = radio.ReadCapabilities();
         bool oracle = radio.HasLossRegisters;
@@ -512,6 +521,8 @@ internal sealed class PlutoBackend : RadioBackendBase
             if (Math.Abs(core - _expCoreRate) > 0.5)
                 return $"the RX DMA delivers {PlutoValues.Num(core)} S/s, and this sidecar set it to {PlutoValues.Num(_expCoreRate)} S/s ({Ad936xNames.RxCore} INPUT {Ad936xNames.Path1} {Ad936xNames.SamplingFrequency})";
             if (!full) return null;
+            if (radio.ReadRxLoPoweredDown())
+                return $"the RX LO reads powered DOWN, and this sidecar receives on it ({Ad936xNames.Phy} OUTPUT {Ad936xNames.RxLo} {Ad936xNames.Powerdown} = 1)";
             var q = radio.ReadQuietState();
             if (_txExpect is { } keyed)
             {
