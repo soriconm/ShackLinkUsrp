@@ -398,6 +398,131 @@ internal static partial class Program
         finally { Stop(p); }
     }
 
+    // ---------------------------------------------------------------- a retune throws the board's queue away (ShackLink 9.33)
+
+    /// <summary>The fake's tone sits ABOVE the LO (true) or below it, by the sign of each sample pair's phase step: counts of the
+    /// pairs that are NOT on <paramref name="above"/>'s side, and of all pairs. sc16, one side.</summary>
+    private static (int wrong, int all) ToneOffSide(byte[] d, int count, bool above)
+    {
+        int wrong = 0, all = 0;
+        for (int k = 0; k + 1 < count; k++)
+        {
+            double i0 = BitConverter.ToInt16(d, 4 * k), q0 = BitConverter.ToInt16(d, 4 * k + 2);
+            double i1 = BitConverter.ToInt16(d, 4 * k + 4), q1 = BitConverter.ToInt16(d, 4 * k + 6);
+            double im = q1 * i0 - i1 * q0;
+            if (im == 0) continue;
+            all++;
+            if ((im > 0) != above) wrong++;
+        }
+        return (wrong, all);
+    }
+
+    private static void PlutoRetuneFlush()
+    {
+        const long LoA = 100_000_000, LoB = 100_500_000;
+        using var fake = Board();
+        // The board's queue (9.12: 0.9-2.3 buffers in flight at a change): each buffer two buffers older than its reply. Without
+        // it the fake makes every buffer at the LO as it stands, and an inexact retune boundary passes.
+        fake.RxLatencyBuffers = 2;
+        fake.ToneRfHz = 100_250_000;    // +250 kHz from LO A, -250 kHz from LO B
+        var p = StartPluto(Opts(fake));
+        try
+        {
+            using var s = Connect(p.server, "pluto-flush");
+            s.WaitReady(10000);
+            s.ClaimLo();
+            s.SetLo(LoA);
+            using var lease = s.OpenLease(new LeaseRequest { CenterHz = LoA, Decimation = 1 });
+            var blocks = new List<(IqHeader h, byte[] d)>();
+            lease.Connection.IqBlockReceived += (c, h, d) => { lock (blocks) blocks.Add((h, d)); };
+            lease.Connection.StartReader();
+            Check(WaitFor(() => { lock (blocks) return blocks.Count >= 10; }, 6000), "the wide lease runs");
+            long Reopens() => s.GetTelemetry().GetObject("radio")?.GetObject("source")?.GetLong("retune_reopens") ?? -1;
+            long legacy = (4 + 2) * (long)TestBufferSamples;   // what every retune skipped before 9.33, the LO's lock aside
+
+            // After a retune: from its retuned block on, three buffers' worth - not one pair on the old LO's side.
+            (int wrong, int all, long gap) After(int mark, long to)
+            {
+                List<(IqHeader h, byte[] d)> got = new();
+                bool ready = WaitFor(() =>
+                {
+                    lock (blocks)
+                    {
+                        int at = blocks.FindIndex(mark, b => b.h.CenterHz == to && (b.h.Flags & IqFlags.Retuned) != 0);
+                        if (at < 0) return false;
+                        long n = blocks.Skip(at).Sum(b => (long)b.h.Count);
+                        if (n < 3L * TestBufferSamples) return false;
+                        got = blocks.Skip(mark).ToList();
+                        return true;
+                    }
+                }, 6000);
+                if (!ready) return (-1, 0, -1);
+                int first = got.FindIndex(b => b.h.CenterHz == to && (b.h.Flags & IqFlags.Retuned) != 0);
+                long gap = first > 0 ? (long)got[first].h.FirstSample - (long)(got[first - 1].h.FirstSample + (ulong)got[first - 1].h.Count) : -1;
+                int wrong = 0, all = 0;
+                foreach (var b in got.Skip(first))
+                {
+                    var (w, a) = ToneOffSide(b.d, b.h.Count, above: to == LoA);
+                    wrong += w;
+                    all += a;
+                }
+                return (wrong, all, gap);
+            }
+
+            long reopens0 = Reopens();
+            for (int k = 0; k < 6; k++)
+            {
+                long to = k % 2 == 0 ? LoB : LoA;
+                int mark;
+                lock (blocks) mark = blocks.Count;
+                s.SetLo(to);
+                var (wrong, all, gap) = After(mark, to);
+                Check(wrong == 0 && all > 2 * TestBufferSamples && gap >= 0 && gap < 2L * TestBufferSamples,
+                      $"retune {k + 1} to {to / 1e6:0.0} MHz: from the retuned block on, {wrong} of {all} sample pairs on the old LO's side, " +
+                      $"and the lease skipped {gap} samples - under two buffers, where the documented settle skipped {legacy}");
+            }
+            Check(Reopens() - reopens0 == 6, $"one re-open of the board's buffer per retune ({Reopens() - reopens0} for 6)");
+            List<string> cmds;
+            lock (fake.Lock) cmds = fake.Commands.ToList();
+            int lastLo = cmds.FindLastIndex(x => x.StartsWith("WRITE iio:device0 OUTPUT altvoltage0 frequency", StringComparison.Ordinal));
+            int lastClose = cmds.FindLastIndex(x => x == "CLOSE iio:device3");
+            Check(lastLo >= 0 && lastClose > lastLo && cmds.Skip(lastClose + 1).Take(2).SequenceEqual(new[] { "SET iio:device3 BUFFERS_COUNT 4", "OPEN iio:device3 32768 00000003" }),
+                  "on the board: the LO written FIRST, then the receive buffer CLOSEd and OPENed again - the queue thrown away after the write, never before it");
+
+            // A burst, as a knob spins: every write before the last re-open, and the stream lands on the last LO with nothing stale.
+            int burstMark;
+            lock (blocks) burstMark = blocks.Count;
+            for (int k = 0; k < 9; k++) s.SetLo(k % 2 == 0 ? LoB : LoA);     // ends on LO B
+            var burst = After(burstMark, LoB);
+            Check(burst.wrong == 0 && burst.all > 0, $"nine retunes back to back: after the last one's retuned block, {burst.wrong} of {burst.all} pairs on LO A's side");
+            Check(s.GetState().Readiness == RadioStates.Ready, "...and the radio is still up, the foreign-writer watch quiet through every re-open");
+
+            // A gain change throws nothing away: the lease runs through it continuous (no break is announced for one), and the
+            // panoramas wait out the documented settle - a re-open there would be a gap the lease never says.
+            Thread.Sleep(300);
+            int gainMark, closes;
+            lock (blocks) gainMark = blocks.Count;
+            lock (fake.Lock) closes = fake.Commands.Count(x => x == "CLOSE iio:device3");
+            long reopens1 = Reopens();
+            s.SetGain(40);
+            long settled = p.backend.SettledFrom;
+            Check(WaitFor(() => { lock (blocks) return blocks.Count >= gainMark + 10; }, 4000), "blocks keep coming after set_gain");
+            List<(IqHeader h, byte[] d)> after;
+            lock (blocks) after = blocks.Skip(gainMark - 1).ToList();
+            bool contiguous = true;
+            for (int k = 1; k < after.Count; k++)
+                if (after[k].h.FirstSample != after[k - 1].h.FirstSample + (ulong)after[k - 1].h.Count || (after[k].h.Flags & (IqFlags.Retuned | IqFlags.Discontinuity)) != 0)
+                    contiguous = false;
+            int closesAfter;
+            lock (fake.Lock) closesAfter = fake.Commands.Count(x => x == "CLOSE iio:device3");
+            Check(contiguous && closesAfter == closes && Reopens() == reopens1,
+                  "set_gain: no re-open, and the lease runs through it with no break - every block where the last one ended, none flagged");
+            long end = (long)(after[0].h.FirstSample + (ulong)after[0].h.Count);
+            Check(settled - end >= legacy, $"...while the panoramas wait out the documented settle: the boundary {settled - end} samples past the lease's last block (>= {legacy})");
+        }
+        finally { Stop(p); }
+    }
+
     // ---------------------------------------------------------------- the loss oracle (section 9.2 item 5)
 
     private static void PlutoLossOracle()
@@ -785,6 +910,12 @@ internal static partial class Program
         int firstWrite = new[] { ".SetSampleRate(", ".SetRxLo(", ".SetRxGain(", ".DisableFir(", ".SetRxBandwidth(", ".ReadAndClearRxOverflow(" }
             .Select(w => open?.IndexOf(w, StringComparison.Ordinal) ?? -1).Where(i => i >= 0).DefaultIfEmpty(int.MaxValue).Min();
         Check(open != null && safe > 0 && safe < firstWrite, "in OpenRadio, SafeIdle comes before every other write (B10)");
+        // 9.33: the re-open is asked AFTER the LO write has returned - asked before it, the pump may throw the queue away while the
+        // board still runs at the old LO, and a gate can only catch that when the timing happens to fall on it.
+        string? tune = MemberBody(src, "protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers) ApplyTuning(");
+        int lo = tune?.IndexOf(".SetRxLo(", StringComparison.Ordinal) ?? -1, flush = tune?.IndexOf("RequestFlush()", StringComparison.Ordinal) ?? -1;
+        Check(lo > 0 && flush > lo && Regex.Matches(src, @"\bRequestFlush\(\)").Count == 2,
+              "in ApplyTuning, RequestFlush comes AFTER the RX LO write - and nothing else asks for a re-open (its declaration and that one call)");
         string program = File.ReadAllText(Path.Combine(RepoRoot(), "src", "ShackLinkUsrp", "Program.cs"));
         Check(program.Contains("string key = opt.Address().RendezvousKey!;") && !program.Contains("\"sim-\" + opt.SimName"),
               "the sidecar takes its rendezvous key from the address grammar, never spelled a second time");

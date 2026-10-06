@@ -271,6 +271,13 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
     /// knows exactly where its change took effect (the synthetic radio) answers that position.</summary>
     protected virtual long ChangeBoundary() => RadioPosition + SettleSamples;
 
+    /// <summary>The first ring position at the tuning or side change JUST applied: asked ONCE, right after
+    /// <see cref="ApplyTuning"/> (a retune) or <see cref="ApplyRxSides"/> returns, and given to every announce of that change -
+    /// never asked for a gain, AGC, antenna, bandwidth, setting or rate change, so a backend's answer for a retune cannot reach
+    /// one. Default <see cref="ChangeBoundary"/>. A backend that throws away what was in flight at a retune knows where its
+    /// fresh samples begin, and answers that (ShackLink docs/plutosdr_support.md 9.33: the Pluto's re-opened buffer).</summary>
+    protected virtual long AppliedBoundary() => ChangeBoundary();
+
     /// <summary>
     /// EVERY radio change ends here (CRTU200's A2), on the sides it touched. The boundary is remembered per
     /// side, so a pipeline created later starts no earlier (F1), and every pipeline alive on that side now is
@@ -405,11 +412,12 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         var centers = before.ToDictionary(kv => kv.Key, kv => kv.Key == RxSides.A ? hz : kv.Value + delta);
         long rf = centers.Count > 1 ? RfLoHz + delta : PlaceFor(centers, MasterClockHz, out _);
         var eff = ApplyTuning(rf, centers);
+        long boundary = AppliedBoundary();
         TakeTuning(eff.RfLoHz, eff.Centers);
         // Side A's centre is the radio's LO on the wire even when A does not stream: it moves too.
         if (!before.ContainsKey(RxSides.A)) lock (_stateLock) _state.LoHz = hz;
         foreach (var kv in eff.Centers)
-            Announce(new[] { Side(kv.Key) }, (l, at) => l.OnRadioRetuned(kv.Value, at));
+            Announce(new[] { Side(kv.Key) }, (l, at) => l.OnRadioRetuned(kv.Value, at), boundary);
         Log($"LO {CenterOf(RxSides.A)} Hz" + (CenterOf(RxSides.A) != hz ? $" (asked {hz})" : "") +
             (eff.Centers.Count > 1 ? $"; {RxSides.Words(RxSides.B)} at {CenterOf(RxSides.B)} Hz, RF LO {eff.RfLoHz} Hz" : ""));
     }
@@ -608,6 +616,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
                 rf = centers.Values.Min() + (centers.Values.Max() - centers.Values.Min()) / 2;
         }
         var eff = ApplyRxSides(want, rf, centers, clock);
+        long boundary = AppliedBoundary();
         lock (_stateLock)
         {
             _streamA = RxSides.Contains(want, RxSides.A);
@@ -617,9 +626,9 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         var staying = before.Where(want.Contains).Select(Side).ToList();
         var switchedOn = want.Where(s => !before.Contains(s)).Select(Side).ToList();
         var switchedOff = before.Where(s => !want.Contains(s)).Select(Side).ToList();
-        Announce(staying, (l, at) => l.OnRadioReconfigured(at));
+        Announce(staying, (l, at) => l.OnRadioReconfigured(at), boundary);
         // A side switched on has no pipeline yet; its settle boundary is the switch, so the first one starts after it.
-        Announce(switchedOn, (l, at) => l.OnRadioReconfigured(at));
+        Announce(switchedOn, (l, at) => l.OnRadioReconfigured(at), boundary);
         foreach (var side in switchedOff) DropSweeps(side);
         Log($"streaming {RxSides.Words(want)} (was {RxSides.Words(before)}), clock {eff.ClockHz:0} Hz, RF LO {eff.RfLoHz} Hz" +
             string.Concat(eff.Centers.Select(kv => $", {RxSides.Words(kv.Key)} at {kv.Value} Hz")));
@@ -637,10 +646,11 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
             throw new RadioRefusal(ErrorCodes.NotReady, $"{RxSides.Words(side)} is not streaming");
         long rf = PlaceFor(centers, MasterClockHz, out bool moved);
         var eff = ApplyTuning(rf, centers);
+        long boundary = AppliedBoundary();
         TakeTuning(eff.RfLoHz, eff.Centers);
-        Announce(new[] { Side(side) }, (l, at) => l.OnRadioRetuned(eff.Centers[side], at));
+        Announce(new[] { Side(side) }, (l, at) => l.OnRadioRetuned(eff.Centers[side], at), boundary);
         if (moved)
-            Announce(eff.Centers.Keys.Where(s => s != side).Select(Side), (l, at) => l.OnRadioReconfigured(at));
+            Announce(eff.Centers.Keys.Where(s => s != side).Select(Side), (l, at) => l.OnRadioReconfigured(at), boundary);
         Log($"{RxSides.Words(side)} at {eff.Centers[side]} Hz" + (eff.Centers[side] != hz ? $" (asked {hz})" : "") +
             (centers.Count > 1 ? (moved ? $"; the RF LO placed at {eff.RfLoHz} Hz" : $"; the RF LO stays at {eff.RfLoHz} Hz") : ""));
     }

@@ -107,6 +107,7 @@ internal static partial class Program
         Run("Pluto P2: levels - the 12-bit samples x16 to sc16 full scale (section 9.2 item 8)", PlutoLevels);
         Run("Pluto: an RX LO another program powered down - found, powered up, said, and the tone heard (section 9.29)", PlutoRxLoFoundDown);
         Run("Pluto P2: the wide lease - the board's samples bit for bit, following the LO (B4)", PlutoWideLease);
+        Run("Pluto 9.33: a retune throws the board's queue away - exact, nothing stale after it, the skip under two buffers; a gain change throws nothing", PlutoRetuneFlush);
         Run("Pluto P2: the loss oracle - a polled register, and a board that has none (section 9.2 item 5)", PlutoLossOracle);
         Run("Pluto P2: a third program - every value this sidecar did not write faults the radio (B11)", PlutoForeignWriter);
         Run("Pluto P2: the radio's settings, each read back, and the watch quiet through them", PlutoSetters);

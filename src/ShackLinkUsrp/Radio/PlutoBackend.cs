@@ -129,6 +129,13 @@ internal sealed class PlutoBackend : RadioBackendBase
     // carries now - RX A is the AD936x's chain 1 (RX1A), RX B its chain 2 (RX2A).
     private int _rxChains = 1;
     private volatile string[] _streamSides = RxSides.OnlyA;
+    // ShackLink docs/plutosdr_support.md 9.33: a retune throws the board's queue away. Under _flushGate: a re-open asked for, and
+    // whether the pump has a READBUF out (and the ring position its buffer will end at) - what makes the boundary exact.
+    private readonly object _flushGate = new();
+    private bool _flushWanted, _inFlight;
+    private long _inFlightEnd;
+    private long _appliedBoundary = long.MinValue;
+    private long _flushes;
 
     private static int ChainOf(string side) => side == RxSides.B ? Ad936xInputs.Rx2 : Ad936xInputs.Rx1;
 
@@ -454,6 +461,12 @@ internal sealed class PlutoBackend : RadioBackendBase
         var sides = _streamSides;
         var s = PlutoRxStream.Open(radio, BufferSamplesFor(rate), _opt.BuffersCount, rate, sides.Select(ChainOf));
         Volatile.Write(ref _samplesPerBuffer, s.SamplesPerBuffer);
+        // A new stream is a new buffer on the board: nothing queued before it, so a re-open asked of the old one is owed no more.
+        lock (_flushGate)
+        {
+            _flushWanted = false;
+            _inFlight = false;
+        }
         _stream = s;
         _stopPump = false;
         _pump = new Thread(() => Pump(radio, s)) { IsBackground = true, Name = "PlutoRx", Priority = ThreadPriority.Highest };
@@ -486,6 +499,26 @@ internal sealed class PlutoBackend : RadioBackendBase
         {
             while (!_stopPump)
             {
+                // A retune asked for the board's queue to be thrown away (9.33, RequestFlush): CLOSE and OPEN again before the
+                // next READBUF - again if another retune came in meanwhile. Otherwise this READBUF is out, and the ring position
+                // its buffer ends at is known before a sample of it arrives.
+                while (true)
+                {
+                    bool flush;
+                    lock (_flushGate)
+                    {
+                        flush = _flushWanted;
+                        _flushWanted = false;
+                        if (!flush)
+                        {
+                            _inFlight = true;
+                            _inFlightEnd = RadioPosition + s.SamplesPerBuffer;
+                        }
+                    }
+                    if (!flush) break;
+                    s.Reopen();
+                    Interlocked.Increment(ref _flushes);
+                }
                 if (!s.ReadBuffer(buf, out string mask))
                 {
                     ForeignFault($"{ForeignReaderPhrase}'s samples: the board's channel mask reads {mask}, and this sidecar's is {s.Mask} - every " +
@@ -510,6 +543,7 @@ internal sealed class PlutoBackend : RadioBackendBase
                     rings[0].Write(one);
                     rings[1].Write(two);
                 }
+                lock (_flushGate) _inFlight = false;
                 Interlocked.Increment(ref _buffers);
                 Interlocked.Add(ref _samples, s.SamplesPerBuffer);
 
@@ -684,9 +718,40 @@ internal sealed class PlutoBackend : RadioBackendBase
     // ------------------------------------------------------------ the radio's settings
 
     /// <summary>Section 9.2 item 9: a change leaves every buffer already filled - the kernel's, and the one iiod is
-    /// sending - at the old settings, plus the LO's lock. DOCUMENTED until P0 measures it.</summary>
+    /// sending - at the old settings, plus the LO's lock. DOCUMENTED (9.12 measured 0.9-2.3 buffers in flight, inside it). A
+    /// RETUNE no longer waits it out: it throws the queue away (<see cref="AppliedBoundary"/>). Every other change still does,
+    /// because a lease runs through a gain, AGC, antenna, bandwidth or setting change continuous - no break is announced for
+    /// one - and a re-open is a break.</summary>
     protected override long SettleSamples =>
         (long)(_opt.BuffersCount + 2) * Volatile.Read(ref _samplesPerBuffer) + (long)(WideRateHz * LoLockSeconds);
+
+    /// <summary>
+    /// ShackLink docs/plutosdr_support.md 9.33: after a retune's LO write, ask the pump to throw the board's queue away (CLOSE and
+    /// OPEN again, <see cref="PlutoRxStream.Reopen"/>) before its next READBUF, and return the first ring position whose samples
+    /// it will capture after that - so after the write. Exact, not a bound: the pump re-opens before it reads again, so the ring
+    /// takes at most the buffer whose READBUF is out now, and where that one ends was written down before it was sent. It does
+    /// not wait for the re-open (a rig-tracking slot retunes at every dial step). No stream: the next one is a new buffer, made
+    /// after this write. MEASURED on the owner's board: 0 samples at the old setting in every cycle; the re-open costs the OPEN
+    /// (33 ms at 4 x 2 MiB) and the new buffer's fill, about 130 ms from the write to the first whole buffer at 10 MS/s, where
+    /// the documented settle skipped 315.6 ms. The LO's lock (1 ms documented) lies inside the OPEN's 33 ms.
+    /// </summary>
+    private long RequestFlush()
+    {
+        lock (_flushGate)
+        {
+            if (_stream == null) return RadioPosition;
+            _flushWanted = true;
+            return _inFlight ? _inFlightEnd : RadioPosition;
+        }
+    }
+
+    /// <summary>The boundary <see cref="ApplyTuning"/> just found (<see cref="RequestFlush"/>) - ApplyRxSides tunes through it while
+    /// the stream is stopped and makes a new one after, which is the same answer. Taken once; anything else the documented settle.</summary>
+    protected override long AppliedBoundary()
+    {
+        long b = Interlocked.Exchange(ref _appliedBoundary, long.MinValue);
+        return b == long.MinValue ? ChangeBoundary() : b;
+    }
 
     /// <summary>The rate at the AD936x's data interface - a B2xx's master clock's counterpart. The ADC clock the chain
     /// runs on is in the telemetry (<c>adc_clock_hz</c>): it is read, never computed (section 9.8).</summary>
@@ -734,6 +799,8 @@ internal sealed class PlutoBackend : RadioBackendBase
             _expRxLo = lo;
             return lo;
         });
+        // AFTER the write has returned: the board's queue holds buffers the DMA filled at the old LO (9.33).
+        Interlocked.Exchange(ref _appliedBoundary, RequestFlush());
         ReadGainAfterMove();
         return (got, centers.Keys.ToDictionary(k => k, _ => got));
     }
@@ -977,6 +1044,7 @@ internal sealed class PlutoBackend : RadioBackendBase
             .Set("buffer_samples", Volatile.Read(ref _samplesPerBuffer))
             .Set("buffers_count", _opt.BuffersCount)
             .Set("settle_samples", SettleSamples)
+            .Set("retune_reopens", Interlocked.Read(ref _flushes))
             .Set("watch_full", Interlocked.Read(ref _watches))
             .Set("watch_quick", Interlocked.Read(ref _quickWatches))
             .Set("adc_clock_hz", double.IsNaN(_adcClockHz) ? (object?)null : _adcClockHz)
