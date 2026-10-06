@@ -440,16 +440,22 @@ internal static partial class Program
             long Reopens() => s.GetTelemetry().GetObject("radio")?.GetObject("source")?.GetLong("retune_reopens") ?? -1;
             long legacy = (4 + 2) * (long)TestBufferSamples;   // what every retune skipped before 9.33, the LO's lock aside
 
-            // After a retune: from its retuned block on, three buffers' worth - not one pair on the old LO's side.
-            (int wrong, int all, long gap) After(int mark, long to)
+            // After a retune: from its retuned block on, three buffers' worth - not one pair on the old LO's side. After a BURST, from
+            // the LAST retuned block: a boundary promises the samples AFTER it, never the ones before - the era before a later
+            // retune's boundary ends with the buffer that was out when it was asked, which may already be at the later LO, and a
+            // lease parked at the earlier boundary emits it under the earlier label (it does not look again while it waits).
+            (int wrong, int all, long gap) After(int mark, long to, bool fromLast = false)
             {
+                int RetunedAt(List<(IqHeader h, byte[] d)> list, int from) =>
+                    fromLast ? list.FindLastIndex(list.Count - 1, Math.Max(0, list.Count - from), b => (b.h.Flags & IqFlags.Retuned) != 0)
+                             : list.FindIndex(from, b => b.h.CenterHz == to && (b.h.Flags & IqFlags.Retuned) != 0);
                 List<(IqHeader h, byte[] d)> got = new();
                 bool ready = WaitFor(() =>
                 {
                     lock (blocks)
                     {
-                        int at = blocks.FindIndex(mark, b => b.h.CenterHz == to && (b.h.Flags & IqFlags.Retuned) != 0);
-                        if (at < 0) return false;
+                        int at = blocks.Count > mark ? RetunedAt(blocks, mark) : -1;
+                        if (at < 0 || blocks[at].h.CenterHz != to) return false;
                         long n = blocks.Skip(at).Sum(b => (long)b.h.Count);
                         if (n < 3L * TestBufferSamples) return false;
                         got = blocks.Skip(mark).ToList();
@@ -457,7 +463,7 @@ internal static partial class Program
                     }
                 }, 6000);
                 if (!ready) return (-1, 0, -1);
-                int first = got.FindIndex(b => b.h.CenterHz == to && (b.h.Flags & IqFlags.Retuned) != 0);
+                int first = RetunedAt(got, 0);
                 long gap = first > 0 ? (long)got[first].h.FirstSample - (long)(got[first - 1].h.FirstSample + (ulong)got[first - 1].h.Count) : -1;
                 int wrong = 0, all = 0;
                 foreach (var b in got.Skip(first))
@@ -486,14 +492,21 @@ internal static partial class Program
             lock (fake.Lock) cmds = fake.Commands.ToList();
             int lastLo = cmds.FindLastIndex(x => x.StartsWith("WRITE iio:device0 OUTPUT altvoltage0 frequency", StringComparison.Ordinal));
             int lastClose = cmds.FindLastIndex(x => x == "CLOSE iio:device3");
-            Check(lastLo >= 0 && lastClose > lastLo && cmds.Skip(lastClose + 1).Take(2).SequenceEqual(new[] { "SET iio:device3 BUFFERS_COUNT 4", "OPEN iio:device3 32768 00000003" }),
-                  "on the board: the LO written FIRST, then the receive buffer CLOSEd and OPENed again - the queue thrown away after the write, never before it");
+            // The fake logs every connection in one list, and the setter's gain read-back runs on the control connection WHILE the
+            // pump re-opens on its own: so the stream's lines are read out by their vocabulary, never by adjacency.
+            var streamAfter = cmds.Skip(lastClose + 1)
+                .Where(x => x.StartsWith("SET iio:device3 ", StringComparison.Ordinal) || x.StartsWith("OPEN iio:device3 ", StringComparison.Ordinal) ||
+                            x.StartsWith("CLOSE iio:device3", StringComparison.Ordinal) || x.StartsWith("READBUF iio:device3 ", StringComparison.Ordinal))
+                .Take(2).ToList();
+            Check(lastLo >= 0 && lastClose > lastLo && streamAfter.SequenceEqual(new[] { "SET iio:device3 BUFFERS_COUNT 4", "OPEN iio:device3 32768 00000003" }),
+                  "on the board: the LO written FIRST, then the receive buffer CLOSEd and OPENed again - the queue thrown away after the write, never before it: " +
+                  string.Join(" | ", streamAfter));
 
             // A burst, as a knob spins: every write before the last re-open, and the stream lands on the last LO with nothing stale.
             int burstMark;
             lock (blocks) burstMark = blocks.Count;
             for (int k = 0; k < 9; k++) s.SetLo(k % 2 == 0 ? LoB : LoA);     // ends on LO B
-            var burst = After(burstMark, LoB);
+            var burst = After(burstMark, LoB, fromLast: true);
             Check(burst.wrong == 0 && burst.all > 0, $"nine retunes back to back: after the last one's retuned block, {burst.wrong} of {burst.all} pairs on LO A's side");
             Check(s.GetState().Readiness == RadioStates.Ready, "...and the radio is still up, the foreign-writer watch quiet through every re-open");
 
