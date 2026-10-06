@@ -49,7 +49,7 @@ internal static partial class Program
               "the library's spawn line over the pipes is one this sidecar accepts: " + string.Join(" ", line));
     }
 
-    // ---------------------------------------------------------------- the open over USB, its ceilings, the substitution (D14-D16, D20)
+    // ---------------------------------------------------------------- the open over USB, at the rate asked (D14, D20; 9.32 Q21)
 
     private static void PlutoUsbOpen()
     {
@@ -65,31 +65,27 @@ internal static partial class Program
                   !log.Contains("_iio._tcp browse", StringComparison.Ordinal),
                   $"...through the fake's USB face: no address, no browse, nothing on its network face [handle {fake.UsbHandleOpen}]");
             var c = s.Caps;
-            Check(c.MaxWideRateHz == 7e6 && c.Link == "its own USB pipes" && c.Tx?.MaxWideRateHz == 4e6,
-                  $"caps: receive 7 MS/s and transmit 4 MS/s over the pipes (Q13), and the link said [{c.MaxWideRateHz}, {c.Link}, {c.Tx?.MaxWideRateHz}]");
-            Check(Math.Abs(s.GetState().WideRateHz - 5e6) < 1 && log.Contains("opening at 5000000 S/s instead", StringComparison.Ordinal),
-                  "D16: asked to open at 10 MS/s (a slot stored from its Ethernet days), it opens at 5 - the highest offered within 7 - and SAYS so");
+            Check(c.MaxWideRateHz == 0 && c.Link == "its own USB pipes" && c.Tx?.MaxWideRateHz == 0,
+                  $"caps: the link said, and NO ceiling either way - the pipes' 7 and 4 MS/s were one board's measurement (9.32 Q21) [{c.MaxWideRateHz}, {c.Link}, {c.Tx?.MaxWideRateHz}]");
+            Check(Math.Abs(s.GetState().WideRateHz - 10e6) < 1 && !log.Contains(" instead", StringComparison.Ordinal) &&
+                  log.Contains("every rate the board states is offered", StringComparison.Ordinal) && log.Contains("measured on the owner's board over its USB pipes", StringComparison.Ordinal),
+                  "asked to open at 10 MS/s over the pipes, it opens at 10 - nothing substituted - and the log carries what was measured, as words");
             Check(c.WideRatesHz.Contains(8e6) && c.WideRatesHz.Contains(10e6) && c.WideRatesHz.Contains(61.44e6),
-                  "B9: every rate is still OFFERED - the ceiling refuses, it never filters");
+                  "B9: every rate the board states is OFFERED");
             var tel = SourceTelemetry(s);
             Check(tel != null && tel.GetString("route") == "usb-pipes" && tel.GetString("address").StartsWith("usb:sidecar-fake-", StringComparison.Ordinal) &&
-                  tel.GetDouble("rx_max_wide_rate_hz", 0) == 7e6 && tel.GetDouble("tx_max_wide_rate_hz", 0) == 4e6,
-                  $"D20: telemetry says the route, the route's name (never usb:...:0) and both ceilings [{tel?.GetString("address")}]");
+                  !tel.Has("rx_max_wide_rate_hz") && !tel.Has("tx_max_wide_rate_hz"),
+                  $"D20: telemetry says the route and the route's name (never usb:...:0), and states no ceiling [{tel?.GetString("address")}]");
             var iiod = s.GetSettings().OfType<JsonObject>().FirstOrDefault(x => x.GetString("key") == "iiod");
             Check(iiod != null && iiod.GetString("value").StartsWith("usb:sidecar-fake-", StringComparison.Ordinal) && !iiod.GetString("value").EndsWith(":0", StringComparison.Ordinal) &&
                   iiod.GetString("text").Contains("its own USB pipes", StringComparison.Ordinal),
                   $"...and so does the iiod setting [{iiod?.GetString("value")}]");
 
             s.ClaimLo();
-            var r8 = RefusedTx(() => s.SetRate(8e6));
-            Check(r8?.Code == ErrorCodes.OutOfRange && r8.Error.Text.Contains("its own USB pipes", StringComparison.Ordinal) && Math.Abs(s.GetState().WideRateHz - 5e6) < 1,
-                  "set_rate to 8 MS/s - offered, above the pipes' 7 - refused OUT_OF_RANGE in words naming the link, the rate unchanged: " + r8?.Error.Text);
-            RadioRefusal? own = null;
-            try { p.backend.SetRate(10e6); }
-            catch (RadioRefusal ex) { own = ex; }
-            Check(own?.Code == ErrorCodes.OutOfRange && Math.Abs(s.GetState().WideRateHz - 5e6) < 1,
-                  "...and the backend's OWN net refuses it too, asked directly, before the stream is touched");
-            Check(Math.Abs(s.SetRate(4e6).WideRateHz - 4e6) < 1, "4 MS/s, within it, is admitted");
+            Check(Math.Abs(s.SetRate(8e6).WideRateHz - 8e6) < 1, "set_rate to 8 MS/s - above the 7 measured on the owner's pipes - is ADMITTED (9.32 Q21)");
+            p.backend.SetRate(12.5e6);
+            Check(Math.Abs(p.backend.GetState().WideRateHz - 12.5e6) < 1, "...and the backend takes 12.5 asked directly: it has no ceiling of its own either");
+            Check(Math.Abs(s.SetRate(4e6).WideRateHz - 4e6) < 1, "4 MS/s is admitted");
             long b0 = SourceTelemetry(s)?.GetLong("buffers") ?? 0;
             Check(WaitFor(() => (SourceTelemetry(s)?.GetLong("buffers") ?? 0) > b0 + 5, 5000), "the receive stream runs over its pipe");
             List<string> usbLog;
@@ -101,7 +97,7 @@ internal static partial class Program
         Check(!fake.UsbHandleOpen && BoardQuiet(fake), "at close: SafeIdle, then the interface let go - another program may take it");
     }
 
-    // ---------------------------------------------------------------- the network routes' ceilings (D11, D15)
+    // ---------------------------------------------------------------- the network routes: named, never capped (D11; 9.32 Q21)
 
     private static void PlutoRouteLimits()
     {
@@ -114,13 +110,13 @@ internal static partial class Program
                 using var s = Connect(p.server, "pluto-eth");
                 Check(s.WaitReady(15000) == RadioStates.Ready, "over the network: " + s.FaultText);
                 var c = s.Caps;
-                Check(asked == "127.0.0.1" && c.MaxWideRateHz == 10e6 && c.Link == "its Ethernet port" && c.Tx?.MaxWideRateHz == 2.5e6,
-                      $"Ethernet: the classifier is asked the HOST it reached; receive 10 MS/s, transmit 2.5 (Q7, Q13) [{asked}, {c.MaxWideRateHz}, {c.Tx?.MaxWideRateHz}]");
-                Check(Math.Abs(s.GetState().WideRateHz - 10e6) < 1, "asked to open at 12.5 MS/s, above Ethernet's 10: it opens at 10, said");
+                Check(asked == "127.0.0.1" && c.MaxWideRateHz == 0 && c.Link == "its Ethernet port" && c.Tx?.MaxWideRateHz == 0,
+                      $"Ethernet: the classifier is asked the HOST it reached; the link said, no ceiling either way (9.32 Q21) [{asked}, {c.MaxWideRateHz}, {c.Tx?.MaxWideRateHz}]");
+                Check(Math.Abs(s.GetState().WideRateHz - 12.5e6) < 1, "asked to open at 12.5 MS/s, above the 10 measured on the owner's Ethernet: it opens at 12.5");
                 Check(SourceTelemetry(s)?.GetString("route") == "ethernet" && SourceTelemetry(s)?.GetString("address") == "127.0.0.1:" + fake.Port.ToString(CultureInfo.InvariantCulture),
                       "telemetry: route ethernet, the address as before");
                 s.ClaimLo();
-                Check(RefusedTx(() => s.SetRate(12.5e6))?.Code == ErrorCodes.OutOfRange, "set_rate 12.5 MS/s over Ethernet: refused (Q13 - it was offered and lossy, it is refused now)");
+                Check(Math.Abs(s.SetRate(20e6).WideRateHz - 20e6) < 1, "set_rate 20 MS/s over Ethernet: admitted - what the link loses there, the overflow count says");
             }
             finally { Stop(p); }
         }
@@ -132,9 +128,9 @@ internal static partial class Program
                 using var s = Connect(p.server, "pluto-rndis");
                 Check(s.WaitReady(15000) == RadioStates.Ready, "over a board's USB network: " + s.FaultText);
                 var c = s.Caps;
-                Check(c.MaxWideRateHz == 5e6 && c.Link == "its USB network (RNDIS)" && c.Tx?.MaxWideRateHz == 2.5e6 && Math.Abs(s.GetState().WideRateHz - 5e6) < 1 &&
+                Check(c.MaxWideRateHz == 0 && c.Link == "its USB network (RNDIS)" && c.Tx?.MaxWideRateHz == 0 && Math.Abs(s.GetState().WideRateHz - 10e6) < 1 &&
                       SourceTelemetry(s)?.GetString("route") == "usb-network",
-                      $"RNDIS (Q14): receive 5 MS/s, transmit 2.5, opened at 5 - the slowest route says so [{c.MaxWideRateHz}, {c.Link}]");
+                      $"RNDIS (Q14): the link said, no ceiling, opened at the 10 MS/s asked (9.32 Q21) [{c.MaxWideRateHz}, {c.Link}]");
             }
             finally { Stop(p); }
         }
@@ -144,7 +140,7 @@ internal static partial class Program
             try
             {
                 using var s = Connect(p.server, "pluto-unclassified");
-                Check(s.WaitReady(15000) == RadioStates.Ready && s.Caps.MaxWideRateHz == 10e6 && s.Caps.Link == "its Ethernet port",
+                Check(s.WaitReady(15000) == RadioStates.Ready && s.Caps.MaxWideRateHz == 0 && s.Caps.Link == "its Ethernet port",
                       "a classifier that fails reads Ethernet - today's behaviour - and the board still opens");
             }
             finally { Stop(p); }

@@ -155,6 +155,19 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
     protected static double ClockFor(int sides, double wideRateHz) =>
         sides > 1 ? SideRules.DualClockHz(wideRateHz) : TxRatePlan.ModelTickHz(wideRateHz);
 
+    /// <summary>The clock THIS radio runs with <paramref name="sides"/> at <paramref name="wideRateHz"/>; 0 = two sides cannot run
+    /// there. The B2xx's rule (<see cref="ClockFor"/>) unless a radio says otherwise: one with no per-side DDC runs at its wide rate
+    /// whatever its sides (ShackLink docs/plutosdr_support.md 9.32 D21).</summary>
+    protected virtual double ClockForSides(int sides, double wideRateHz) => ClockFor(sides, wideRateHz);
+
+    /// <summary>
+    /// True for a radio whose two sides share ONE centre (ShackLink docs/plutosdr_support.md 9.32 D21): no per-side DDC, so the RF
+    /// LO IS the centre and two centres are served only when equal. The B2xx's placement - a DDC's window inside 0.9 of a wider
+    /// clock (<see cref="SideRules.PlaceRfLo"/>) - is never asked of such a radio: with the clock at the wide rate it places no LO
+    /// at all, not even for two equal centres.
+    /// </summary>
+    protected virtual bool SidesShareOneCenter => false;
+
     // ------------------------------------------------------------ the pipelines' view
 
     public long LoHz
@@ -353,6 +366,16 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
             long rf = centers.Values.First() + dc;
             moved = rf != current;
             return rf;
+        }
+        if (SidesShareOneCenter)
+        {
+            if (centers.Values.Distinct().Count() > 1)
+                throw new RadioRefusal(ErrorCodes.OutOfRange,
+                    $"this radio's two sides share ONE centre (no per-side DDC): {RxSides.Words(centers.Keys)} cannot be at " +
+                    $"{string.Join(" and ", centers.Values)} Hz - move the radio (set_lo with no side), which moves both");
+            long one = centers.Values.First() + dc;
+            moved = one != current;
+            return one;
         }
         if (!SideRules.PlaceRfLo(current, centers.Values.ToList(), rate, clockHz, dc, out long placed, out moved))
             throw new RadioRefusal(ErrorCodes.OutOfRange,
@@ -564,7 +587,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         var before = StreamingSides;
         if (before.SequenceEqual(want)) return;
         double rate = WideRateHz;
-        double clock = ClockFor(want.Length, rate);
+        double clock = ClockForSides(want.Length, rate);
         if (clock <= 0)
             throw new RadioRefusal(ErrorCodes.OutOfRange, $"two sides cannot stream at {rate:0} S/s: no clock under 30.72 MHz serves it with an even decimation");
         var centers = new Dictionary<string, long>();
@@ -580,7 +603,7 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         lock (_stateLock)
         {
             long dc = _state.DcOffsetHz;
-            if (want.Length < 2) rf = centers.Values.First() + dc;
+            if (want.Length < 2 || SidesShareOneCenter) rf = centers.Values.First() + dc;
             else if (!SideRules.PlaceRfLo(_rfLoHz, centers.Values.ToList(), rate, clock, dc, out rf, out _))
                 rf = centers.Values.Min() + (centers.Values.Max() - centers.Values.Min()) / 2;
         }

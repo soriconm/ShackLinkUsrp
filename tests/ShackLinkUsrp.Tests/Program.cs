@@ -110,6 +110,7 @@ internal static partial class Program
         Run("Pluto P2: the loss oracle - a polled register, and a board that has none (section 9.2 item 5)", PlutoLossOracle);
         Run("Pluto P2: a third program - every value this sidecar did not write faults the radio (B11)", PlutoForeignWriter);
         Run("Pluto P2: the radio's settings, each read back, and the watch quiet through them", PlutoSetters);
+        Run("Pluto 9.32: RX B - the second chain: one stream, each side its own samples, gain, AGC and input, ONE centre; a 1R1T board offers RX A alone", PlutoSides);
         Run("Pluto P2: close, and a board that goes away (B10)", PlutoCloseAndLoss);
         Run("Pluto P2: the real executable, spawned with --iiod, loads no UHD", PlutoSpawned);
         Run("Pluto P2: what the running gates cannot reach, pinned in the source", PlutoSourceRules);
@@ -130,8 +131,8 @@ internal static partial class Program
         Run("Pluto P4e: the drain's deadline is the board's queue at the WIDE rate, the DMA's", PlutoTxDrainDeadline);
         Run("Pluto P4e: a tuned step's interpolated tail leaves at ITS LO before the LO moves", PlutoTxTunedTail);
         Run("Pluto U3: --iiod usb:<hw_serial> - the serial the address's, never a second spelling (9.26 D14)", PlutoUsbCommandLine);
-        Run("Pluto U3: the board over its own USB pipes - its ceilings, the open's substitution, set_rate refused, the route said (9.26 D14-D16, D20)", PlutoUsbOpen);
-        Run("Pluto U3: the network routes' ceilings - Ethernet and the board's USB network, told by the classifier (9.26 D11, D15)", PlutoRouteLimits);
+        Run("Pluto U3: the board over its own USB pipes - opened at the rate asked, no ceiling, the route said (9.26 D14, D20; 9.32 Q21)", PlutoUsbOpen);
+        Run("Pluto U3: the network routes - Ethernet and the board's USB network, told by the classifier, never capped (9.26 D11; 9.32 Q21)", PlutoRouteLimits);
         Run("Pluto U3: a keyed radio's broken control connection - SafeIdle through pipe 0 again, never a fourth (9.26 D17)", PlutoUsbSafeIdleOnItsOwnPipe);
         Run("Pluto P2: and still nothing here loaded UHD", NoUhdInThisProcess);
 

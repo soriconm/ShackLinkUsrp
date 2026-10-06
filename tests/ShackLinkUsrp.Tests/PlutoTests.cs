@@ -130,11 +130,13 @@ internal static partial class Program
             var rates = c.WideRatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture)).ToArray();
             Check(string.Join(",", rates) == "2.5,4,5,8,10,12.5,15.36,16,20,25,30.72,32,40,50,56,61.44",
                   "B9: every native rate at or above the no-FIR floor, inside the board's own range - 30.72 and 61.44 included: " + string.Join(", ", rates));
-            Check(c.LeaseDecimMin == 1 && c.RxSides != null && c.RxSides.SequenceEqual(new[] { "A" }) && c.OverflowOracle == true && c.Tx != null,
-                  "lease_decim_min 1 (B4), one receive side, a loss oracle - and, since P4, a transmitter (its caps are PlutoTxTests')");
+            Check(c.LeaseDecimMin == 1 && c.RxSides != null && c.RxSides.SequenceEqual(new[] { "A", "B" }) && c.OverflowOracle == true && c.Tx != null,
+                  "lease_decim_min 1 (B4), RX A and RX B - the owner's board states RX2 (booted 2R2T, 9.32 Q19) - a loss oracle, and a transmitter");
             Check(c.FreqMinHz == 70_000_000 && c.FreqMaxHz == 6_000_000_000 && c.GainMinDb == -10 && c.GainMaxDb == 73 && c.GainStepDb == 1 &&
-                  c.Antennas.Length == 12 && c.Antennas[0] == "A_BALANCED" && c.BandwidthMinHz == 200_000 && c.BandwidthMaxHz == 56e6 && c.Agc,
-                  "the RX LO, bandwidth and ports are the board's own statements; the gain is the union of its bands (section 9.2 item 7)");
+                  c.Antennas.SequenceEqual(new[] { "RX1A", "RX1B", "RX1C" }) && SideRules.AntennasFor(c, "B").SequenceEqual(new[] { "RX2A", "RX2B", "RX2C" }) &&
+                  c.BandwidthMinHz == 200_000 && c.BandwidthMaxHz == 56e6 && c.Agc,
+                  "the RX LO and bandwidth are the board's own statements, each side's inputs the balanced ports it lists, named as the AD936x " +
+                  "names them (9.32 Q20); the gain is the union of its bands (section 9.2 item 7)");
 
             // B10: SafeIdle is the FIRST write - before any rate, LO, gain or FIR write.
             var writes = fake.AttributeWrites();
@@ -150,7 +152,7 @@ internal static partial class Program
                   fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "hardwaregain") == "30.000000 dB" && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_bandwidth") == "2500000",
                   "the RX LO at 100 MHz, manual gain 30 dB, the analog bandwidth following the rate");
             var st = s.GetState();
-            Check(st.LoHz == 100_000_000 && st.WideRateHz == 2.5e6 && st.GainDb == 30 && !st.Agc && st.Antenna == "A_BALANCED" && st.BandwidthHz == 2.5e6,
+            Check(st.LoHz == 100_000_000 && st.WideRateHz == 2.5e6 && st.GainDb == 30 && !st.Agc && st.Antenna == "RX1A" && st.BandwidthHz == 2.5e6,
                   "the state is the board's read-back");
             Check(fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage1", "powerdown") == "1", "the board is quiet");
             Check(WaitFor(() => (s.GetTelemetry().GetObject("radio")?.GetObject("source")?.GetLong("buffers") ?? 0) >= 20, 3000), "buffers stream");
@@ -533,17 +535,19 @@ internal static partial class Program
             st = s.SetAgc(false);
             Check(!st.Agc && st.GainDb == 52 && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "gain_control_mode") == "manual",
                   "AGC off is manual, and the gain in force is what the AGC left, read back (52 dB)");
-            st = s.SetAntenna("B_BALANCED");
-            Check(st.Antenna == "B_BALANCED" && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "B_BALANCED", "an RX port the board lists");
+            st = s.SetAntenna("RX1B");
+            Check(st.Antenna == "RX1B" && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "B_BALANCED", "an input the board lists: RX1B is B_BALANCED");
             // ShackLink docs/plutosdr_support.md 9.30: a board whose device tree LOCKS its RX input refuses every listed port but the
             // one in force (EINVAL). The client was told "the board refused WRITE ... rf_port_select 11" - the value's byte count.
             lock (fake.Lock) fake.RxPortLocked = true;
             string? lockedSaid = null;
-            try { s.SetAntenna("C_BALANCED"); }
+            try { s.SetAntenna("RX1C"); }
             catch (Exception ex) { lockedSaid = ex.Message; }
             Check(lockedSaid != null && lockedSaid.Contains("locks the RX input") && lockedSaid.Contains("stays B_BALANCED") && !lockedSaid.Contains("rf_port_select 11") &&
-                  fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "B_BALANCED" && s.GetState().Antenna == "B_BALANCED",
-                  "a port a device-tree lock refuses: refused to the client in words naming the lock and the port in force, which stays: " + lockedSaid);
+                  fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "B_BALANCED" && s.GetState().Antenna == "RX1B",
+                  "an input a device-tree lock refuses: refused to the client in words naming the lock and the port in force, which stays: " + lockedSaid);
+            Check(Throws(() => s.SetAntenna("B_BALANCED")) && Throws(() => s.SetAntenna("A_N")),
+                  "the driver's port names are no inputs on the wire (9.32 Q20): a stored old spelling is ShackLink's to translate");
             Check(p.backend.WaitReady(1000), "...and the radio is still up: a refused port is a refusal, not a fault");
             lock (fake.Lock) fake.RxPortLocked = false;
             st = s.SetBandwidth(1e6);
@@ -561,12 +565,138 @@ internal static partial class Program
             Check(s.SetSetting("xo_correction", "40000010") == "40000010", "the XO correction, read back");
             var ro = Throws(() => s.SetSetting("iiod", "10.0.0.1"));
             Check(ro, "the board's address is the board's to state, not a setting");
-            Check(Throws(() => s.SetRxSides(new[] { "A", "B" })), "a second receive side is refused (section 9.2 item 6)");
             Thread.Sleep(800);
             Check(s.GetState().Readiness == RadioStates.Ready,
                   "every change above was this sidecar's own: the foreign-writer watch, running all the while, stayed quiet");
         }
         finally { Stop(p); }
+    }
+
+    // ---------------------------------------------------------------- RX B: the second chain (ShackLink docs/plutosdr_support.md 9.32)
+
+    /// <summary>The fake's ramps: RX1 counts up (I = r, Q = -r), RX2 down (I = 2047 - r, Q = r), x16 to sc16 by the backend.
+    /// Returns the block's first r, or -1 when any sample is not that chain's.</summary>
+    private static int RampStart(byte[] d, int count, bool rx2)
+    {
+        short i0 = BitConverter.ToInt16(d, 0);
+        int r0 = rx2 ? (0x7FF - ((i0 >> 4) & 0x7FF)) & 0x7FF : (i0 >> 4) & 0x7FF;
+        for (int k = 0; k < count; k++)
+        {
+            int r = (r0 + k) & 0x7FF;
+            short wantI = rx2 ? (short)((0x7FF - r) << 4) : (short)(r << 4), wantQ = rx2 ? (short)(r << 4) : (short)((-r) << 4);
+            if (BitConverter.ToInt16(d, 4 * k) != wantI || BitConverter.ToInt16(d, 4 * k + 2) != wantQ) return -1;
+        }
+        return r0;
+    }
+
+    private static void PlutoSides()
+    {
+        using (var fake = Board())   // the owner's board: booted 2R2T; the ramps
+        {
+            var p = StartPluto(Opts(fake));
+            try
+            {
+                using var s = Connect(p.server, "pluto-sides");
+                Check(s.WaitReady(10000) == RadioStates.Ready, "the board opens: " + s.FaultText);
+                var c = s.Caps;
+                Check(c.RxSides!.SequenceEqual(new[] { "A", "B" }) && c.DualRatesHz != null && c.DualRatesHz.SequenceEqual(c.WideRatesHz),
+                      "RX A and RX B - the board states RX2 - and every rate it states with two sides as with one (9.32 Q19, Q21)");
+                var st = s.GetState();
+                var b = st.Side("B");
+                Check(st.RxSides.SequenceEqual(new[] { "A" }) && b != null && !b.Streaming && b.Antenna == "RX2A" && b.Agc && b.CenterHz == st.LoHz,
+                      "it opens streaming RX A alone; RX B stated as the board has it - RX2A, its AGC on as it booted (D22), on RX A's centre");
+                Check(!fake.AttributeWrites().Any(w => w.Contains("|INPUT|voltage1|", StringComparison.Ordinal)),
+                      "...and nothing was written to RX2 to learn it");
+
+                s.ClaimLo();
+                st = s.SetRxSides(new[] { "A", "B" });
+                Check(st.RxSides.SequenceEqual(new[] { "A", "B" }) && st.MaxApartHz == 0 &&
+                      fake.Commands.Any(x => x.StartsWith("OPEN iio:device3 ", StringComparison.Ordinal) && x.EndsWith(" 0000000f", StringComparison.Ordinal)),
+                      $"set_rx_sides A,B: ONE stream of both chains (mask 0000000f, D23), and max_apart_hz 0 - one centre (D21) [{st.MaxApartHz}]");
+
+                using var la = s.OpenLease(new LeaseRequest { CenterHz = st.LoHz, Decimation = 1 });
+                using var lb = s.OpenLease(new LeaseRequest { CenterHz = st.LoHz, Decimation = 1, Side = "B" });
+                var ba = new List<(IqHeader h, byte[] d)>();
+                var bb = new List<(IqHeader h, byte[] d)>();
+                la.Connection.IqBlockReceived += (cn, h, d) => { lock (ba) ba.Add((h, d)); };
+                lb.Connection.IqBlockReceived += (cn, h, d) => { lock (bb) bb.Add((h, d)); };
+                la.Connection.StartReader();
+                lb.Connection.StartReader();
+                Check(WaitFor(() => { lock (ba) lock (bb) return ba.Count >= 20 && bb.Count >= 20; }, 8000), "both sides' wide leases deliver");
+                List<(IqHeader h, byte[] d)> ga, gb;
+                lock (ba) ga = ba.ToList();
+                lock (bb) gb = bb.ToList();
+                Check(ga.All(x => RampStart(x.d, (int)x.h.Count, rx2: false) >= 0) && gb.All(x => RampStart(x.d, (int)x.h.Count, rx2: true) >= 0),
+                      $"RX A's samples are RX1's and RX B's are RX2's, bit for bit, split from one buffer ({ga.Count} and {gb.Count} blocks)");
+                var byPos = ga.ToDictionary(x => x.h.FirstSample, x => RampStart(x.d, (int)x.h.Count, false));
+                var same = gb.Where(x => byPos.ContainsKey(x.h.FirstSample)).ToList();
+                Check(same.Count > 0 && same.All(x => RampStart(x.d, (int)x.h.Count, true) == byPos[x.h.FirstSample]),
+                      $"...and radio position n is ONE instant on both: the same r at the same position on each side ({same.Count} blocks compared)");
+
+                // Each side's own receiver (D22): gain and AGC on its own chain.
+                st = s.SetGain(20, "B");
+                Check(st.Side("B")!.GainDb == 20 && !st.Side("B")!.Agc && fake.Get(FakeIiod.Phy, "INPUT", "voltage1", "hardwaregain") == "20.000000 dB" &&
+                      fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "hardwaregain") == "30.000000 dB" && st.GainDb == 30,
+                      "RX B's gain is RX2's alone (INPUT voltage1); RX A's stays 30 dB");
+                st = s.SetAgc(true, "A");
+                Check(st.Agc && !st.Side("B")!.Agc && fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "gain_control_mode") == "slow_attack" &&
+                      fake.Get(FakeIiod.Phy, "INPUT", "voltage1", "gain_control_mode") == "manual",
+                      "RX A's AGC on, RX B still manual - two AGCs");
+
+                // The input (Q20): each side its own; the LETTER one setting for both (F34).
+                var other = RefusedTx(() => s.SetAntenna("RX1A", "B"));
+                Check(other?.Code == ErrorCodes.OutOfRange && other.Error.Text.Contains("RX B") && other.Error.Text.Contains("RX2A, RX2B, RX2C"),
+                      "RX A's input asked of RX B is refused, naming RX B's: " + other?.Error.Text);
+                st = s.SetAntenna("RX2C", "B");
+                Check(st.Side("B")!.Antenna == "RX2C" && st.Side("A")!.Antenna == "RX1C" && st.Antenna == "RX1C" &&
+                      fake.Get(FakeIiod.Phy, "INPUT", "voltage0", "rf_port_select") == "C_BALANCED" &&
+                      LogText(p.backend).Contains("selects A, B or C for both chains at once, so RX A is on RX1C", StringComparison.Ordinal),
+                      "RX2C on RX B moves RX A to RX1C with it - one letter for both chains - stated and said");
+                st = s.SetAntenna("RX1A", "A");
+                Check(st.Side("B")!.Antenna == "RX2A" && st.Antenna == "RX1A", "...and back: RX1A on RX A puts RX B on RX2A");
+                int portWrites = fake.AttributeWrites().Count(w => w.Contains("rf_port_select=", StringComparison.Ordinal));
+                s.SetAntenna("RX2A", "B");
+                Check(fake.AttributeWrites().Count(w => w.Contains("rf_port_select=", StringComparison.Ordinal)) == portWrites,
+                      "the letter in force is not written again");
+
+                // One centre (D21): a side alone may not move; the radio moves both.
+                var apart = RefusedTx(() => s.SetLo(145_000_000, false, "B"));
+                Check(apart?.Code == ErrorCodes.OutOfRange && apart.Error.Text.Contains("at most 0 Hz apart"),
+                      "RX B alone to 145 MHz is refused - the two sides can be 0 Hz apart: " + apart?.Error.Text);
+                st = s.SetLo(145_000_000);
+                Check(st.CenterOf("A") == 145_000_000 && st.CenterOf("B") == 145_000_000 && fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage0", "frequency") == "145000000",
+                      "set_lo with no side moves the radio: both sides to 145 MHz, ONE RX LO");
+
+                // RX B alone, then RX A alone again: the stream follows, the mask says which.
+                la.Dispose();
+                st = s.SetRxSides(new[] { "B" });
+                Check(st.RxSides.SequenceEqual(new[] { "B" }) && SourceTelemetry(s)?.GetString("rx_mask") == "0000000c",
+                      "RX B alone: the stream carries RX2 only (0000000c)");
+                lb.Dispose();
+                st = s.SetRxSides(new[] { "A" });
+                Check(st.RxSides.SequenceEqual(new[] { "A" }) && SourceTelemetry(s)?.GetString("rx_mask") == "00000003", "...and RX A alone again (00000003)");
+                Thread.Sleep(800);
+                Check(s.GetState().Readiness == RadioStates.Ready, "every change was this sidecar's own: the foreign-writer watch stayed quiet");
+            }
+            finally { Stop(p); }
+        }
+
+        using (var fake = Board(FakeIiod.BoardContextOneChain()))   // the same board booted 1R1T
+        {
+            var p = StartPluto(Opts(fake));
+            try
+            {
+                using var s = Connect(p.server, "pluto-one-chain");
+                Check(s.WaitReady(10000) == RadioStates.Ready, "a board booted 1R1T opens: " + s.FaultText);
+                var c = s.Caps;
+                Check(c.RxSides!.SequenceEqual(new[] { "A" }) && c.DualRatesHz == null && c.SideAntennas == null &&
+                      c.Antennas.SequenceEqual(new[] { "RX1A", "RX1B", "RX1C" }) && (c.Tx == null || !c.Tx.DualRx),
+                      "...states RX A alone - no RX B is offered where the board states no RX2 (Q19: the board says, never a guess)");
+                s.ClaimLo();
+                Check(RefusedTx(() => s.SetRxSides(new[] { "A", "B" })) != null, "and set_rx_sides A,B is refused");
+            }
+            finally { Stop(p); }
+        }
     }
 
     // ---------------------------------------------------------------- close, and a board that goes away

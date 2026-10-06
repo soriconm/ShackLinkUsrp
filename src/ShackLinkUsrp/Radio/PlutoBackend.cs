@@ -58,7 +58,8 @@ internal sealed record PlutoBackendOptions
 
 /// <summary>
 /// A Pluto-class board (an AD936x behind iiod) as a radio of this sidecar (ShackLink docs/plutosdr_support.md
-/// section 9, P2): ONE receive side, the wide stream pumped from <see cref="PlutoRxStream"/> into the ring. It loads
+/// section 9, P2): RX A - and RX B when the board states a second chain (9.32: RX2A, its own gain, AGC and input, ONE centre with
+/// RX A) - the wide stream pumped from ONE <see cref="PlutoRxStream"/> into each side's ring. It loads
 /// no UHD. Every value it states is the board's read-back.
 /// <list type="bullet">
 /// <item><b>The board is found by its serial</b> (B6): the stored address first, then one <c>_iio._tcp</c> browse
@@ -82,11 +83,11 @@ internal sealed record PlutoBackendOptions
 /// DMA on a connection of its own, and every end is SafeIdle (B10). Its timebase is the host's (section 9.2 item 2).</item>
 /// <item><b>The TX DMA runs at the WIDE rate, always</b> (section 9.21, the owner's Q4): the owner's board's DMA consumes about 1.5 x the
 /// wide rate at the wide/8 it lists and reads back (section 9.20), so a source a client sends at wide/8 is interpolated x8 by the sender
-/// (<c>TxUpsampler</c>). And a key-up is refused above <see cref="MaxTxWideRateHz"/> (Q5): the board's transmitter starves beside
-/// its own receiver above it, measured.</item>
-/// <item><b>Its ceilings are its ROUTE's</b> (section 9.26 D15): Ethernet, its own USB pipes, or its USB network, each measured
-/// (<see cref="LimitsFor"/>). A wide rate above the route's receive ceiling is refused by set_rate and SUBSTITUTED at the open, out
-/// loud; a key-up above its transmit ceiling is refused.</item>
+/// (<c>TxUpsampler</c>).</item>
+/// <item><b>Every rate the board states is offered, receive and transmit, over every route</b> (ShackLink docs/plutosdr_support.md
+/// 9.32 Q21, the owner's rule): a link that cannot carry a rate says so through what already counts it - the overflow oracle, the
+/// leases' breaks, the TX underflows and a starved transmission's end - never through a ceiling measured on one board on one PC. What
+/// was measured is one line of the open's log (<see cref="MeasuredWords"/>).</item>
 /// </list>
 /// </summary>
 internal sealed class PlutoBackend : RadioBackendBase
@@ -122,8 +123,23 @@ internal sealed class PlutoBackend : RadioBackendBase
     private double _expRate, _expCoreRate;
     private long _buffers, _samples, _flagged, _watches, _quickWatches;
     private double _temperatureC = double.NaN;
-    // How the board is reached (section 9.26 D11), known once FindBoard has found it: the limits are this route's.
+    // How the board is reached (section 9.26 D11), known once FindBoard has found it.
     private volatile int _route = (int)PlutoRoute.Ethernet;
+    // ShackLink docs/plutosdr_support.md 9.32: the receive chains the board states (2 booted 2R2T), and the sides the ONE stream
+    // carries now - RX A is the AD936x's chain 1 (RX1A), RX B its chain 2 (RX2A).
+    private int _rxChains = 1;
+    private volatile string[] _streamSides = RxSides.OnlyA;
+
+    private static int ChainOf(string side) => side == RxSides.B ? Ad936xInputs.Rx2 : Ad936xInputs.Rx1;
+
+    private static string SideOfChain(int chain) => chain == Ad936xInputs.Rx2 ? RxSides.B : RxSides.A;
+
+    /// <summary>9.32 D21: no per-side DDC in the stock HDL - one RX LO, so both sides sit on ONE centre, and it is the LO.</summary>
+    protected override bool SidesShareOneCenter => true;
+
+    /// <summary>The AD936x's data interface runs at the wide rate whatever the sides (the clock IS the rate: no DDC to decimate
+    /// from a wider one). Never 0: a 2R2T board states its rates with both chains running.</summary>
+    protected override double ClockForSides(int sides, double wideRateHz) => wideRateHz;
 
     public PlutoBackend(SidecarLog log, PlutoBackendOptions opt)
         : base(log, InfoFor(opt.Serial, "Pluto-class board (iiod)", ""), InitialCaps(), ringSamples: 1 << 24,
@@ -160,7 +176,7 @@ internal sealed class PlutoBackend : RadioBackendBase
         MaxLeases = 8,
         MaxPanoramas = 4,
         MaxPanoramaBins = 1 << 18,
-        Antennas = new[] { "A_BALANCED" },
+        Antennas = new[] { "RX1A" },
         Agc = true,
         BandwidthMinHz = 200e3,
         BandwidthMaxHz = 56e6,
@@ -217,23 +233,17 @@ internal sealed class PlutoBackend : RadioBackendBase
         var caps = radio.ReadCapabilities();
         bool oracle = radio.HasLossRegisters;
         var offered = OfferedRates(caps.SampleRateRange.Min, caps.SampleRateRange.Max);
-        // Section 9.26 D16: a rate above what this route carries is SUBSTITUTED at the open (set_rate refuses it): a slot stored at
-        // 10 MS/s from its Ethernet days must still open over USB, because the remedy - a lower rate on the SDR tab - needs it open.
-        double openAt = _opt.WideRateHz, rxLimit = MaxRxWideRateHz;
-        if (openAt > rxLimit + 0.5)
-        {
-            double within = RateRules.HighestWithin(offered, rxLimit);
-            if (within > 0)
-            {
-                Log($"asked to open at {openAt:0} S/s, above the {rxLimit:0} S/s this board was measured to carry over {PlutoRoutes.Words(Route)} " +
-                    $"(ShackLink docs/plutosdr_support.md 9.26 D16): opening at {within:0} S/s instead; set_rate above {rxLimit:0} S/s is refused in words");
-                openAt = within;
-            }
-        }
+        // 9.32 Q19/Q20: the board's own statement of its chains, and each side's inputs named as the AD936x names them.
+        _rxChains = caps.RxChains;
+        var inputsA = Ad936xInputs.Offered(Ad936xInputs.Rx1, caps.RxPorts);
+        var inputsB = _rxChains > 1 ? Ad936xInputs.Offered(Ad936xInputs.Rx2, caps.RxPorts) : Array.Empty<string>();
+        // Section 9.32 Q21: opened at the rate it was asked for, whatever the route - what this link loses there is counted, never guessed.
+        double openAt = _opt.WideRateHz;
         double rate, coreRate;
         long lo;
-        double gain, bandwidth;
-        string antenna;
+        double gain, bandwidth, gainB = double.NaN;
+        bool agcB = false;
+        string antenna, port;
         lock (_boardLock)
         {
             rate = radio.SetSampleRate(openAt);
@@ -243,7 +253,15 @@ internal sealed class PlutoBackend : RadioBackendBase
             lo = radio.SetRxLo(_opt.LoHz);
             gain = radio.SetRxGain(30);
             bandwidth = radio.SetRxBandwidth(Math.Clamp(BandwidthForRate(rate, null), caps.RxBandwidthRange.Min, caps.RxBandwidthRange.Max));
-            antenna = radio.ReadState().RxPort;
+            // READ, never written: the R3 bench requires the open never write the port (9.30 F30).
+            port = radio.ReadRxPort();
+            antenna = Ad936xInputs.Name(Ad936xInputs.Rx1, port) ?? port;
+            if (_rxChains > 1)
+            {
+                // RX B as the board has it (9.32 D22) - read, nothing written: its slot sets what it wants when it opens.
+                gainB = radio.ReadRxGainDb(Ad936xInputs.Rx2);
+                agcB = radio.ReadGainControlMode(Ad936xInputs.Rx2) != Ad936xNames.AgcManual;
+            }
             _expRate = rate;
             _expCoreRate = coreRate;
             _expRxLo = lo;
@@ -266,14 +284,16 @@ internal sealed class PlutoBackend : RadioBackendBase
             MaxLeases = 8,
             MaxPanoramas = 4,
             MaxPanoramaBins = 1 << 18,
-            Antennas = caps.RxPorts,
+            Antennas = inputsA,
+            SideAntennas = _rxChains > 1 ? new Dictionary<string, string[]> { [RxSides.A] = inputsA, [RxSides.B] = inputsB } : null,
             Agc = caps.GainControlModes.Contains(Ad936xNames.AgcSlowAttack) && caps.GainControlModes.Contains(Ad936xNames.AgcManual),
             BandwidthMinHz = caps.RxBandwidthRange.Min,
             BandwidthMaxHz = caps.RxBandwidthRange.Max,
-            RxSides = RxSides.OnlyA,
+            // 9.32 Q19: RX B is offered exactly when the board states a second chain; every rate it states, with two as with one (Q21).
+            RxSides = _rxChains > 1 ? RxSides.All : RxSides.OnlyA,
+            DualRatesHz = _rxChains > 1 ? offered : null,
             OverflowOracle = oracle,
-            // Section 9.26 D15: what this route carries, and which route that is.
-            MaxWideRateHz = rxLimit,
+            // Which route this is (section 9.26 D15). No max_wide_rate_hz: a ceiling would be one board's measurement (9.32 Q21).
             Link = PlutoRoutes.Words(Route),
         };
         UpdateRfLo(lo);
@@ -287,6 +307,8 @@ internal sealed class PlutoBackend : RadioBackendBase
             s.BandwidthHz = bandwidth;
             s.DcOffsetHz = 0;
         }, announce: false);
+        if (_rxChains > 1)
+            UpdateSideB(gainDb: gainB, agc: agcB, antenna: Ad936xInputs.Name(Ad936xInputs.Rx2, port) ?? port, centerHz: lo);
 
         // The transmitter's statements, read APART (section 9.15): a board whose TX side cannot be read still receives, and
         // says it does not transmit.
@@ -306,8 +328,11 @@ internal sealed class PlutoBackend : RadioBackendBase
         Log($"{rate:0} S/s (ADC clock {(double.IsNaN(_adcClockHz) ? "not stated" : _adcClockHz.ToString("0", CultureInfo.InvariantCulture) + " Hz")}), " +
             $"LO {lo} Hz, gain {gain} dB (manual), {antenna}, bandwidth {bandwidth:0} Hz; rates offered " +
             string.Join("/", Caps.WideRatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture))) + " MS/s");
-        Log($"route: {PlutoRoutes.Words(Route)} ({radio.Route.Name}) - it carries {rxLimit / 1e6:0.###} MS/s of receive and keys at a wide rate of " +
-            $"{MaxTxWideRateHz / 1e6:0.###} MS/s or less, both measured (ShackLink docs/plutosdr_support.md 9.25, 9.26 D15)");
+        Log($"route: {PlutoRoutes.Words(Route)} ({radio.Route.Name}) - every rate the board states is offered; {MeasuredWords(Route)}");
+        Log(_rxChains > 1
+            ? $"receive: two chains (the board was booted 2R2T) - RX A is RX1 ({string.Join("/", inputsA)}), RX B is RX2 ({string.Join("/", inputsB)}, " +
+              $"{(agcB ? "its AGC on" : $"{gainB} dB manual")}); ONE centre for both (no per-side DDC), and the input letter is one setting for both"
+            : $"receive: one chain (the board was booted 1R1T) - RX A is RX1 ({string.Join("/", inputsA)}); no RX B");
         Log(oracle
             ? $"loss oracle: the RX core's status register, read after every buffer{(was == true ? " (its overflow flag was already set, from before this sidecar; cleared)" : "")}"
             : "loss oracle: NONE - this board has no debugfs, so lost samples cannot be seen and the overflow counter says nothing (caps.overflow_oracle false)");
@@ -421,17 +446,20 @@ internal sealed class PlutoBackend : RadioBackendBase
     private int BufferSamplesFor(double rateHz) =>
         _opt.BufferSamples > 0 ? _opt.BufferSamples : (int)Math.Min(1 << 20, 1L << (int)Math.Ceiling(Math.Log2(Math.Max(1024, rateHz * 0.033))));
 
+    /// <summary>ONE stream for the sides streaming now (9.32 D23): RX1, RX2 or both on one DMA - one instant on both.</summary>
     private void StartStreaming()
     {
         var radio = Radio;
         double rate = WideRateHz;
-        var s = PlutoRxStream.Open(radio, BufferSamplesFor(rate), _opt.BuffersCount, rate);
+        var sides = _streamSides;
+        var s = PlutoRxStream.Open(radio, BufferSamplesFor(rate), _opt.BuffersCount, rate, sides.Select(ChainOf));
         Volatile.Write(ref _samplesPerBuffer, s.SamplesPerBuffer);
         _stream = s;
         _stopPump = false;
         _pump = new Thread(() => Pump(radio, s)) { IsBackground = true, Name = "PlutoRx", Priority = ThreadPriority.Highest };
         _pump.Start();
-        Log($"streaming RX1: {s.SamplesPerBuffer} samples ({1000.0 * s.SamplesPerBuffer / rate:0.0} ms) x {s.BuffersCount} kernel buffers, mask {s.Mask}");
+        Log($"streaming {string.Join(" and ", s.Chains.Select(Ad936xInputs.ChainWords))} ({RxSides.Words(sides)}): {s.SamplesPerBuffer} samples " +
+            $"({1000.0 * s.SamplesPerBuffer / rate:0.0} ms) x {s.BuffersCount} kernel buffers, mask {s.Mask}");
     }
 
     private void StopStreaming()
@@ -446,9 +474,13 @@ internal sealed class PlutoBackend : RadioBackendBase
 
     private void Pump(PlutoRadio radio, PlutoRxStream s)
     {
-        var ring = RingOf(RxSides.A);
+        // Each chain the stream carries into ITS side's ring: RX1 -> RX A, RX2 -> RX B (9.32 D23).
+        var rings = s.Chains.Select(c => RingOf(SideOfChain(c))).ToArray();
         var buf = new byte[s.BytesPerBuffer];     // once, reused: never a per-buffer allocation
         var samples = MemoryMarshal.Cast<byte, short>(buf.AsSpan(0, s.BytesPerBuffer));
+        // Two chains: an instant is RX1's I/Q then RX2's, split here into one array a side, allocated once with the buffer.
+        short[]? one = rings.Length > 1 ? new short[2 * s.SamplesPerBuffer] : null;
+        short[]? two = rings.Length > 1 ? new short[2 * s.SamplesPerBuffer] : null;
         long lastFull = Stopwatch.GetTimestamp();
         try
         {
@@ -464,7 +496,20 @@ internal sealed class PlutoBackend : RadioBackendBase
                 // Section 9.2 item 8: 12 significant bits, LSB-aligned (le:S12/16>>0) -> sc16 full scale. Shifting the 16-bit
                 // word left by 4 is x16 for a sign-extended sample, and reads the 12 bits right if the top four were not.
                 for (int i = 0; i < samples.Length; i++) samples[i] = (short)(samples[i] << 4);
-                ring.Write(samples);
+                if (one == null || two == null) rings[0].Write(samples);
+                else
+                {
+                    for (int k = 0, j = 0; k + 3 < samples.Length; k += 4, j += 2)
+                    {
+                        one[j] = samples[k];
+                        one[j + 1] = samples[k + 1];
+                        two[j] = samples[k + 2];
+                        two[j + 1] = samples[k + 3];
+                    }
+                    // Both rings take the same instants, in lockstep: radio position n is one instant on both sides.
+                    rings[0].Write(one);
+                    rings[1].Write(two);
+                }
                 Interlocked.Increment(ref _buffers);
                 Interlocked.Add(ref _samples, s.SamplesPerBuffer);
 
@@ -665,10 +710,24 @@ internal sealed class PlutoBackend : RadioBackendBase
         }
     }
 
+    /// <summary>The centre every streaming side sits on (9.32 D21): ONE, and it is the RX LO. A side this board does not have, or
+    /// two centres that differ, are refused in words before anything is written.</summary>
+    private long OneCenter(IReadOnlyDictionary<string, long> centers)
+    {
+        if (centers.Count == 0) throw new RadioRefusal(ErrorCodes.BadRequest, "no side to tune");
+        if (centers.ContainsKey(RxSides.B) && _rxChains < 2)
+            throw new RadioRefusal(ErrorCodes.Unsupported, "this board states one receive chain (it was booted 1R1T): it has no RX B");
+        long want = centers.Values.First();
+        if (centers.Values.Any(c => c != want))
+            throw new RadioRefusal(ErrorCodes.OutOfRange,
+                $"this board's two sides share ONE centre - one RX LO, no per-side DDC: {RxSides.Words(centers.Keys)} cannot be at " +
+                $"{string.Join(" and ", centers.Values)} Hz; move the radio (set_lo with no side), which moves both");
+        return want;
+    }
+
     protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers) ApplyTuning(long rfLoHz, IReadOnlyDictionary<string, long> centers)
     {
-        if (!centers.TryGetValue(RxSides.A, out long want))
-            throw new RadioRefusal(ErrorCodes.Unsupported, "this board has one receive side, RX A");
+        long want = OneCenter(centers);
         long got = Board(r =>
         {
             long lo = r.SetRxLo(want);
@@ -676,28 +735,73 @@ internal sealed class PlutoBackend : RadioBackendBase
             return lo;
         });
         ReadGainAfterMove();
-        return (got, new Dictionary<string, long> { [RxSides.A] = got });
+        return (got, centers.Keys.ToDictionary(k => k, _ => got));
     }
 
     /// <summary>The AD936x's gain table changes with the band (section 9.2 item 7): after a move, a manual gain the new
-    /// band cannot hold reads back as what it now is, and the state says so.</summary>
+    /// band cannot hold reads back as what it now is, and the state says so - each streaming side's, on its own chain.</summary>
     private void ReadGainAfterMove()
     {
-        if (GetState().Agc) return;
-        double before = GetState().GainDb;
-        double now = Board(r => r.ReadRxGainDb());
-        if (Math.Abs(now - before) < 1e-9) return;
-        UpdateState(s => s.GainDb = now, announce: true);
-        Log($"the RX gain reads {now} dB after the move (it was {before} dB): the new band's range is {Board(r => r.ReadRxGainRange())}");
+        bool changed = false;
+        foreach (var side in _streamSides)
+        {
+            float before = RowGainOf(side);
+            if (float.IsNaN(before)) continue;      // its AGC decides
+            int chain = ChainOf(side);
+            double now = Board(r => r.ReadRxGainDb(chain));
+            if (Math.Abs(now - before) < 1e-3) continue;
+            if (side == RxSides.B) UpdateSideB(gainDb: now);
+            else UpdateState(s => s.GainDb = now, announce: false);
+            changed = true;
+            Log($"{RxSides.Words(side)}'s gain reads {now} dB after the move (it was {before} dB): the new band's range is {Board(r => r.ReadRxGainRange(chain))}");
+        }
+        if (changed) UpdateState(_ => { }, announce: true);
     }
 
+    /// <summary>
+    /// 9.32 D23: stream exactly <paramref name="sides"/> - the ONE stream made again with the chains they are (mask 03, 0c or 0f).
+    /// Refused before anything stops when the board has no RX B or the centres differ; a side switched on starts where the other
+    /// stands (its ring aligned while nothing writes), and the base tells the side that stays it was reconfigured.
+    /// </summary>
     protected override (long RfLoHz, IReadOnlyDictionary<string, long> Centers, double ClockHz) ApplyRxSides(
         IReadOnlyList<string> sides, long rfLoHz, IReadOnlyDictionary<string, long> centers, double clockHz)
     {
-        if (sides.Count != 1 || sides[0] != RxSides.A)
-            throw new RadioRefusal(ErrorCodes.Unsupported, "this board streams one receive side, RX A (section 9.2 item 6)");
-        var t = ApplyTuning(rfLoHz, centers);
-        return (t.RfLoHz, t.Centers, MasterClockHz);
+        var want = RxSides.Canonical(sides) ?? RxSides.OnlyA;
+        if (RxSides.Contains(want, RxSides.B) && _rxChains < 2)
+            throw new RadioRefusal(ErrorCodes.Unsupported, "this board states one receive chain (it was booted 1R1T): it has no RX B");
+        OneCenter(centers);
+        StopStreaming();
+        var before = _streamSides;
+        _streamSides = want;
+        (long RfLoHz, IReadOnlyDictionary<string, long> Centers) t;
+        try
+        {
+            // Nothing writes the rings now: a side switched on starts at the position the other has reached.
+            AlignRings(want);
+            t = ApplyTuning(rfLoHz, centers);
+        }
+        catch
+        {
+            _streamSides = before;
+            RestartAfter("the side change was refused");
+            throw;
+        }
+        RestartAfter("the side change");
+        return (t.RfLoHz, t.Centers, WideRateHz);
+    }
+
+    /// <summary>The stream made again after a reconfiguration; a stream that cannot be made again ends the radio, said.</summary>
+    private void RestartAfter(string what)
+    {
+        if (_closed || GetState().Readiness != RadioStates.Ready) return;
+        try
+        {
+            StartStreaming();
+        }
+        catch (Exception ex)
+        {
+            RadioDied($"the stream could not be made again after {what}: {ex.Message}");
+        }
     }
 
     protected override double ApplyRate(double hz)
@@ -706,9 +810,6 @@ internal sealed class PlutoBackend : RadioBackendBase
         // transmission (TX_ACTIVE); this is the backend's own net, because here the wide rate IS the TX DMA's parent clock.
         if (OpenTx is { IsFinished: false })
             throw new RadioRefusal(ErrorCodes.TxActive, "the wide rate cannot change while a transmission is open: it is the transmitter's clock too");
-        // Section 9.26 D15: above what this route carries - the server refused first, through the same ONE rule; this is the backend's net.
-        var over = RateRules.WideRateRefusal(Caps, hz);
-        if (over != null) throw new RadioRefusal(over.Code, over.Text, over.Extra);
         // The stream is made again around it, so no buffer at the old rate is written after the pipelines were told the new one.
         StopStreaming();
         double got;
@@ -757,16 +858,50 @@ internal sealed class PlutoBackend : RadioBackendBase
         return got;
     }
 
-    protected override double ApplyGain(string side, double db) => Board(r => r.SetRxGain(db));
+    /// <summary>A side's gain, on ITS chain (9.32 D22): RX A is the AD936x's RX1, RX B its RX2.</summary>
+    protected override double ApplyGain(string side, double db) => Board(r => r.SetRxGain(db, ChainOf(side)));
 
     protected override void ApplyAgc(string side, bool on)
     {
-        Board(r => r.SetGainControlMode(on ? Ad936xNames.AgcSlowAttack : Ad936xNames.AgcManual));
+        int chain = ChainOf(side);
+        Board(r => r.SetGainControlMode(on ? Ad936xNames.AgcSlowAttack : Ad936xNames.AgcManual, chain));
+        if (on) return;
         // Off, the gain the AGC left is the manual gain now in force: its read-back.
-        if (!on) UpdateState(s => s.GainDb = Board(r => r.ReadRxGainDb()), announce: false);
+        double g = Board(r => r.ReadRxGainDb(chain));
+        if (side == RxSides.B) UpdateSideB(gainDb: g);
+        else UpdateState(s => s.GainDb = g, announce: false);
     }
 
-    protected override string ApplyAntenna(string side, string name) => Board(r => r.SetRxPort(name));
+    /// <summary>
+    /// A side's input (9.32 Q20): RX1A..RX1C on RX A, RX2A..RX2C on RX B - the old spelling (a balanced port's own name) taken on the
+    /// side it arrives on. Another side's input is refused in words naming that side. The LETTER is one setting for both chains
+    /// (F34): written only when it changes (a board whose device tree locks it refuses in the library's words, 9.30), and then the
+    /// other side is moved to the same letter, told, and said.
+    /// </summary>
+    protected override string ApplyAntenna(string side, string name)
+    {
+        int chain = ChainOf(side);
+        string offered = string.Join(", ", SideRules.AntennasFor(Caps, side));
+        if (!Ad936xInputs.TryParse(name, chain, out int asked, out string port))
+            throw new RadioRefusal(ErrorCodes.OutOfRange, $"\"{name}\" is no input of this board: {RxSides.Words(side)} offers {offered}");
+        if (asked != chain)
+            throw new RadioRefusal(ErrorCodes.OutOfRange,
+                $"{name.Trim().ToUpperInvariant()} is {RxSides.Words(SideOfChain(asked))}'s input (the AD936x's {Ad936xInputs.ChainWords(asked)}): " +
+                $"{RxSides.Words(side)} offers {offered}");
+        string before = Board(r => r.ReadRxPort());
+        string now = before == port ? before : Board(r => r.SetRxPort(port));
+        string mine = Ad936xInputs.Name(chain, now) ?? now;
+        if (now != before && _rxChains > 1)
+        {
+            string other = RxSides.Other(side);
+            string theirs = Ad936xInputs.Name(ChainOf(other), now) ?? now;
+            if (other == RxSides.B) UpdateSideB(antenna: theirs);
+            else UpdateState(s => s.Antenna = theirs, announce: false);
+            AnnounceFrontEndChange();
+            Log($"{RxSides.Words(side)} on {mine}: the AD936x selects A, B or C for both chains at once, so {RxSides.Words(other)} is on {theirs} now");
+        }
+        return mine;
+    }
 
     protected override double ApplyBandwidth(double hz)
     {
@@ -830,7 +965,8 @@ internal sealed class PlutoBackend : RadioBackendBase
             .Set("kind", "iiod")
             .Set("address", r == null ? "" : r.Route.Name)
             .Set("route", PlutoRoutes.Token(Route))
-            .Set("rx_max_wide_rate_hz", MaxRxWideRateHz)
+            .Set("rx_chains", _rxChains)
+            .Set("rx_mask", _stream?.Mask ?? "")
             .Set("iiod_version", r?.Identity.Iiod?.ToString() ?? "")
             .Set("firmware", r?.Identity.Firmware ?? "")
             .Set("model", r?.Identity.Model ?? "")
@@ -852,7 +988,6 @@ internal sealed class PlutoBackend : RadioBackendBase
             .Set("tx_key_ups", Interlocked.Read(ref _txKeyUps))
             .Set("tx_key_ups_refused", Interlocked.Read(ref _txRefusedKeyUps))
             .Set("tx_dma_rate_hz", _txDmaRateHz)
-            .Set("tx_max_wide_rate_hz", MaxTxWideRateHz)
             .Set("tx_interp_clipped", Volatile.Read(ref _lastTx)?.InterpolatorClipped ?? 0)
             .Set("tx_keyed_expect", _txExpect is { } e ? $"LO {e.LoHz} Hz, {e.AttenuationDb} dB" : "idle (SafeIdle)");
     }
@@ -903,45 +1038,21 @@ internal sealed class PlutoBackend : RadioBackendBase
             Log($"transmitter: TX LO {PlutoValues.Mhz(_txLoRange.Min)}-{PlutoValues.Mhz(_txLoRange.Max)} MHz, attenuation 0-89.75 dB in 0.25 dB, " +
                 $"source rates {string.Join("/", _txCaps.RatesHz.Select(r => (r / 1e6).ToString("0.###", CultureInfo.InvariantCulture)))} MS/s (set to {txRate / 1e6:0.###}), " +
                 $"the TX DMA at the wide rate {_txDmaRateHz / 1e6:0.###} MS/s ALWAYS - a wide/8 source is interpolated x8 here (section 9.21) - " +
-                $"keying only at a wide rate of {MaxTxWideRateHz / 1e6:0.###} MS/s or less; timebase host; set_tx's centre and gain are HELD and " +
+                "keying at any wide rate the board states; timebase host; set_tx's centre and gain are HELD and " +
                 "written at the key-up - nothing is sent until a client asks");
     }
 
     /// <summary>
-    /// ETHERNET, transmit (<c>caps.tx.max_wide_rate_hz</c>, the owner's Q5 of section 9.20): MEASURED on the owner's board on 2026-10-01 -
-    /// zeros streamed to the TX DMA at the wide rate beside a receiving stream at the same rate, the TX LO powered down. 2.5 MS/s each way
-    /// ran clean for 1,560 s over three runs (section 9.22). 4 MS/s, stated here first (section 9.21, one 60 s run), starved both 120 s
-    /// runs, from 76.7 s and 41 s: the board's Ethernet MAC drops PC-to-board frames when both directions are busy, and a lost tail frame
-    /// waits out Windows' 300 ms retransmission timeout against a 131 ms TX queue. So the owner's Q7 (section 9.22): 2.5 MS/s. The radio
-    /// slot's wide receive stream stays open through a transmission (section 9.6), so above this a key-up is refused in words naming the
-    /// remedy - lower the radio's rate. A ceiling of the board's own, said at the key-up; never a rate hidden from the rate list (B9).
+    /// What was MEASURED over a route, on the owner's board and PC (ShackLink docs/plutosdr_support.md 9.12, 9.22, 9.25) - words for the
+    /// open's log and nothing else. Never a ceiling (9.32 Q21, the owner's rule): another board, another PC or another link carries
+    /// something else, so every rate the board states is offered and what a link loses is counted where it is lost.
     /// </summary>
-    public const double EthernetMaxTxWideRateHz = 2_500_000;
-
-    /// <summary>ETHERNET, receive (Q13, section 9.25.1): 10 MS/s clean for ten minutes (section 9.12), the ceiling about 12.</summary>
-    public const double EthernetMaxRxWideRateHz = 10_000_000;
-
-    /// <summary>The board's OWN USB PIPES (Q13, section 9.25): 4 MS/s each way held for 600 s and 5 did not; receive alone held 7 and
-    /// 7.5 MS/s for 60 s under a 7.68 MS/s plateau, so 7. Under B9's list that admits 5 MS/s (section 9.26 F15).</summary>
-    public const double UsbPipesMaxTxWideRateHz = 4_000_000, UsbPipesMaxRxWideRateHz = 7_000_000;
-
-    /// <summary>Its USB NETWORK, RNDIS (Q14, section 9.26): receive 5 MS/s clean and 10 delivered 6.40; both ways 2.5 clean and 4 failed
-    /// at once, with the board's CPU at 76-100 % (section 9.25).</summary>
-    public const double UsbNetworkMaxTxWideRateHz = 2_500_000, UsbNetworkMaxRxWideRateHz = 5_000_000;
-
-    /// <summary>The ONE table of a route's ceilings (section 9.26 D15): the receive wide rate it carries, and the wide rate it keys at.</summary>
-    internal static (double Rx, double Tx) LimitsFor(PlutoRoute route) => route switch
+    internal static string MeasuredWords(PlutoRoute route) => route switch
     {
-        PlutoRoute.UsbPipes => (UsbPipesMaxRxWideRateHz, UsbPipesMaxTxWideRateHz),
-        PlutoRoute.UsbNetwork => (UsbNetworkMaxRxWideRateHz, UsbNetworkMaxTxWideRateHz),
-        _ => (EthernetMaxRxWideRateHz, EthernetMaxTxWideRateHz),
-    };
-
-    /// <summary>The highest WIDE rate this board transmits at over the route it is reached by (<c>caps.tx.max_wide_rate_hz</c>).</summary>
-    public double MaxTxWideRateHz => LimitsFor(Route).Tx;
-
-    /// <summary>The highest WIDE rate this board's receive carries over the route it is reached by (<c>caps.max_wide_rate_hz</c>).</summary>
-    public double MaxRxWideRateHz => LimitsFor(Route).Rx;
+        PlutoRoute.UsbPipes => "measured on the owner's board over its USB pipes: receive clean to 7 MS/s, transmit and receive together to 4 (9.25)",
+        PlutoRoute.UsbNetwork => "measured on the owner's board over its USB network: receive clean to 5 MS/s, transmit and receive together to 2.5 (9.25)",
+        _ => "measured on the owner's board over Ethernet: receive clean to 10 MS/s, transmit and receive together to 2.5 (9.12, 9.22)",
+    } + " - the overflow and underflow counts say what THIS link loses";
 
     /// <summary>The source rates a transmission may run at: the wide rate itself, and wide/8, which THIS sidecar interpolates x8
     /// (section 9.21) - the TX DMA only ever runs at the wide rate. Its samples per source sample; 0 for any other.</summary>
@@ -1007,9 +1118,10 @@ internal sealed class PlutoBackend : RadioBackendBase
             QuantumSamples = TxBufferSamplesFor(dma) / InterpolationFor(rates[0], wide),
             // No DUC and no CORDIC (section 9.15 item 8): the LO sits on the carrier and no offset is offered.
             MaxLoOffsetHz = 0,
-            DualRx = false,
+            // 9.32 D24: TX1A keys from its own DMA whether RX B streams or not - the receive stream is apart from it.
+            DualRx = _rxChains > 1,
             Timebase = TxTimebases.Host,
-            MaxWideRateHz = MaxTxWideRateHz,
+            // No tx.max_wide_rate_hz: a key-up at any wide rate the board states (9.32 Q21); a starved over ends, said.
         }));
         _txWhyNot = "";
         return want;
@@ -1097,9 +1209,6 @@ internal sealed class PlutoBackend : RadioBackendBase
     protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
         var caps = Volatile.Read(ref _txCaps) ?? throw new RadioRefusal(ErrorCodes.Unsupported, "this board does not transmit: " + _txWhyNot);
-        // Q5 (section 9.21): the backend's own net - the server refused first, through the same ONE rule, before anything opened.
-        var wideNo = TxRules.WideRateRefusal(caps, WideRateHz);
-        if (wideNo != null) throw new RadioRefusal(wideNo.Code, wideNo.Text, wideNo.Extra);
         if (!caps.RatesHz.Any(r => Math.Abs(r - grant.RateHz) < 0.5))
             throw new RadioRefusal(ErrorCodes.OutOfRange, $"this board does not transmit at {grant.RateHz:0} S/s at the rate in force");
         if (_foreign)

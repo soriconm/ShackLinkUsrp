@@ -98,13 +98,13 @@ internal static partial class Program
                   $"its rates are the TX DMA's own list at 2.5 MS/s - the wide rate and /8 - never a list of ours [{string.Join(", ", c?.RatesHz ?? Array.Empty<double>())}]");
             Check(c != null && c.GainMinDb == 0 && c.GainMaxDb == 89.75 && c.GainStepDb == 0.25 && c.FreqMinHz == 46_875_001 && c.FreqMaxHz == 6_000_000_000,
                   "gain 0-89.75 in 0.25 (the wire's 89.75 + hardwaregain); the TX LO 46.875001 MHz-6 GHz, as the board states it");
-            Check(c != null && c.MaxLoOffsetHz == 0 && !c.DualRx && c.Offers(TxSourceKinds.Iq) && c.Offers(TxSourceKinds.Tone) && c.Offers(TxSourceKinds.Mod) &&
+            Check(c != null && c.MaxLoOffsetHz == 0 && c.DualRx && c.Offers(TxSourceKinds.Iq) && c.Offers(TxSourceKinds.Tone) && c.Offers(TxSourceKinds.Mod) &&
                   c.Offers(TxSourceKinds.Step) && c.QuantumSamples == PlutoBackend.TxBufferSamplesFor(2_500_000) / 8 && c.QuantumSamples == 8192,
-                  $"no LO offset (no DUC), one side, all four sources (B5: streamed IQ, never the DDS), the quantum one TX DMA buffer in SOURCE samples " +
+                  $"no LO offset (no DUC), dual_rx (TX1A keys whether RX B streams or not, 9.32 D24), all four sources (B5: streamed IQ, never the DDS), the quantum one TX DMA buffer in SOURCE samples " +
                   $"at the lowest rate ({c?.QuantumSamples}: 65,536 at the wide rate, interpolated from 8,192)");
-            Check(c != null && c.MaxWideRateHz == 2_500_000,
-                  $"caps.tx.max_wide_rate_hz: 2.5 MS/s, the wide rate this board was MEASURED to transmit at beside its own receiver for a long over " +
-                  $"(section 9.22, Q7 - 4 MS/s starved past 40 s) [{c?.MaxWideRateHz}]");
+            Check(c != null && c.MaxWideRateHz == 0,
+                  $"caps.tx states NO max_wide_rate_hz (9.32 Q21): 2.5 MS/s is what ONE board was measured to transmit at beside its own receiver, " +
+                  $"and another board, PC or link carries something else [{c?.MaxWideRateHz}]");
             var st = s.GetState().Tx!;
             Check(st.CenterHz == 0 && st.LoHz == 0 && st.GainDb == 0 && st.RateHz == 312_500 && st.Held != null && st.Held.CenterHz == 0 && double.IsNaN(st.Held.GainDb),
                   "state.tx at open: the truth in force (LO powered down = 0, gain 0 = the maximum attenuation), the lowest SOURCE rate, and NOTHING held");
@@ -614,26 +614,25 @@ internal static partial class Program
                   "...the source rate the new one does not list moved to the lowest it does, said - and the DMA put at the NEW WIDE rate, 10 MS/s");
             s.ClaimTx();
             s.SetTx(new TxSettings { CenterHz = TxCentre, GainDb = 30 });
-            // Q5 (section 9.21): at 10 MS/s this board's transmitter starves beside its own receiver - refused before anything opens.
+            // Section 9.32 Q21 (the owner's rule): a key-up at ANY wide rate the board states. 10 MS/s starved beside its own receiver on the
+            // owner's board over Ethernet - and that is the link's to say, through the underflow count and a starved over's end, never a
+            // refusal measured on one board.
             int opens = fake.TxOpens;
-            var q5 = RefusedTx(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 }));
-            Check(q5?.Code == ErrorCodes.OutOfRange && q5.Message.Contains("2500000") && q5.Message.Contains("lower the radio's rate") &&
-                  fake.TxOpens == opens && BoardQuiet(fake),
-                  "a key-up at a 10 MS/s wide rate is REFUSED in words naming the remedy - the TX DMA never opened, the board quiet: " + q5?.Message);
-            RadioRefusal? own5 = null;
-            try { p.backend.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 }); }
-            catch (RadioRefusal ex) { own5 = ex; }
-            Check(own5?.Code == ErrorCodes.OutOfRange && fake.TxOpens == opens,
-                  "...and the backend refuses it ITSELF, asked past the server: " + own5?.Message);
-            // Q7 (section 9.22): 4 MS/s was the first stated limit, and both 120 s runs on the board starved there (the Ethernet's lost
-            // tail frames). It is refused now, as 10 MS/s is: the number the board did NOT earn.
+            var t10 = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 });
+            Check(WaitFor(() => fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage1", "powerdown") == "0", 3000) && fake.TxOpens == opens + 1,
+                  "a key-up at a 10 MS/s wide rate is ADMITTED and keys - no ceiling measured on one board refuses it (9.32 Q21)");
+            t10.Stop(drain: false);
+            Check(WaitFor(() => BoardQuiet(fake), 3000), "...and its end is SafeIdle, as every end is");
+            // 4 MS/s was Q7's refusal (both 120 s runs on the owner's board starved there): admitted too.
             s.SetRate(4e6);
             s.WaitReady(5000);
             Check(s.Caps.Tx!.RatesHz.SequenceEqual(new[] { 500_000.0, 4_000_000.0 }) && fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "4000000",
-                  "at 4 MS/s: the source rates 500 kS/s and 4 MS/s, the DMA at 4 MS/s - the list is the board's, never filtered by the limit (B9)");
-            var q7 = RefusedTx(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 }));
-            Check(q7?.Code == ErrorCodes.OutOfRange && q7.Message.Contains("4000000") && q7.Message.Contains("2500000") && fake.TxOpens == opens && BoardQuiet(fake),
-                  "a key-up at 4 MS/s is REFUSED too (section 9.22, Q7: an over there starved past 40 s), naming 2.5 MS/s - the DMA never opened: " + q7?.Message);
+                  "at 4 MS/s: the source rates 500 kS/s and 4 MS/s, the DMA at 4 MS/s - the list is the board's (B9)");
+            var t4 = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 30_000, OffsetHz = 10_000, LevelDbfs = -10 });
+            Check(WaitFor(() => fake.Get(FakeIiod.Phy, "OUTPUT", "altvoltage1", "powerdown") == "0", 3000) && fake.TxOpens == opens + 2,
+                  "a key-up at 4 MS/s is ADMITTED and keys (Q7's refusal is gone with Q21)");
+            t4.Stop(drain: false);
+            Check(WaitFor(() => BoardQuiet(fake), 3000), "...and ends quiet");
             s.SetRate(2.5e6);
             s.WaitReady(5000);
             Check(s.Caps.Tx!.RatesHz.SequenceEqual(new[] { 312_500.0, 2_500_000.0 }) && fake.Get(FakeIiod.Dds, "OUTPUT", "voltage0", "sampling_frequency") == "2500000",
