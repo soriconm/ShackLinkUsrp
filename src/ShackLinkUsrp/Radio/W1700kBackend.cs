@@ -131,8 +131,9 @@ internal sealed class W1700kBackend : RadioBackendBase
         _cond.RemoveDc = opt.RemoveDc;
     }
 
-    /// <summary>The radio's serial and its log's key: ONE spelling, outside the address grammar (a W1700K is reached by its address).</summary>
-    internal static string KeyFor(string name) => "w1700k-" + name;
+    /// <summary>The radio's serial: its address's rendezvous key, the grammar's ONE spelling (<c>usrp:w1700k:&lt;name&gt;</c>), so the
+    /// serial a client's IsSameRadio compares is the key it found the sidecar by.</summary>
+    internal static string KeyFor(string name) => ShackLinkUsrp.Client.UsrpAddress.W1700k(name).RendezvousKey;
 
     private static RadioInfo InfoFor(string name) => new()
     {

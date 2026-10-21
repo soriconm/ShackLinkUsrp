@@ -112,6 +112,8 @@ internal static partial class Program
         Run("W1700K: no controller - another program's stream, received as it is", W1700kNoController);
         Run("W1700K: the command line", W1700kCommandLine);
         Run("W1700K: the real executable, --w1700k fed by the fake export", W1700kSpawned);
+        Run("W1700K U1: usrp:w1700k[:<name>], its key, IsSameRadio, and the spawn line read back by the sidecar", W1700kAddressCases);
+        Run("W1700K U1: spawned through the library for usrp:w1700k:<name>, joined by a second open, gone after its linger", W1700kSpawnedThroughLibrary);
         Run("Pluto P2: the command line - --iiod, its refusals, and the library's spawn line", PlutoCommandLine);
         Run("Pluto P2: the open - SafeIdle first, the sidecar's rate, the board's own caps (B9, B10)", PlutoOpen);
         Run("Pluto P2: found by its serial - a stale address re-found, another board never written (B6)", PlutoFind);

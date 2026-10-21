@@ -968,7 +968,7 @@ internal static partial class Program
             using var s = UsrpSession.Open(UsrpAddress.Remote("127.0.0.1", port), new UsrpSessionOptions { ClientName = "spawned" });
             Check(s.WaitReady(10000) == RadioStates.Ready && s.Radio.Source == RadioSources.W1700k && s.Radio.Serial == "w1700k-spawned",
                   "joined as usrp://127.0.0.1:<port>: a W1700K, ready");
-            Check(!File.Exists(Rendezvous.PathFor("w1700k-spawned")), "it published no rendezvous file: only its address reaches it");
+            Check(File.Exists(Rendezvous.PathFor("w1700k-spawned")), "a hand-run one publishes its rendezvous file too (usrp:w1700k:spawned joins it)");
             s.ClaimLo();
             using var pano = s.OpenPanorama(new PanoramaRequest { Bins = 4096, Fps = 10, Integration = IntegrationKind.Average, Window = WindowKind.Hann });
             pano.Connection.StartReader();
@@ -984,6 +984,103 @@ internal static partial class Program
                 Check(false, "the sidecar exits after its last client leaves");
                 p.Kill();
             }
+        }
+    }
+
+    /// <summary>U1: the address grammar's fourth family.</summary>
+    private static void W1700kAddressCases()
+    {
+        var a = UsrpAddress.Parse("usrp:w1700k");
+        Check(a.Kind == UsrpAddressKind.W1700k && a.UnitName == "unit" && a.RendezvousKey == "w1700k-unit" && a.ToString() == "usrp:w1700k",
+              "usrp:w1700k is the unit named unit, keyed w1700k-unit, and spelled back the same");
+        a = UsrpAddress.Parse("usrp:w1700k:attic");
+        Check(a.Kind == UsrpAddressKind.W1700k && a.UnitName == "attic" && a.RendezvousKey == "w1700k-attic" && a.ToString() == "usrp:w1700k:attic",
+              "usrp:w1700k:attic names another");
+        Check(UsrpAddress.Parse("usrp:w1700k:unit").ToString() == "usrp:w1700k", "the default name is spelled the short way: ONE canonical spelling");
+        Check(!UsrpAddress.TryParse("usrp:w1700k:a b", out _, out string e1), "a name is the grammar's characters: " + e1);
+        Check(!UsrpAddress.TryParse("usrp:w1700k-unit", out _, out string e2) && e2.Contains("rendezvous key"),
+              "a B2xx serial may not begin like a W1700K's key: " + e2);
+        Check(UsrpAddress.Parse("usrp:3164E5A").Kind == UsrpAddressKind.Local, "a B2xx serial is still a B2xx's");
+        Check(W1700kBackend.KeyFor("unit") == "w1700k-unit", "the radio's serial IS its address's key");
+        var info = new RadioInfo { Source = RadioSources.W1700k, Serial = "w1700k-unit" };
+        Check(UsrpSession.IsSameRadio(UsrpAddress.W1700k(), info) && !UsrpSession.IsSameRadio(UsrpAddress.W1700k("attic"), info),
+              "joining asks the family AND the name");
+        Check(!UsrpSession.IsSameRadio(UsrpAddress.Iiod("w1700k-unit"), info) && !UsrpSession.IsSameRadio(UsrpAddress.Sim("unit"), info),
+              "no other family's address joins a W1700K, even one spelling its serial");
+
+        // The spawn line, read back by the sidecar's own parser.
+        var launch = new SidecarLaunch
+        {
+            W1700kBind = "127.0.0.1:7701",
+            W1700kServe = "none",
+            W1700kRates = "40e6,80e6",
+            W1700kFlatten = false,
+            W1700kRemoveDc = true,
+            WideRateHz = 80e6,
+            LingerSeconds = 3,
+            // UHD's, which a W1700K's sidecar refuses: the line must leave every one of them out.
+            UhdDirectory = @"C:\uhd",
+            FpgaPath = @"C:\fpga.bin",
+            DeviceArgs = "num_recv_frames=64",
+            AllowKnownCodecFault = true,
+        };
+        var args = SidecarLocator.Arguments(UsrpAddress.W1700k("attic"), launch, "tok");
+        Check(!args.Contains("--uhd") && !args.Contains("--fpga") && !args.Contains("--args") && !args.Contains("--allow-known-codec-fault") && !args.Contains("--serial"),
+              "the spawn line carries no UHD option and no serial: " + string.Join(" ", args));
+        var o = SidecarOptions.Parse(args.ToArray());
+        Check(o.W1700k && o.W1700kName == "attic" && o.W1700kBind.ToString() == "127.0.0.1:7701" && o.W1700kServe == null &&
+              o.W1700kRatesHz.SequenceEqual(new[] { 40e6, 80e6 }) && o.RateHz == 80e6 && !o.W1700kFlatten && o.W1700kRemoveDc &&
+              o.LingerSeconds == 3 && o.SpawnToken == "tok" && o.Address().RendezvousKey == "w1700k-attic",
+              "...and the sidecar reads it back as written: name, export, no controller, rates, rate, flatten off, DC on, linger, token");
+        o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").ToArray());
+        Check(o.W1700k && o.W1700kServe == W1700kServe.DefaultCommand && o.W1700kBind.ToString() == "10.77.0.10:7700" && o.W1700kFlatten && o.W1700kRemoveDc,
+              "an empty launch profile passes nothing: the sidecar's defaults, never ones invented by the spawner");
+    }
+
+    /// <summary>U1: ShackLink's way in - the library spawns the sidecar for usrp:w1700k:&lt;name&gt;, and a second open JOINS it.</summary>
+    private static void W1700kSpawnedThroughLibrary()
+    {
+        int udp = FreeUdpPort();
+        var export = new FakeExport(new IPEndPoint(IPAddress.Loopback, udp), W1700kScene, 2_442_000_000, 40e6) { Running = true };
+        string name = "gate" + Environment.ProcessId;
+        var opts = new UsrpSessionOptions
+        {
+            ClientName = "w1700k-spawner",
+            SidecarExe = SidecarExe(),
+            Launch = new SidecarLaunch
+            {
+                W1700kServe = "none",
+                W1700kBind = $"127.0.0.1:{udp}",
+                LingerSeconds = 1,
+                ExtraArgs = new[] { "--state-dir", Rendezvous.Root },
+            },
+        };
+        UsrpSession? a = null, b = null;
+        try
+        {
+            a = UsrpSession.Open(UsrpAddress.W1700k(name), opts);
+            b = UsrpSession.Open(UsrpAddress.W1700k(name), new UsrpSessionOptions { ClientName = "w1700k-joiner", SidecarExe = opts.SidecarExe, Launch = opts.Launch });
+            Check(a.Spawned && !b.Spawned && a.SidecarPid == b.SidecarPid && a.SidecarPid > 0,
+                  $"usrp:w1700k:{name}: the first open spawned the sidecar, the second joined it (pid {a.SidecarPid})");
+            Check(a.WaitReady(10000) == RadioStates.Ready && a.Radio.Source == RadioSources.W1700k && a.Radio.Serial == "w1700k-" + name,
+                  "the spawned radio is a W1700K, ready, its serial its key");
+            Check(File.Exists(Rendezvous.PathFor("w1700k-" + name)), "its rendezvous file is under the grammar's key");
+            a.ClaimLo();
+            using var pano = a.OpenPanorama(new PanoramaRequest { Bins = 4096, Fps = 10, Integration = IntegrationKind.Average, Window = WindowKind.Hann });
+            pano.Connection.StartReader();
+            var rows = RowsFor(pano, 1500);
+            Check(rows.Count >= 2 && Math.Abs(LevelAt(rows[^1].h, rows[^1].bins, 2_450_000_000, 40e6) + 10) < 1,
+                  "the launch profile reached it: the export on the profile's address, no controller, the tone at -10 dBFS");
+        }
+        finally
+        {
+            int pid = a?.SidecarPid ?? 0;
+            b?.Dispose();
+            a?.Dispose();
+            export.Dispose();
+            if (pid > 0)
+                Check(WaitFor(() => { try { return Process.GetProcessById(pid).HasExited; } catch (ArgumentException) { return true; } }, 8000),
+                      "with its last client gone, the spawned sidecar exits (1 s linger)");
         }
     }
 

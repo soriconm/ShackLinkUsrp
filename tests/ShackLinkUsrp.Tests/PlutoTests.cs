@@ -930,10 +930,8 @@ internal static partial class Program
         Check(lo > 0 && flush > lo && Regex.Matches(src, @"\bRequestFlush\(\)").Count == 2,
               "in ApplyTuning, RequestFlush comes AFTER the RX LO write - and nothing else asks for a re-open (its declaration and that one call)");
         string program = File.ReadAllText(Path.Combine(RepoRoot(), "src", "ShackLinkUsrp", "Program.cs"));
-        // A W1700K is outside the grammar (reached by its address alone): its key has ONE owner too, W1700kBackend.KeyFor, which is its serial.
-        Check(program.Contains("string key = opt.W1700k ? W1700kBackend.KeyFor(opt.W1700kName) : opt.Address().RendezvousKey!;") &&
-              !program.Contains("\"sim-\" + opt.SimName") && !program.Contains("\"w1700k-\""),
-              "the sidecar takes its rendezvous key from the address grammar (a W1700K's from W1700kBackend.KeyFor), never spelled a second time");
+        Check(program.Contains("string key = opt.Address().RendezvousKey!;") && !program.Contains("\"sim-\" + opt.SimName") && !program.Contains("\"w1700k-\""),
+              "the sidecar takes its rendezvous key from the address grammar, never spelled a second time (a W1700K's too)");
     }
 
     private static int FreePort()

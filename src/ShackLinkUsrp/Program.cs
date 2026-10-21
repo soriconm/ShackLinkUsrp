@@ -45,9 +45,8 @@ internal static class Program
 
     private static int RunServer(SidecarOptions opt)
     {
-        // The rendezvous key is the address grammar's (one owner): sim-<name>, iiod-<hw_serial> or the B2xx serial. A W1700K is
-        // reached as a running sidecar (usrp://host:port), which the grammar gives no key: its log is keyed w1700k-<name>.
-        string key = opt.W1700k ? W1700kBackend.KeyFor(opt.W1700kName) : opt.Address().RendezvousKey!;
+        // The rendezvous key is the address grammar's (one owner): sim-<name>, iiod-<hw_serial>, w1700k-<name> or the B2xx serial.
+        string key = opt.Address().RendezvousKey!;
         if (opt.StateDirectory != null) Rendezvous.RootOverride = opt.StateDirectory;
         using var log = new SidecarLog(Rendezvous.LogPathFor(key), console: opt.Console);
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
@@ -146,8 +145,7 @@ internal static class Program
             Exe = Environment.ProcessPath ?? "",
         };
         bool published = false;
-        // A W1700K is joined by its address only (usrp://host:port): no client finds it by a key, so nothing is published.
-        if (!opt.W1700k && (opt.Listen.Equals(IPAddress.Loopback) || opt.Listen.Equals(IPAddress.Any)))
+        if (opt.Listen.Equals(IPAddress.Loopback) || opt.Listen.Equals(IPAddress.Any))
         {
             try
             {
@@ -503,8 +501,14 @@ internal sealed class SidecarOptions
             if (!o.LoSet) o.LoHz = 2_442_000_000;
             if (!o.W1700kRatesHz.Contains(o.RateHz))
                 throw new ArgumentException($"--rate {o.RateHz.ToString("0", CultureInfo.InvariantCulture)} is not one of --w1700k-rates ({string.Join(", ", o.W1700kRatesHz.Select(r => r.ToString("0", CultureInfo.InvariantCulture)))})");
-            if (o.W1700kName.Length == 0 || o.W1700kName.Length > 48 || !o.W1700kName.All(c => char.IsAsciiLetterOrDigit(c) || c == '.' || c == '_' || c == '-'))
-                throw new ArgumentException($"--w1700k-name is letters, digits, '.', '_' or '-' (1-48 of them), not \"{o.W1700kName}\"");
+            try
+            {
+                o.Address();
+            }
+            catch (FormatException ex)
+            {
+                throw new ArgumentException("--w1700k-name: " + ex.Message);
+            }
             return o;
         }
         if (!o.Help && !o.List)
@@ -554,7 +558,7 @@ internal sealed class SidecarOptions
 
     /// <summary>The radio this command line names, in the address grammar - the ONE spelling of its rendezvous key.</summary>
     public UsrpAddress Address() =>
-        Sim ? UsrpAddress.Sim(SimName) : Iiod != null ? UsrpAddress.Iiod(Serial!) : UsrpAddress.Local(Serial!);
+        W1700k ? UsrpAddress.W1700k(W1700kName) : Sim ? UsrpAddress.Sim(SimName) : Iiod != null ? UsrpAddress.Iiod(Serial!) : UsrpAddress.Local(Serial!);
 
     /// <summary>The unit's sample rates (upstream <c>host/w1700k/radio.py</c> SAMPLE_RATES); band 2's 640/2 is not offered.</summary>
     public static readonly double[] W1700kRates = { 40e6, 80e6, 160e6, 320e6 };
