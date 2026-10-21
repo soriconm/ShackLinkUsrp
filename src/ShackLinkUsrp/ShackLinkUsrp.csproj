@@ -18,4 +18,44 @@
     <ProjectReference Include="..\ShackLinkUsrp.Uhd\ShackLinkUsrp.Uhd.csproj" />
     <ProjectReference Include="..\ShackLinkUsrp.Dsp\ShackLinkUsrp.Dsp.csproj" />
   </ItemGroup>
+  <!-- A DEVELOPMENT sidecar's W1700K controller. The default controller is ..\W1700K\w1700k.exe beside this program's
+       folder (ShackLinkUsrp.Client.W1700kDefaults.ControllerPathFor): the installer puts it there ({app}\Server\W1700K\,
+       ShackLink.iss gate 6) and a build folder has none, so every W1700K slot run from bin\ was refused as "not installed"
+       (2026-10-21). When the sibling repository's PyInstaller folder exists, it is copied there after each build, unchanged
+       files skipped; when it does not, the build WARNS, because skipping in silence is how the slot came to be refused. A
+       warning, never an error: a sidecar without a W1700K is still a sidecar. A copy built from uncommitted controller code
+       (buildinfo.json "app_dirty": true) is staged and said. A file that build dropped is not removed here. A controller held
+       open by a running sidecar is a warning, never a failed build. Override with -p:W1700kControllerDist=... -->
+  <PropertyGroup>
+    <W1700kControllerDist Condition="'$(W1700kControllerDist)' == ''">$(MSBuildThisFileDirectory)..\..\..\SDRW1700K\app\dist\W1700K\</W1700kControllerDist>
+  </PropertyGroup>
+  <!-- OutDir is set by the SDK's targets, imported AFTER this body, so the stage is resolved inside a target. -->
+  <Target Name="ResolveW1700kControllerStage">
+    <PropertyGroup>
+      <W1700kControllerDistFull>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(W1700kControllerDist)'))</W1700kControllerDistFull>
+      <W1700kControllerStage>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(OutDir)', '..', 'W1700K'))</W1700kControllerStage>
+    </PropertyGroup>
+  </Target>
+  <Target Name="StageW1700kController" AfterTargets="Build" DependsOnTargets="ResolveW1700kControllerStage"
+          Condition="Exists('$(W1700kControllerDist)w1700k.exe')">
+    <PropertyGroup>
+      <W1700kControllerDirty Condition="Exists('$(W1700kControllerDistFull)buildinfo.json')">$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(W1700kControllerDistFull)buildinfo.json')), '"app_dirty"\s*:\s*true'))</W1700kControllerDirty>
+    </PropertyGroup>
+    <ItemGroup>
+      <W1700kControllerFile Include="$(W1700kControllerDist)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(W1700kControllerFile)"
+          DestinationFiles="@(W1700kControllerFile->'$(W1700kControllerStage)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" ContinueOnError="WarnAndContinue" />
+    <Message Importance="high" Text="W1700K controller staged beside the sidecar: $(W1700kControllerStage)" />
+    <Warning Condition="'$(W1700kControllerDirty)' == 'True'" Code="W1700K002"
+             Text="The W1700K controller staged beside the sidecar was built from UNCOMMITTED controller code (&quot;app_dirty&quot;: true in $(W1700kControllerDistFull)buildinfo.json). Fine to test with; not a build to ship, and the installer takes the same folder." />
+  </Target>
+  <Target Name="WarnW1700kControllerAbsent" AfterTargets="Build" DependsOnTargets="ResolveW1700kControllerStage"
+          Condition="!Exists('$(W1700kControllerDist)w1700k.exe')">
+    <Warning Condition="!Exists('$(W1700kControllerStage)w1700k.exe')" Code="W1700K001"
+             Text="No W1700K controller to stage beside the sidecar: there is no w1700k.exe in $(W1700kControllerDistFull), and none in $(W1700kControllerStage). A W1700K slot run from this build is refused as not installed. Build the controller in C:\Dev\SDRW1700K (app\.venv\Scripts\python app\build.py), or pass -p:W1700kControllerDist=&lt;its folder&gt;." />
+    <Warning Condition="Exists('$(W1700kControllerStage)w1700k.exe')" Code="W1700K001"
+             Text="No W1700K controller to stage beside the sidecar: there is no w1700k.exe in $(W1700kControllerDistFull). The copy already in $(W1700kControllerStage) is left as it was and may be stale. Build the controller in C:\Dev\SDRW1700K (app\.venv\Scripts\python app\build.py), or pass -p:W1700kControllerDist=&lt;its folder&gt;." />
+  </Target>
 </Project>

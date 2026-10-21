@@ -34,6 +34,10 @@ internal static partial class Program
         if (args.Length > 0 && args[0] == "--live") return LiveRun(args);
         if (args.Length > 1 && args[0] == "--w1700k-replay") return W1700kReplay(args);
         if (args.Length > 1 && args[0] == "--w1700k-probe") return W1700kProbe(args);
+        // P0 of ShackLink docs/skimmer_support.md section 26 (BandChannelProbe.cs): instruments, never gates.
+        if (args.Length > 0 && args[0] == "--fir-response") return FirResponse(args);
+        if (args.Length > 0 && args[0] == "--fir-scaling") return FirScaling(args);
+        if (args.Length > 1 && args[0] == "--lease-cost") return LeaseCost(args);
         // --only <text>: run the cases whose name contains it (a way to iterate, never how the gate is run).
         if (args.Length > 1 && args[0] == "--only") _only = args[1];
         var sw = Stopwatch.StartNew();
@@ -44,6 +48,11 @@ internal static partial class Program
         Run("spectrum levels", SpectrumLevelCases);
         Run("decimating FIR", FirCases);
         Run("NCO", NcoCases);
+        Run("26.14: the vectorised NCO against the exact phasor", NcoVectorCases);
+        Run("26.14: the two-stage lease filter against a reference decimator", LeaseFilterReferenceCases);
+        Run("26.14: the two-stage filter keeps the single stage's timing", LeaseFilterTimingCases);
+        Run("26.14: the lease's clean fraction (ProtocolConstants.LeaseCleanFraction), on the design and on the running filter", LeaseFilterCleanFractionCases);
+        Run("26.14: a lease filters through the cascade, pinned in the source", LeaseFilterSourceRules);
         Run("in process: a lease on the synthetic radio", InProcessLease);
         Run("in process: panorama, sweep, retune, rate change", InProcessPanorama);
         Run("A2 F1: a pipeline created inside a change's settle starts at its boundary", RaceNewPipelinesStartAtTheBoundary);
@@ -212,6 +221,39 @@ internal static partial class Program
         Thread.Sleep(50);
         ring.Write(new short[1000]);
         Check(waiter.Wait(1000) && waiter.Result, "a waiter wakes when the data it waits for is written");
+
+        // Section 26.14: a waiter is woken by the write that reaches ITS position - promptly, never by its timeout - and
+        // twelve waiters at twelve positions each come back after their own write, not before.
+        var wide = new WideRing(1 << 16);
+        var targets = Enumerable.Range(1, 12).Select(i => (long)i * 4096).ToArray();
+        var woke = new long[targets.Length];
+        var sw = Stopwatch.StartNew();
+        var waiters = targets.Select((t, i) => Task.Factory.StartNew(() =>
+        {
+            bool ok = wide.WaitFor(t, 5000);
+            woke[i] = ok ? sw.ElapsedTicks : -1;
+        }, TaskCreationOptions.LongRunning)).ToArray();
+        Thread.Sleep(100);
+        var writtenAt = new long[targets.Length];
+        var slice = new short[2 * 2048];
+        int reached = 0;
+        for (long pos = 0; pos < targets[^1]; pos += 2048)
+        {
+            wide.Write(slice);
+            while (reached < targets.Length && wide.Written >= targets[reached]) writtenAt[reached++] = sw.ElapsedTicks;
+            Thread.Sleep(5);
+        }
+        Check(Task.WaitAll(waiters, 5000), "twelve waiters at twelve positions all return");
+        double ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+        var late = Enumerable.Range(0, targets.Length).Select(i => ms(woke[i] - writtenAt[i])).ToArray();
+        bool early = Enumerable.Range(0, targets.Length).Any(i => woke[i] < 0 || woke[i] < writtenAt[i] - Stopwatch.Frequency / 1000);
+        Check(!early && late.Max() < 50,
+              $"...each after the write that reached it and within {late.Max():0.0} ms of it (a lost wake would sit out the 5 s timeout)");
+        var stuck = Task.Factory.StartNew(() => wide.WaitFor(long.MaxValue, 5000), TaskCreationOptions.LongRunning);
+        Thread.Sleep(50);
+        var t0 = Stopwatch.StartNew();
+        wide.WakeAll();
+        Check(stuck.Wait(1000) && !stuck.Result && t0.ElapsedMilliseconds < 1000, "WakeAll wakes a waiter whose data will never come, which then reports it did not arrive");
     }
 
     private static void FftCases()

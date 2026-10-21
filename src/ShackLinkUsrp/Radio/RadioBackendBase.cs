@@ -1203,7 +1203,8 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         foreach (var lp in _sides.SelectMany(s => s.Snapshot()).Select(LeaseOf).Where(p => p != null).Distinct())
             pipelines.Add(new JsonObject().Set("kind", "lease").Set("sides", lp!.Sides).Set("center_hz", lp.CenterHz).Set("rate_hz", lp.RateHz)
                 .Set("blocks", Interlocked.Read(ref lp.BlocksPosted)).Set("samples", Interlocked.Read(ref lp.SamplesProduced))
-                .Set("wide_missed", Interlocked.Read(ref lp.WideSamplesMissed)));
+                .Set("wide_missed", Interlocked.Read(ref lp.WideSamplesMissed))
+                .Set("halfbands", lp.FilterPlan.Halfbands.Count).Set("filter_lead", lp.FilterPlan.LeadSamples));
         return new JsonObject()
             .Set("ring_written", Ring.Written)
             .Set("ring_capacity", Ring.Capacity)

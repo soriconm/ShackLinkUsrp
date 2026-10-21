@@ -7,10 +7,21 @@ using ShackLinkUsrp.Wire;
 
 namespace ShackLinkUsrp.Radio;
 
-/// <summary>A request <c>w1700k serve</c> answered <c>ok:false</c>: its words, as the unit's controller gave them.</summary>
+/// <summary>A request <c>w1700k serve</c> answered <c>ok:false</c>: its words, as the unit's controller gave them, and its stable
+/// <c>reason</c> where it has one (sdrw1700k-cb, 5a88a04: <c>rate_exceeds_link</c>, <c>router_busy</c>, <c>host_key_untrusted</c>).</summary>
 internal sealed class W1700kServeException : Exception
 {
-    public W1700kServeException(string message) : base(message) { }
+    public W1700kServeException(string message, string reason = "") : base(message) => Reason = reason ?? "";
+
+    /// <summary>"" = the controller gave none (any other refusal, or a build from before 5a88a04).</summary>
+    public string Reason { get; }
+
+    /// <summary>
+    /// The refusal as this sidecar says it, at open and to a request alike: the reason IN BRACKETS before the controller's words,
+    /// <c>the unit refused (rate_exceeds_link): ...</c>. A host classifies a fault by its text (ShackLink's
+    /// <c>UsrpKind.PermanentPhrases</c>), so the bracketed token is the stable part and the words are the operator's.
+    /// </summary>
+    public string Said => Reason.Length > 0 ? $"the unit refused ({Reason}): {Message}" : "the unit refused: " + Message;
 }
 
 /// <summary>
@@ -47,8 +58,10 @@ internal sealed class W1700kServe : IDisposable
         _log = log;
     }
 
-    /// <summary>The default: upstream's checkout in WSL, as it was built and installed (C:\Dev\SDRW1700K docs/05 option 2).</summary>
-    public const string DefaultCommand = "wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd ~/w1700k-sdr && exec host/bin/w1700k serve\"";
+    /// <summary>The default: the bundled <c>w1700k.exe</c> beside this executable (C:\Dev\SDRW1700K docs/07; the WSL checkout was the
+    /// default until 2026-10-21). Its ONE owner is the protocol library, which a host reads to judge or say an empty launch profile
+    /// (ShackLink Device Setup).</summary>
+    public static string DefaultCommand => ShackLinkUsrp.Client.W1700kDefaults.ServeCommandIn(AppContext.BaseDirectory);
 
     /// <summary>Start <paramref name="commandLine"/> (its first word the program, the rest its arguments, as a shell would
     /// split them) with its standard streams redirected. Its stderr is the sidecar's log.</summary>
@@ -66,7 +79,17 @@ internal sealed class W1700kServe : IDisposable
             StandardErrorEncoding = new UTF8Encoding(false),
             StandardInputEncoding = new UTF8Encoding(false),
         };
-        var p = Process.Start(psi) ?? throw new InvalidOperationException($"\"{commandLine}\" did not start");
+        Process p;
+        try
+        {
+            p = Process.Start(psi) ?? throw new InvalidOperationException($"\"{commandLine}\" did not start");
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 2 || ex.NativeErrorCode == 3)
+        {
+            // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND. .NET's own sentence names the working directory, which the operator did
+            // not choose and which is not where the controller was looked for.
+            throw new FileNotFoundException(NotInstalled(exe, AppContext.BaseDirectory), exe, ex);
+        }
         p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) log("serve stderr: " + e.Data); };
         p.BeginErrorReadLine();
         p.StandardInput.AutoFlush = true;
@@ -84,19 +107,28 @@ internal sealed class W1700kServe : IDisposable
         }, log);
     }
 
-    /// <summary>The first word of <paramref name="commandLine"/> (quoted or not) and the rest, verbatim.</summary>
+    /// <summary>The sentence a controller that is not there is refused with. ShackLink never retries it
+    /// (<c>UsrpKind.PermanentPhrases</c>: <c>w1700k controller is not installed</c>) and adds where to set another one, so a change
+    /// to its first clause is a change there. The bundled default is said as such: a sidecar run from a build folder has no
+    /// <c>..\W1700K\</c> beside it unless one was put there.</summary>
+    internal static string NotInstalled(string exe, string helperDirectory)
+    {
+        string bundled = ShackLinkUsrp.Client.W1700kDefaults.ControllerPathFor(helperDirectory);
+        bool isBundled;
+        try { isBundled = string.Equals(Path.GetFullPath(exe), bundled, StringComparison.OrdinalIgnoreCase); }
+        catch (Exception) { isBundled = false; }
+        return isBundled
+            ? $"the W1700K controller is not installed: there is no {Path.GetFileName(bundled)} in {Path.GetDirectoryName(bundled)}, " +
+              "where the bundled controller goes (a sibling of this helper's folder)"
+            : $"the W1700K controller is not installed: {exe} was not found";
+    }
+
+    /// <summary>The first word of <paramref name="commandLine"/> (quoted or not) and the rest, verbatim: the protocol library's
+    /// split, so a host judging a controller splits it as this one starts it.</summary>
     internal static (string Exe, string Args) SplitCommand(string commandLine)
     {
-        string s = (commandLine ?? "").Trim();
-        if (s.Length == 0) throw new ArgumentException("an empty serve command");
-        if (s[0] == '"')
-        {
-            int close = s.IndexOf('"', 1);
-            if (close < 0) throw new ArgumentException($"an unclosed quote in the serve command: {s}");
-            return (s.Substring(1, close - 1), s.Substring(close + 1).TrimStart());
-        }
-        int space = s.IndexOf(' ');
-        return space < 0 ? (s, "") : (s.Substring(0, space), s.Substring(space + 1).TrimStart());
+        ShackLinkUsrp.Client.W1700kDefaults.SplitCommand(commandLine, out string exe, out string args);
+        return (exe, args);
     }
 
     /// <summary>Raised on every <c>state</c> event and every reply's state, on the reader thread.</summary>
@@ -164,7 +196,8 @@ internal sealed class W1700kServe : IDisposable
         }
         var reply = tcs.Task.Result;
         if (!reply.GetBool("ok"))
-            throw new W1700kServeException(reply.GetString("error", "") is { Length: > 0 } e ? e : $"{request.GetString("op")} failed, with no reason given");
+            throw new W1700kServeException(reply.GetString("error", "") is { Length: > 0 } e ? e : $"{request.GetString("op")} failed, with no reason given",
+                                           reply.GetString("reason", "") ?? "");
         return reply.GetObject("state") ?? State ?? new JsonObject();
     }
 

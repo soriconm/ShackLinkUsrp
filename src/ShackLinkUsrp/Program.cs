@@ -238,9 +238,13 @@ internal sealed class SidecarOptions
         "                              --lo default 2442e6). Serve with --port and --persist, and join it from ShackLink as usrp://127.0.0.1:<port>\n" +
         "  --w1700k-name <name>        the radio's name in its serial (w1700k-<name>) and its log (default unit)\n" +
         "  --w1700k-bind <ip:port>     where the export arrives (default 10.77.0.10:7700, the unit's fixed destination)\n" +
-        "  --w1700k-serve <cmd|none>   upstream's controller, spoken to as JSON lines (default: w1700k serve in WSL's Ubuntu-24.04, ~/w1700k-sdr);\n" +
+        "  --w1700k-serve <cmd|none>   upstream's controller, spoken to as JSON lines (default: the bundled w1700k.exe beside this program, serve;\n" +
+        "                              a WSL checkout is wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd ~/w1700k-sdr && exec host/bin/w1700k serve\");\n" +
         "                              none = receive the stream another program drives and change nothing on the unit\n" +
-        "  --w1700k-rates <S/s,...>    the wide rates offered: what the LINK carries (default 40e6, the most 2.5 GbE carries; the export never throttles)\n" +
+        "  --w1700k-config <file>      a station's own config for the controller, given to it as --config \"<file>\" before serve (default none:\n" +
+        "                              the controller's own %USERPROFILE%\\.config\\w1700k\\config.json; a second router uses a file of its own)\n" +
+        "  --w1700k-rates <S/s,...>    the wide rates offered (default every rate the unit has: 40e6,80e6,160e6,320e6; the operator picks one, and a\n" +
+        "                              rate above what the link carries is lost, since the export never throttles - 40 needs 2.5 GbE, 80 5 GbE, 320 10 GbE)\n" +
         "  --w1700k-settle-ms <ms>     samples skipped after a change, as milliseconds in flight from the unit (default 20, stated, not measured)\n" +
         "  --w1700k-flatten on|off     correct the decimation's roll-off at the band's edges, in the samples (default on; the setting flatten)\n" +
         "  --w1700k-dc on|off          take the LO's leak out of the centre (default on; the setting dc_removal)\n" +
@@ -322,12 +326,14 @@ internal sealed class SidecarOptions
     public bool RateSet, LoSet;
     public bool W1700k;
     public string W1700kName = "unit";
-    public IPEndPoint W1700kBind = new(IPAddress.Parse("10.77.0.10"), 7700);
+    public IPEndPoint W1700kBind = ShackLinkUsrp.Client.W1700kDefaults.BindEndPoint();
     public bool W1700kBindSet;
     /// <summary>Null = none: no controller.</summary>
     public string? W1700kServe = ShackLinkUsrp.Radio.W1700kServe.DefaultCommand;
     public bool W1700kServeSet;
-    public double[] W1700kRatesHz = { 40e6 };
+    /// <summary>A station's own config file for the controller ("" = the controller's default folder), put before its subcommand.</summary>
+    public string W1700kConfig = "";
+    public double[] W1700kRatesHz = ShackLinkUsrp.Client.W1700kDefaults.UnitRatesHz();
     public bool W1700kRatesSet;
     public int W1700kSettleMs = 20;
     public bool W1700kSettleSet;
@@ -441,6 +447,13 @@ internal sealed class SidecarOptions
                         o.W1700kServeSet = true;
                         break;
                     }
+                case "--w1700k-config":
+                    {
+                        string v = Next().Trim();
+                        if (v.Length == 0) throw new ArgumentException("--w1700k-config needs a file");
+                        o.W1700kConfig = v;
+                        break;
+                    }
                 case "--w1700k-rates":
                     {
                         string v = Next();
@@ -481,7 +494,8 @@ internal sealed class SidecarOptions
             }
         }
         if (o.JsonPath != null && !o.List) throw new ArgumentException("--json <file> goes with --list");
-        bool w1700kOption = o.W1700kBindSet || o.W1700kServeSet || o.W1700kRatesSet || o.W1700kSettleSet || o.W1700kConditionSet || o.W1700kName != "unit";
+        bool w1700kOption = o.W1700kBindSet || o.W1700kServeSet || o.W1700kRatesSet || o.W1700kSettleSet || o.W1700kConditionSet || o.W1700kName != "unit" ||
+                           o.W1700kConfig.Length > 0;
         if (w1700kOption && !o.W1700k) throw new ArgumentException("the --w1700k-... options go with --w1700k");
         if (o.W1700k && !o.Help && !o.List)
         {
@@ -497,6 +511,14 @@ internal sealed class SidecarOptions
             if (o.DcOffsetHz != 0) uhdOnly.Add("--dc-offset");
             if (uhdOnly.Count > 0)
                 throw new ArgumentException($"{string.Join(", ", uhdOnly)} {(uhdOnly.Count == 1 ? "is a" : "are")} UHD option{(uhdOnly.Count == 1 ? "" : "s")}; a W1700K (--w1700k) loads no UHD");
+            if (o.W1700kConfig.Length > 0)
+            {
+                // The ONE placement of --config is the protocol library's; refused in words where it has no place.
+                string why = ShackLinkUsrp.Client.W1700kDefaults.WithConfig(o.W1700kServe ?? ShackLinkUsrp.Client.W1700kDefaults.NoController,
+                                                                            o.W1700kConfig, out string composed);
+                if (why.Length > 0) throw new ArgumentException("--w1700k-config: " + why);
+                o.W1700kServe = composed;
+            }
             if (!o.RateSet) o.RateHz = o.W1700kRatesHz[0];
             if (!o.LoSet) o.LoHz = 2_442_000_000;
             if (!o.W1700kRatesHz.Contains(o.RateHz))
@@ -561,7 +583,7 @@ internal sealed class SidecarOptions
         W1700k ? UsrpAddress.W1700k(W1700kName) : Sim ? UsrpAddress.Sim(SimName) : Iiod != null ? UsrpAddress.Iiod(Serial!) : UsrpAddress.Local(Serial!);
 
     /// <summary>The unit's sample rates (upstream <c>host/w1700k/radio.py</c> SAMPLE_RATES); band 2's 640/2 is not offered.</summary>
-    public static readonly double[] W1700kRates = { 40e6, 80e6, 160e6, 320e6 };
+    public static readonly double[] W1700kRates = ShackLinkUsrp.Client.W1700kDefaults.UnitRatesHz();
 
     private static bool OnOff(string opt, string v) => v.Trim().ToLowerInvariant() switch
     {

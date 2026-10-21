@@ -11,15 +11,34 @@ namespace ShackLinkUsrp.Dsp;
 /// than <see cref="Capacity"/> behind has been LAPPED: its read fails, and it counts the samples it
 /// missed and jumps forward - the radio is never slowed down for a consumer (an overflow in UHD is a
 /// sample the FPGA already threw away; a lap here is the same fact one stage later).
+/// <para><b>A waiter is woken when ITS position is reached, not on every write</b> (ShackLink docs/skimmer_support.md
+/// section 26.14): each registers the position it waits for and its own event, and the writer sets only the events whose
+/// position it has passed. A PulseAll on every write woke every waiting lease about four times per chunk, three of them
+/// for nothing, and with eight leases that waking cost more than their arithmetic.</para>
 /// </summary>
 public sealed class WideRing
 {
     private readonly short[] _buf;
     private readonly int _capacity;
     private readonly int _mask;
-    private readonly object _signal = new();
     private long _written;
     private int _waiters;
+    // The waiters, one slot each, claimed by compare-and-swap: no lock and no allocation on either side, and the writer
+    // (the radio's own thread, which must never block) scans the slots up to the highest ever claimed.
+    private const int WaiterSlots = 256;
+    private readonly Waiter?[] _slots = new Waiter?[WaiterSlots];
+    private int _slotsUsed;
+    // Moved by WakeAll: a waiter that sees it move returns (a pipeline being stopped does not sit out its timeout).
+    private int _wakeAllGen;
+
+    private sealed class Waiter
+    {
+        public long Target;
+        public readonly ManualResetEventSlim Event = new(false, spinCount: 1);
+    }
+
+    // A thread waits on one ring at a time (WaitFor blocks), so one waiter object per thread serves every ring.
+    [ThreadStatic] private static Waiter? _mine;
 
     /// <param name="capacitySamples">Rounded up to a power of two.</param>
     public WideRing(int capacitySamples)
@@ -59,35 +78,75 @@ public sealed class WideRing
         // of this store (x86 reorders a store after a later load), or a consumer that registered as a
         // waiter between the two could sleep through the data it is waiting for.
         Interlocked.Exchange(ref _written, w + n);
-        if (Volatile.Read(ref _waiters) > 0)
-            lock (_signal) Monitor.PulseAll(_signal);
+        if (Volatile.Read(ref _waiters) > 0) WakeReached(w + n);
+    }
+
+    // Set the event of every waiter whose position has been written. The waiter's side of the ordering is in WaitFor.
+    private void WakeReached(long written)
+    {
+        int used = Volatile.Read(ref _slotsUsed);
+        for (int i = 0; i < used; i++)
+        {
+            var r = Volatile.Read(ref _slots[i]);
+            if (r != null && Volatile.Read(ref r.Target) <= written) r.Event.Set();
+        }
     }
 
     /// <summary>Block until <see cref="Written"/> reaches <paramref name="position"/>. False on timeout.</summary>
     public bool WaitFor(long position, int timeoutMs)
     {
         if (Written >= position) return true;
+        int gen = Volatile.Read(ref _wakeAllGen);
+        var me = _mine ??= new Waiter();
+        me.Event.Reset();
+        Volatile.Write(ref me.Target, position);
+        // Claim a slot (a full fence), THEN read Written: the writer stores Written, fences, then reads the slots - so
+        // either it sees this waiter or this waiter sees its write.
+        int slot = -1;
+        for (int i = 0; i < WaiterSlots; i++)
+            if (Interlocked.CompareExchange(ref _slots[i], me, null) == null) { slot = i; break; }
+        if (slot < 0) return PollFor(position, timeoutMs);
+        int used;
+        while ((used = Volatile.Read(ref _slotsUsed)) <= slot && Interlocked.CompareExchange(ref _slotsUsed, slot + 1, used) != used) { }
         Interlocked.Increment(ref _waiters);
         try
         {
-            lock (_signal)
+            long deadline = Environment.TickCount64 + timeoutMs;
+            while (Written < position)
             {
-                while (Written < position)
-                    if (!Monitor.Wait(_signal, timeoutMs))
-                        return Written >= position;
+                long left = deadline - Environment.TickCount64;
+                if (left <= 0 || !me.Event.Wait((int)left)) return Written >= position;
+                me.Event.Reset();
+                if (Volatile.Read(ref _wakeAllGen) != gen) return Written >= position;
             }
             return true;
         }
         finally
         {
+            Volatile.Write(ref _slots[slot], null);
             Interlocked.Decrement(ref _waiters);
         }
     }
 
-    /// <summary>Wake every waiter (a pipeline being stopped should not sit out its timeout).</summary>
+    // Every slot taken (more waiters than any client set has needed): wait by looking, correct and slower.
+    private bool PollFor(long position, int timeoutMs)
+    {
+        long deadline = Environment.TickCount64 + timeoutMs;
+        while (Written < position)
+        {
+            if (Environment.TickCount64 >= deadline) return false;
+            Thread.Sleep(1);
+        }
+        return true;
+    }
+
+    /// <summary>Wake every waiter, and make it RETURN - true if its data is there, false if not - so a pipeline being
+    /// stopped does not sit out its timeout. A waiter that was not being stopped simply waits again.</summary>
     public void WakeAll()
     {
-        lock (_signal) Monitor.PulseAll(_signal);
+        Interlocked.Increment(ref _wakeAllGen);
+        int used = Volatile.Read(ref _slotsUsed);
+        for (int i = 0; i < used; i++) Volatile.Read(ref _slots[i])?.Event.Set();
     }
 
     /// <summary>Copy <paramref name="count"/> samples starting at <paramref name="position"/>
@@ -117,8 +176,7 @@ public sealed class WideRing
     {
         if (position <= Volatile.Read(ref _written)) return;
         Interlocked.Exchange(ref _written, position);
-        if (Volatile.Read(ref _waiters) > 0)
-            lock (_signal) Monitor.PulseAll(_signal);
+        if (Volatile.Read(ref _waiters) > 0) WakeReached(position);
     }
 
     /// <summary>The oldest position still readable.</summary>

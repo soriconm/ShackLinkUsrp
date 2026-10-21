@@ -241,6 +241,8 @@ internal static partial class Program
         public string? Error;
         public string? AttachError;
         public int Attaches;
+        /// <summary>The controller refuses every request of this op up front, with these words and this <c>reason</c>.</summary>
+        public (string Op, string Error, string? Reason)? Refuse;
 
         public FakeUnit(FakeExport export, bool loaded = true, bool running = false)
         {
@@ -321,14 +323,25 @@ internal static partial class Program
                 string op = r.GetString("op") ?? "";
                 long id = r.GetLong("id");
                 Event(op switch { "configure" => "configuring", "start" => "starting", "stop" => "stopping", "load" => "loading", _ => null });
-                string? err = null;
-                try { Do(op, r); }
-                catch (Exception ex) { err = ex.Message; }
+                string? err = null, reason = null;
+                // A refusal the controller gives up front (5a88a04): nothing is done on the unit, and the reply carries its reason.
+                if (Refuse is { } refuse && refuse.Op == op)
+                {
+                    err = refuse.Error;
+                    reason = refuse.Reason;
+                }
+                else
+                {
+                    try { Do(op, r); }
+                    catch (Exception ex) { err = ex.Message; }
+                }
                 lock (_lock) Error = err;
                 Event();
-                Send(err == null
+                var reply = err == null
                     ? new JsonObject().Set("id", id).Set("ok", true).Set("state", State())
-                    : new JsonObject().Set("id", id).Set("ok", false).Set("error", err));
+                    : new JsonObject().Set("id", id).Set("ok", false).Set("error", err);
+                if (reason != null) reply.Set("reason", reason);
+                Send(reply);
             }
         }
 
@@ -426,11 +439,12 @@ internal static partial class Program
         public readonly SidecarLog Log;
         public readonly IPEndPoint Bind;
 
-        public W1700kRig(string name, bool loaded = true, bool running = false, string? attachError = null, bool controlled = true, int silenceMs = 3000)
+        public W1700kRig(string name, bool loaded = true, bool running = false, string? attachError = null, bool controlled = true, int silenceMs = 3000,
+                         (string Op, string Error, string? Reason)? refuse = null)
         {
             Bind = new IPEndPoint(IPAddress.Loopback, FreeUdpPort());
             Export = new FakeExport(Bind, W1700kScene, 2_442_000_000, 40e6);
-            Unit = new FakeUnit(Export, loaded, running) { AttachError = attachError };
+            Unit = new FakeUnit(Export, loaded, running) { AttachError = attachError, Refuse = refuse };
             if (!controlled)
             {
                 Unit.Band = 0;
@@ -708,9 +722,9 @@ internal static partial class Program
         using var s = rig.Connect("w1700k-gate");
         Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens against the fake unit: " + s.GetState().FaultText);
         Check(s.Radio.Source == RadioSources.W1700k && s.Radio.Serial == "w1700k-gate", "hello: source w1700k, serial w1700k-<name>");
-        Check(s.Caps.WideRatesHz.SequenceEqual(new[] { 40e6 }) && s.Caps.Tx == null && s.Caps.OverflowOracle == true &&
+        Check(s.Caps.WideRatesHz.SequenceEqual(new[] { 40e6, 80e6, 160e6, 320e6 }) && s.Caps.Tx == null && s.Caps.OverflowOracle == true &&
               s.Caps.RxSides != null && s.Caps.RxSides.SequenceEqual(RxSides.OnlyA) && s.Caps.Antennas.Length == 3,
-              "caps: 40 MS/s only (the link's), no transmitter, one side, three bands as antennas, lost samples seen");
+              "caps: every rate the unit has (the operator picks; no station's link decides), no transmitter, one side, three bands as antennas, lost samples seen");
         var cfg = rig.Unit.Taken("configure");
         Check(cfg.Count == 1 && cfg[0].GetLong("band") == 0 && cfg[0].GetLong("sample_rate") == 40_000_000 && cfg[0].GetLong("lo_hz") == 2_442_000_000,
               "the open configures band 0 at 40 MS/s and 2442 MHz - the unit was at 320 MS/s, more than the link carries");
@@ -848,8 +862,8 @@ internal static partial class Program
         var filter = rig.Unit.Taken("filter");
         Check(filter.Count == 1 && filter[0].GetLong("mhz") == 40 && st.BandwidthHz == 40e6, "set_bandwidth 30 MHz: the 40 MHz filter, read back as such");
 
-        why = RefusalOf(() => s.SetRate(80e6));
-        Check(why.StartsWith(ErrorCodes.OutOfRange), "80 MS/s is not offered on this link: refused by the server: " + why);
+        why = RefusalOf(() => s.SetRate(50e6));
+        Check(why.StartsWith(ErrorCodes.OutOfRange), "50 MS/s is not a rate the unit has: refused by the server: " + why);
         why = RefusalOf(() => s.ClaimTx());
         why = why.Length == 0 ? RefusalOf(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone })) : why;
         Check(why.Length > 0, "nothing transmits: " + why);
@@ -895,6 +909,53 @@ internal static partial class Program
             s.WaitReady(10000);
             var st = s.GetState();
             Check(st.Readiness == RadioStates.Fault && st.FaultText.Contains("Connection timed out"), "a unit the controller cannot reach faults in its words: " + st.FaultText);
+        }
+
+        // The controller's stable refusals (sdrw1700k-cb 5a88a04, its words verbatim): said with the reason IN BRACKETS before them,
+        // at open and to a request alike, so a host can tell one that will not fix itself from one that may.
+        const string rateWords = "Band 0 is at 80 Msps, but Ethernet links at 2.5 Gb/s, which carries up to 40 Msps. Set sample_rate 40000000 on that band " +
+                                 "(w1700k band 0 --rate 40), or raise the limit with export.max_rate_msps.";
+        const string busyWords = "W1700K Control is driving the router at 127.0.0.2. Close it to drive the router from here.";
+        // A configure refused mid-stream has its own sentence (bafe1d8): it says nothing was changed.
+        const string midWords = "80 Msps on band 0 is more than this link carries: Ethernet links at 2.5 Gb/s, which carries up to 40 Msps. " +
+                                "Nothing was changed: the stream stays on band 0 at 40 Msps. To allow it anyway, raise export.max_rate_msps.";
+        using (var rig = new W1700kRig("cap", refuse: ("start", rateWords, "rate_exceeds_link")))
+        {
+            using var s = rig.Connect("cap");
+            s.WaitReady(10000);
+            var st = s.GetState();
+            Check(st.Readiness == RadioStates.Fault && st.FaultText == "the radio could not be opened: the unit refused (rate_exceeds_link): " + rateWords,
+                  "a start at a rate the link cannot carry faults the open, the reason in brackets, then the controller's words: " + st.FaultText);
+        }
+        using (var rig = new W1700kRig("held-by-window", refuse: ("configure", busyWords, "router_busy")))
+        {
+            using var s = rig.Connect("held-by-window");
+            s.WaitReady(10000);
+            var st = s.GetState();
+            Check(st.Readiness == RadioStates.Fault && st.FaultText.Contains("the unit refused (router_busy): W1700K Control is driving the router"),
+                  "a router another W1700K program drives: the open faults naming it: " + st.FaultText);
+            Check(rig.Unit.Taken("start").Count == 0, "...and nothing was started");
+        }
+        using (var rig = new W1700kRig("old-exe", refuse: ("start", "the link is slow", null)))
+        {
+            using var s = rig.Connect("old-exe");
+            s.WaitReady(10000);
+            Check(s.GetState().FaultText == "the radio could not be opened: the unit refused: the link is slow",
+                  "a refusal with no reason (an older controller): the words alone, nothing invented: " + s.GetState().FaultText);
+        }
+        using (var rig = new W1700kRig("mid"))
+        {
+            using var s = rig.Connect("mid");
+            Check(s.WaitReady(10000) == RadioStates.Ready, "open at 40 MS/s");
+            s.ClaimLo();
+            int configures = rig.Unit.Taken("configure").Count;
+            rig.Unit.Refuse = ("configure", midWords, "rate_exceeds_link");
+            string why = RefusalOf(() => s.SetRate(80e6));
+            var st = s.GetState();
+            Check(why == ErrorCodes.OutOfRange + ": the unit refused (rate_exceeds_link): " + midWords,
+                  "a rate change past the link mid-stream is refused to the request, in the same form: " + why);
+            Check(st.Readiness == RadioStates.Ready && st.WideRateHz == 40e6 && rig.Unit.Taken("configure").Count == configures + 1 && rig.Unit.Taken("stop").Count == 0,
+                  $"...and the radio streams on at 40 MS/s, nothing stopped (the controller refuses it up front, 5a88a04): {st.Readiness}, {st.WideRateHz}");
         }
         // The export's port held by another receiver.
         var held = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp) { ExclusiveAddressUse = true };
@@ -948,20 +1009,71 @@ internal static partial class Program
     {
         var o = SidecarOptions.Parse(new[] { "--w1700k", "--port", "5555", "--persist" });
         Check(o.W1700k && o.RateHz == 40e6 && o.LoHz == 2_442_000_000 && o.W1700kServe == W1700kServe.DefaultCommand &&
-              o.W1700kBind.ToString() == "10.77.0.10:7700" && o.W1700kRatesHz.SequenceEqual(new[] { 40e6 }),
-              "--w1700k: 40 MS/s at 2442 MHz, the export on 10.77.0.10:7700, upstream's serve in WSL");
+              o.W1700kBind.ToString() == "10.77.0.10:7700" && o.W1700kRatesHz.SequenceEqual(new[] { 40e6, 80e6, 160e6, 320e6 }),
+              "--w1700k: every rate offered, OPENING at the lowest (40 MS/s) at 2442 MHz, the export on 10.77.0.10:7700, the bundled w1700k.exe's serve");
         o = SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-serve", "none", "--w1700k-bind", "127.0.0.1:7701", "--w1700k-rates", "40e6,80e6", "--rate", "80e6", "--lo", "5.8e9" });
         Check(o.W1700kServe == null && o.W1700kBind.Port == 7701 && o.RateHz == 80e6 && o.LoHz == 5_800_000_000 && o.W1700kRatesHz.Length == 2,
               "none, another bind, two rates, the rate and LO given");
         Check(Throws(() => SidecarOptions.Parse(new[] { "--w1700k", "--sim" })), "--w1700k with --sim is refused");
         Check(Throws(() => SidecarOptions.Parse(new[] { "--sim", "--w1700k-bind", "127.0.0.1:7701" })), "a --w1700k-... option without --w1700k is refused");
-        Check(Throws(() => SidecarOptions.Parse(new[] { "--w1700k", "--rate", "80e6" })), "a rate the link is not offered is refused");
+        Check(Throws(() => SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-rates", "40e6", "--rate", "80e6" })), "a rate the profile does not offer is refused");
+        Check(SidecarOptions.Parse(new[] { "--w1700k", "--rate", "320e6" }).RateHz == 320e6, "...and with no list every rate the unit has is offered, 320 MS/s included");
         Check(Throws(() => SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-rates", "50e6" })), "a rate the unit does not have is refused");
         Check(Throws(() => SidecarOptions.Parse(new[] { "--w1700k", "--otw", "sc8" })), "a UHD option is refused");
         var (exe, args) = W1700kServe.SplitCommand(W1700kServe.DefaultCommand);
-        Check(exe == "wsl.exe" && args.StartsWith("-d Ubuntu-24.04 -- bash -lc"), "the default controller command splits as a shell would: " + exe + " | " + args);
+        Check(exe == ShackLinkUsrp.Client.W1700kDefaults.ControllerPathFor(AppContext.BaseDirectory) && args == "serve" &&
+              exe.EndsWith(@"\W1700K\w1700k.exe", StringComparison.Ordinal) &&
+              string.Equals(Path.GetDirectoryName(Path.GetDirectoryName(exe)), Path.GetDirectoryName(AppContext.BaseDirectory.TrimEnd('\\')), StringComparison.OrdinalIgnoreCase),
+              "the default controller is the bundled W1700K\\w1700k.exe in the folder BESIDE this program's, by full path, quoted: " + exe + " | " + args);
+        Check(ShackLinkUsrp.Client.W1700kDefaults.ExportIpPacketBytes == W1700kExport.HeaderBytes + W1700kExport.RawSliceBytes + 8 + 20,
+              "the IP packet a host's adapter must carry (Device Setup's jumbo check) is THIS codec's datagram, plus UDP and IPv4");
+        (exe, args) = W1700kServe.SplitCommand(ShackLinkUsrp.Client.W1700kDefaults.WslServeCommand);
+        Check(exe == "wsl.exe" && args.StartsWith("-d Ubuntu-24.04 -- bash -lc"), "the WSL form splits as a shell would: " + exe + " | " + args);
         (exe, args) = W1700kServe.SplitCommand("\"C:\\Program Files\\x\\serve.exe\" --a b");
         Check(exe == "C:\\Program Files\\x\\serve.exe" && args == "--a b", "a quoted program path");
+
+        // A controller that is not there (a dev sidecar has no ..\W1700K\ beside it): refused in words ShackLink never retries
+        // (UsrpKind.PermanentPhrases "w1700k controller is not installed"), never .NET's sentence naming the working directory.
+        // The bundled default is only WORDED here, never spawned: a gate must not start a real controller that reaches the unit.
+        string nowhere = Path.Combine(Path.GetTempPath(), "w1700k-absent-" + Guid.NewGuid().ToString("N"), "w1700k.exe");
+        string spawnWhy = "";
+        try { W1700kServe.Spawn("\"" + nowhere + "\" serve", _ => { }).Dispose(); }
+        catch (FileNotFoundException ex) { spawnWhy = ex.Message; }
+        Check(spawnWhy.ToLowerInvariant().Contains("w1700k controller is not installed") && spawnWhy.Contains(nowhere) &&
+              !spawnWhy.Contains("working directory"),
+              "a controller that is not there is refused as NOT INSTALLED, naming where it was looked for: " + spawnWhy);
+        string defaultExe = ShackLinkUsrp.Client.W1700kDefaults.ControllerPathFor(AppContext.BaseDirectory);
+        string bundledWhy = W1700kServe.NotInstalled(defaultExe, AppContext.BaseDirectory);
+        Check(bundledWhy.ToLowerInvariant().Contains("w1700k controller is not installed") && bundledWhy.Contains(Path.GetDirectoryName(defaultExe)!) &&
+              bundledWhy.Contains("bundled"),
+              "...and the bundled default is said as the bundled one, with its folder: " + bundledWhy);
+
+        // A station's own config (owner 2026-10-21, ShackLink docs/device_setup_support.md W17): --config "<file>" before serve,
+        // placed in ONE place (W1700kDefaults.WithConfig) and refused in words where it has none.
+        o = SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-config", @"C:\Stations\Attic Router\config.json" });
+        (exe, args) = W1700kServe.SplitCommand(o.W1700kServe!);
+        Check(exe == ShackLinkUsrp.Client.W1700kDefaults.ControllerPathFor(AppContext.BaseDirectory) &&
+              args == "--config \"C:\\Stations\\Attic Router\\config.json\" serve",
+              "--w1700k-config puts --config \"<file>\" before the bundled controller's serve, quoted: " + args);
+        o = SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-serve", @"C:\Py\python.exe C:\co\host\bin\w1700k serve", "--w1700k-config", @"D:\r2.json" });
+        Check(o.W1700kServe == @"C:\Py\python.exe C:\co\host\bin\w1700k --config ""D:\r2.json"" serve",
+              "...and before a Windows checkout's serve, after its script: " + o.W1700kServe);
+        Check(SidecarOptions.Parse(new[] { "--w1700k" }).W1700kServe == W1700kServe.DefaultCommand, "...and with none given nothing is added");
+        foreach (var (serve, words, what) in new[]
+                 {
+                     ("none", "no controller", "no controller"),
+                     (ShackLinkUsrp.Client.W1700kDefaults.WslServeCommand, "WSL", "a WSL controller"),
+                     (@"C:\w\w1700k.exe --config C:\a.json serve", "already names a config", "a command that already says --config"),
+                     (@"C:\w\w1700k.exe serve --verbose", "does not end with its subcommand serve", "a command not ending in serve"),
+                 })
+        {
+            string message = "";
+            try { SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-serve", serve, "--w1700k-config", @"C:\x.json" }); }
+            catch (ArgumentException ex) { message = ex.Message; }
+            Check(message.StartsWith("--w1700k-config: ", StringComparison.Ordinal) && message.Contains(words), $"--w1700k-config with {what} is refused in words: {message}");
+        }
+        Check(Throws(() => SidecarOptions.Parse(new[] { "--w1700k", "--w1700k-config", "C:\\a\"b.json" })), "a config path with a quote in it is refused");
+        Check(Throws(() => SidecarOptions.Parse(new[] { "--sim", "--w1700k-config", @"C:\x.json" })), "--w1700k-config without --w1700k is refused");
     }
 
     /// <summary>The real executable, --w1700k with no controller, fed by the fake exporter: what the command line reaches.</summary>
@@ -1056,6 +1168,9 @@ internal static partial class Program
               o.W1700kRatesHz.SequenceEqual(new[] { 40e6, 80e6 }) && o.RateHz == 80e6 && !o.W1700kFlatten && o.W1700kRemoveDc &&
               o.LingerSeconds == 3 && o.SpawnToken == "tok" && o.Address().RendezvousKey == "w1700k-attic",
               "...and the sidecar reads it back as written: name, export, no controller, rates, rate, flatten off, DC on, linger, token");
+        o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k("attic"), new SidecarLaunch { W1700kConfig = @" C:\r\attic.json " }, "t").ToArray());
+        Check(o.W1700kServe == W1700kServe.DefaultCommand.Substring(0, W1700kServe.DefaultCommand.Length - "serve".Length) + "--config \"C:\\r\\attic.json\" serve",
+              "the launch profile's config reaches the sidecar as --w1700k-config, trimmed, and its controller as --config before serve: " + o.W1700kServe);
         o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").ToArray());
         Check(o.W1700k && o.W1700kServe == W1700kServe.DefaultCommand && o.W1700kBind.ToString() == "10.77.0.10:7700" && o.W1700kFlatten && o.W1700kRemoveDc,
               "an empty launch profile passes nothing: the sidecar's defaults, never ones invented by the spawner");

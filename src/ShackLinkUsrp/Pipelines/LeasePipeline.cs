@@ -32,6 +32,9 @@ internal interface ILeaseListener
 /// <c>origin + k x D</c>, through every drop (a drop advances first_sample by exactly the samples missed).
 /// And its NCO's phase is a function of the radio position alone (anchored before every chunk), so two leases
 /// at one centre agree in PHASE at one position too - the price is that a retune's phase is not continuous.</para>
+/// <para><b>Its filter</b> is a <see cref="LeaseDecimator"/> (ShackLink docs/skimmer_support.md section 26.14): halfbands, then
+/// the shaping filter at the reduced rate. The cascade's longer group delay is taken off the front of the stream, so the
+/// timing above is exactly the single-stage filter's it replaced; only the latency grows, by the plan's lead.</para>
 /// </summary>
 internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
 {
@@ -54,6 +57,9 @@ internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
     public long CenterHz => Interlocked.Read(ref _center);
     public int Decimation { get; }
     public double RateHz { get; }
+
+    /// <summary>How this lease filters (the same plan for every lease of its decimation).</summary>
+    public LeasePlan FilterPlan => LeasePlan.For(Decimation);
 
     /// <summary>The sides it reads, in wire order: one, or both for a dual lease.</summary>
     public string[] Sides { get; }
@@ -196,11 +202,11 @@ internal sealed class LeasePipeline : ILeasePipeline, ILeaseOrigin
         var rings = _ctx.Select(c => c.Ring).ToArray();
         double fs = _ctx[0].WideRateHz;
         var ncos = new Nco[n];
-        var firs = new DecimatingFir[n];
+        var firs = new LeaseDecimator[n];
         for (int s = 0; s < n; s++)
         {
             ncos[s] = new Nco();
-            firs[s] = new DecimatingFir(Decimation);
+            firs[s] = new LeaseDecimator(FilterPlan);
         }
         int chunk = Math.Max(Decimation, ChunkMax / Decimation * Decimation);
         chunk = Math.Min(chunk, rings[0].Capacity / 4);

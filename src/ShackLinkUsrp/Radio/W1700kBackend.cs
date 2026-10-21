@@ -17,7 +17,7 @@ internal sealed class W1700kBackendOptions
     public string Name = "unit";
 
     /// <summary>Where the unit's export arrives: its FIXED destination (upstream's <c>export.dst_ip</c> and <c>port</c>).</summary>
-    public IPEndPoint Bind = new(IPAddress.Parse("10.77.0.10"), 7700);
+    public IPEndPoint Bind = ShackLinkUsrp.Client.W1700kDefaults.BindEndPoint();
 
     /// <summary>The command line of upstream's controller; null = NONE: receive the stream another program drives, change nothing.</summary>
     public string? ServeCommand = W1700kServe.DefaultCommand;
@@ -25,11 +25,14 @@ internal sealed class W1700kBackendOptions
     /// <summary>A gate's controller in place of <see cref="ServeCommand"/>'s process.</summary>
     public Func<W1700kServe>? ServeFactory;
 
-    /// <summary>The wide rates offered: what the LINK carries (40 MS/s on 2.5 GbE, 80 on 5 GbE, up to 320 on 10 GbE), never
-    /// every rate the radio has - the export does not throttle, so a rate the link cannot carry is lost wholesale.</summary>
-    public double[] RatesHz = { 40e6 };
+    /// <summary>The wide rates offered: by default every rate the unit has (<see cref="ShackLinkUsrp.Client.W1700kDefaults.UnitRatesHz"/>;
+    /// owner, 2026-10-21: no station's link decides for another's), and the operator picks. The export does not throttle, so a rate
+    /// the link cannot carry is lost wholesale - 40 MS/s needs 2.5 GbE, 80 5 GbE, 320 10 GbE - and a launch profile may offer fewer.
+    /// The ring is sized for the fastest offered (<see cref="RingSamplesFor"/>).</summary>
+    public double[] RatesHz = ShackLinkUsrp.Client.W1700kDefaults.UnitRatesHz();
 
-    public double WideRateHz = 40e6;
+    /// <summary>The rate it opens at: the lowest the unit has, unless the caller names another offered one.</summary>
+    public double WideRateHz = ShackLinkUsrp.Client.W1700kDefaults.UnitRatesHz()[0];
     public long LoHz = 2_442_000_000;
 
     /// <summary>Samples skipped after a change, in milliseconds of the wide rate: what is still in flight between the unit's
@@ -106,6 +109,8 @@ internal sealed class W1700kBackend : RadioBackendBase
     private volatile bool _accept;
     private volatile bool _resync;
     private volatile bool _streamOurs;
+    /// <summary>The unit has said, in a state event, that our stream runs: only then can it END on its own (OnUnitState).</summary>
+    private volatile bool _streamSeenRunning;
     private int _band;
     private readonly W1700kCondition _cond = new();
     private double _condRateHz;
@@ -154,7 +159,7 @@ internal sealed class W1700kBackend : RadioBackendBase
         WideRatesHz = (double[])opt.RatesHz.Clone(),
         LeaseDecimMin = 2,
         LeaseDecimMax = 4096,
-        MaxLeases = 8,
+        MaxLeases = 16,
         MaxPanoramas = 4,
         MaxPanoramaBins = 1 << 18,
         Antennas = (string[])BandNames.Clone(),
@@ -241,6 +246,20 @@ internal sealed class W1700kBackend : RadioBackendBase
     // ------------------------------------------------------------ open and close
 
     protected override void OpenRadio()
+    {
+        // A refusal at open (a start at a rate the link cannot carry, a router another program drives, a host key not trusted) is
+        // said the way every refusal is (W1700kServeException.Said), so the host can tell one that will not fix itself.
+        try
+        {
+            OpenRadioCore();
+        }
+        catch (W1700kServeException ex)
+        {
+            throw new InvalidOperationException(ex.Said, ex);
+        }
+    }
+
+    private void OpenRadioCore()
     {
         OpenSocket();
         _worker = new Thread(ConditionLoop) { IsBackground = true, Name = "W1700kCondition", Priority = ThreadPriority.AboveNormal };
@@ -400,12 +419,20 @@ internal sealed class W1700kBackend : RadioBackendBase
     }
 
     /// <summary>Every <c>state</c> event: a stream that ended on its own (an overrun, a killed pump) ends this radio, in the unit's
-    /// words - samples will not come back without a start, and a client must not wait on silence.</summary>
+    /// words - samples will not come back without a start, and a client must not wait on silence. Only a stream SEEN running can
+    /// end: a start the unit refuses emits its state (error set, not running) BEFORE its reply, and the reply carries the reason
+    /// the open reports (W1700kServeException.Said); read here, the first-wins fault would say "stream ended" and lose it.</summary>
     private void OnUnitState(JsonObject st)
     {
         if (_closing || !_streamOurs) return;
         var stream = st.GetObject("stream");
-        if (stream == null || stream.GetBool("running")) return;
+        if (stream == null) return;
+        if (stream.GetBool("running"))
+        {
+            _streamSeenRunning = true;
+            return;
+        }
+        if (!_streamSeenRunning) return;
         if (st.GetString("busy") != null) return;     // a configure stops and restarts the stream itself
         string error = st.GetString("error") ?? "";
         _streamOurs = false;
@@ -448,7 +475,7 @@ internal sealed class W1700kBackend : RadioBackendBase
         }
         catch (W1700kServeException ex)
         {
-            throw new RadioRefusal(ErrorCodes.OutOfRange, "the unit refused: " + ex.Message);
+            throw new RadioRefusal(ErrorCodes.OutOfRange, ex.Said);
         }
         catch (Exception ex) when (ex is TimeoutException || ex is IOException)
         {

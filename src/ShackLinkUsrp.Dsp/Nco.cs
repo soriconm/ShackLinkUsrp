@@ -1,6 +1,9 @@
 // ShackLinkUsrp - USRP B2xx streaming server. Copyright (C) 2026 Sorin Marghitoiu.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+using System.Numerics;
+using System.Runtime.InteropServices;
+
 namespace ShackLinkUsrp.Dsp;
 
 /// <summary>
@@ -8,12 +11,20 @@ namespace ShackLinkUsrp.Dsp;
 /// a unit phasor multiplied by a fixed step per sample, renormalised often enough that its
 /// magnitude cannot drift. Double precision, because a lease at 4 MHz offset of a 20 MS/s stream
 /// runs 10^7 multiplications a second and single precision would drift audibly within seconds.
+/// <para><b>Vectorised, and still a double-precision oscillator</b> (ShackLink docs/skimmer_support.md 26.14): the
+/// recurrence runs once per block of <see cref="Vector{T}"/> samples, in double, by the block's step; each lane's
+/// phasor is that base times its own offset step^i, formed in float and never fed back. So nothing accumulates
+/// in float - every sample's phasor is one float rounding from the exact one - and the serial chain that made a
+/// per-sample recurrence latency-bound (a complex multiply's latency per sample) is a block long instead.</para>
 /// </summary>
 public sealed class Nco
 {
     private double _re = 1.0, _im = 0.0;
     private double _stepRe = 1.0, _stepIm = 0.0;
     private int _sinceRenorm;
+    // The block step, step^W, and each lane's offset step^i over 32768 (the sc16 scale folded in), i < W.
+    private double _blockRe = 1.0, _blockIm = 0.0;
+    private float[] _laneRe = Array.Empty<float>(), _laneIm = Array.Empty<float>();
 
     public double FrequencyHz { get; private set; }
     public double SampleRateHz { get; private set; }
@@ -27,6 +38,16 @@ public sealed class Nco
         double w = -2.0 * Math.PI * shiftHz / sampleRateHz;
         _stepRe = Math.Cos(w);
         _stepIm = Math.Sin(w);
+        int lanes = Vector<float>.Count;
+        _blockRe = Math.Cos(w * lanes);
+        _blockIm = Math.Sin(w * lanes);
+        _laneRe = new float[lanes];
+        _laneIm = new float[lanes];
+        for (int i = 0; i < lanes; i++)
+        {
+            _laneRe[i] = (float)(Math.Cos(w * i) / 32768.0);
+            _laneIm[i] = (float)(Math.Sin(w * i) / 32768.0);
+        }
     }
 
     /// <summary>
@@ -63,9 +84,13 @@ public sealed class Nco
     /// <summary>Mix <paramref name="count"/> sc16 samples (normalised to +/-1) into re/im.</summary>
     public void Mix(ReadOnlySpan<short> iq, int count, Span<float> re, Span<float> im)
     {
+        int n = 0;
+        int lanes = Vector<float>.Count;
+        if (Vector.IsHardwareAccelerated && count >= lanes && _laneRe.Length == lanes)
+            n = MixBlocks(iq, count / lanes * lanes, re, im);
         const double scale = 1.0 / 32768.0;
         double pr = _re, pi = _im, sr = _stepRe, si = _stepIm;
-        for (int n = 0; n < count; n++)
+        for (; n < count; n++)
         {
             double xr = iq[2 * n] * scale;
             double xi = iq[2 * n + 1] * scale;
@@ -84,5 +109,42 @@ public sealed class Nco
         }
         _re = pr;
         _im = pi;
+    }
+
+    // Whole blocks of W samples. A sample's I and Q are the low and high halves of one little-endian int, so a
+    // Vector<int> of samples splits into I and Q by shifts - no shuffle.
+    private int MixBlocks(ReadOnlySpan<short> iq, int count, Span<float> re, Span<float> im)
+    {
+        int lanes = Vector<float>.Count;
+        var samples = MemoryMarshal.Cast<short, int>(iq.Slice(0, 2 * count));
+        var laneRe = new Vector<float>(_laneRe);
+        var laneIm = new Vector<float>(_laneIm);
+        double br = _re, bi = _im, sr = _blockRe, si = _blockIm;
+        for (int n = 0; n < count; n += lanes)
+        {
+            var v = new Vector<int>(samples.Slice(n));
+            var xr = Vector.ConvertToSingle(Vector.ShiftRightArithmetic(Vector.ShiftLeft(v, 16), 16));
+            var xi = Vector.ConvertToSingle(Vector.ShiftRightArithmetic(v, 16));
+            var fr = new Vector<float>((float)br);
+            var fi = new Vector<float>((float)bi);
+            var pr = fr * laneRe - fi * laneIm;
+            var pi = fr * laneIm + fi * laneRe;
+            (xr * pr - xi * pi).CopyTo(re.Slice(n, lanes));
+            (xr * pi + xi * pr).CopyTo(im.Slice(n, lanes));
+            double nbr = br * sr - bi * si;
+            bi = br * si + bi * sr;
+            br = nbr;
+            _sinceRenorm += lanes;
+            if (_sinceRenorm >= 1024)
+            {
+                double mag = Math.Sqrt(br * br + bi * bi);
+                br /= mag;
+                bi /= mag;
+                _sinceRenorm = 0;
+            }
+        }
+        _re = br;
+        _im = bi;
+        return count;
     }
 }
