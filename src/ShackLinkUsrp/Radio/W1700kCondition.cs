@@ -21,8 +21,8 @@ namespace ShackLinkUsrp.Radio;
 /// response is the inverse of the roll-off measured on its unit A (band 1), capped at +24 dB, applied ZERO-PHASE (output t from
 /// inputs t-64..t+64). In the TIME domain, so a lease near an edge is corrected as well as the panorama - which is why it is here and
 /// not a per-bin correction of the rows.</item>
-/// <item><b>DC removal</b>: the LO's leak is a spike at the centre (-37 dBFS measured). A one-pole DC blocker with a corner of
-/// <see cref="DcCornerHz"/> takes it out and leaves a signal a few hundred hertz from the LO alone.</item>
+/// <item><b>DC removal</b>: the LO's leak is a spike at the centre (-37 to -42 dBFS measured, and WANDERING). A one-pole DC blocker
+/// with a corner of <see cref="DcCornerTargetHz"/> takes it out and leaves a signal a kilohertz from the LO alone.</item>
 /// </list>
 /// One instance per stream; it is fed the receive thread's slices in order and keeps 128 samples of history across them. A gap
 /// (lost completions) is filtered across as if contiguous - the samples were lost anyway, and the ring says where.
@@ -69,9 +69,19 @@ internal sealed class W1700kCondition
     private const int DesignPoints = 8192;
     private const double KaiserBeta = 4;
 
-    /// <summary>The DC blocker's corner: a 2^-20 one-pole at 40 MS/s is about 6 Hz wide and settles a retune's new leak in ~80 ms.</summary>
-    public const int DcShift = 20;
-    public static double DcCornerHz(double rateHz) => rateHz / (1 << DcShift) / (2 * Math.PI);
+    /// <summary>
+    /// The DC blocker's corner, the same at every rate. MEASURED on the unit (2026-10-20, band 0, AGC, 610 Hz bins): the leak is a narrow
+    /// line at -42 dBFS that WANDERS - a 6 Hz corner took 16 dB off it and left -58 dBFS in the same narrow shape, 18 dB over the floor
+    /// in ShackLink's 1.2 kHz bins, because what it follows faster than 6 Hz (the AGC's steps among it) passed straight through. 200 Hz
+    /// follows that and stays far narrower than a display bin; the price, said where the setting is offered, is a notch of a few
+    /// hundred hertz at the LO (a sub-receiver tuned exactly there loses it). It settles a retune's new leak in about 4 ms.
+    /// </summary>
+    public const double DcCornerTargetHz = 200;
+    public static double DcCornerHz(double rateHz) => DcCornerTargetHz;
+
+    /// <summary>The estimate's step per block: the block's share of the one-pole's per-sample coefficient 2 pi fc / rate, capped at 1.</summary>
+    internal static double DcShare(double rateHz, int blockSamples) =>
+        rateHz > 0 ? Math.Min(1.0, 2 * Math.PI * DcCornerTargetHz / rateHz * blockSamples) : 1.0;
 
     private static readonly Dictionary<long, float[]> Designed = new();
 
@@ -200,9 +210,11 @@ internal sealed class W1700kCondition
     /// Condition one block in place (<paramref name="iq"/>: <c>_block</c> interleaved sc16 samples). With the flatten on, the output is
     /// the input <see cref="Delay"/> samples earlier (zero-phase as computed, so the stream is 64 samples late - 1.6 us at 40 MS/s);
     /// the first block after a reset is filtered against zeros before it.
-    /// <para>The DC estimate is a one-pole of 2^-<see cref="DcShift"/> a SAMPLE, moved once a BLOCK by the block's mean (by
-    /// block/2^DcShift of the way): it moves 0.2 % over a 2048-sample block, so the block-wise pole is the per-sample one to that
-    /// much, and the per-sample recursion - a serial chain no vector unit can share - is gone.</para>
+    /// <para>The DC estimate is a one-pole of corner <see cref="DcCornerTargetHz"/>, moved once every <see cref="DcSubSamples"/> samples by
+    /// their mean (<see cref="DcShare"/>) - the per-sample recursion is a serial chain no vector unit can share. NOT once a 2048-sample
+    /// block: the subtracted estimate is a STAIRCASE, and stepping at 19.5 kHz it put images of a signal f from the LO at 19.5 kHz +- f,
+    /// about -30 dBc for one 5 kHz away (the gate caught it as that tone reading 0.23 dB high). Stepping every 16 samples (2.5 MHz at
+    /// 40 MS/s) puts them near (corner / step rate) = -82 dBc of the signal, and the gate measures them (64 was -70).</para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Process(Span<short> iq)
@@ -224,16 +236,26 @@ internal sealed class W1700kCondition
             Array.Copy(_work, n2, _work, 0, hist);
         }
         else ToFloat(iq, _out.AsSpan(0, n2));
-        float subI = dc ? (float)_dcI : 0, subQ = dc ? (float)_dcQ : 0;
-        long clipped = ToShort(_out, iq, subI, subQ, out double sumI, out double sumQ);
-        if (dc)
+        long clipped = 0;
+        if (!dc) clipped = ToShort(_out, 0, iq, 0, 0, out _, out _);
+        else
         {
-            double share = (double)_block / (1 << DcShift);
-            _dcI += share * (sumI / _block - _dcI);
-            _dcQ += share * (sumQ / _block - _dcQ);
+            double share = DcShare(_rateHz, DcSubSamples);
+            int step = 2 * DcSubSamples;
+            for (int at = 0; at < n2; at += step)
+            {
+                int len = Math.Min(step, n2 - at);
+                clipped += ToShort(_out, at, iq.Slice(at, len), (float)_dcI, (float)_dcQ, out double sumI, out double sumQ);
+                _dcI += share * (sumI / (len / 2) - _dcI);
+                _dcQ += share * (sumQ / (len / 2) - _dcQ);
+            }
         }
         if (clipped > 0) Interlocked.Add(ref Clipped, clipped);
     }
+
+    /// <summary>How many samples the DC estimate stands for before it moves: small enough that its staircase's images are negligible
+    /// (<see cref="Process"/>), large enough that the vector loop between moves is not all overhead.</summary>
+    public const int DcSubSamples = 16;
 
     /// <summary>sc16 to float, widened eight at a time.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -253,12 +275,13 @@ internal sealed class W1700kCondition
     }
 
     /// <summary>
-    /// float to sc16: the DC (<paramref name="subI"/>, <paramref name="subQ"/>) taken off, rounded to nearest, saturated at full scale
-    /// with every saturated sample counted. <paramref name="sumI"/> / <paramref name="sumQ"/>: the block's sums BEFORE the DC is taken
-    /// off - what the estimate moves by.
+    /// float to sc16: <paramref name="src"/> from float index <paramref name="at"/> into <paramref name="dst"/>, the DC
+    /// (<paramref name="subI"/>, <paramref name="subQ"/>) taken off, rounded to nearest, saturated at full scale with every saturated
+    /// sample counted. <paramref name="sumI"/> / <paramref name="sumQ"/>: the stretch's sums BEFORE the DC is taken off - what the
+    /// estimate moves by.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static long ToShort(float[] src, Span<short> dst, float subI, float subQ, out double sumI, out double sumQ)
+    private static long ToShort(float[] src, int at, Span<short> dst, float subI, float subQ, out double sumI, out double sumQ)
     {
         int n = dst.Length, i = 0;
         long clipped = 0;
@@ -266,7 +289,7 @@ internal sealed class W1700kCondition
         sumQ = 0;
         if (Vector256.IsHardwareAccelerated && Avx.IsSupported)
         {
-            ref float s = ref MemoryMarshal.GetArrayDataReference(src);
+            ref float s = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), at);
             var sub = Vector256.Create(subI, subQ, subI, subQ, subI, subQ, subI, subQ);
             var max = Vector256.Create(32767f);
             var min = Vector256.Create(-32768f);
@@ -294,10 +317,10 @@ internal sealed class W1700kCondition
         }
         for (; i < n; i += 2)
         {
-            sumI += src[i];
-            sumQ += src[i + 1];
-            dst[i] = Sat(MathF.Round(src[i] - subI), ref clipped);
-            dst[i + 1] = Sat(MathF.Round(src[i + 1] - subQ), ref clipped);
+            sumI += src[at + i];
+            sumQ += src[at + i + 1];
+            dst[i] = Sat(MathF.Round(src[at + i] - subI), ref clipped);
+            dst[i + 1] = Sat(MathF.Round(src[at + i + 1] - subQ), ref clipped);
         }
         return clipped;
     }

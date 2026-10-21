@@ -858,8 +858,9 @@ internal sealed class W1700kBackend : RadioBackendBase
                 .Set("text", "correct the decimation's roll-off at the band's edges (upstream's measured table, up to +24 dB), in the samples: " +
                              "the panorama and every sub-receiver" + (W1700kCondition.TapsFor(WideRateHz) == null ? " - this rate has no table" : "")))
             .Add(new JsonObject().Set("key", "dc_removal").Set("type", "bool").Set("value", _cond.RemoveDc ? "true" : "false")
-                .Set("text", "take the LO's leak out of the centre: a DC blocker " +
-                             W1700kCondition.DcCornerHz(WideRateHz).ToString("0.0", CultureInfo.InvariantCulture) + " Hz wide"))
+                .Set("text", "take the LO's leak out of the centre: a DC blocker with a " +
+                             W1700kCondition.DcCornerHz(WideRateHz).ToString("0", CultureInfo.InvariantCulture) +
+                             " Hz corner (a sub-receiver tuned within a few hundred hertz of the LO loses that notch)"))
             .Add(new JsonObject().Set("key", "export").Set("type", "string").Set("value", _opt.Bind.ToString()).Set("read_only", true))
             .Add(new JsonObject().Set("key", "controller").Set("type", "string").Set("read_only", true)
                 .Set("value", _controlled ? (_opt.ServeFactory != null ? "a gate's" : _opt.ServeCommand ?? "") : "none"));

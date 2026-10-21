@@ -640,34 +640,58 @@ internal static partial class Program
         double level = 10 * Math.Log10(power / counted) - 20 * Math.Log10(32767);
         Check(Math.Abs(level + 20) < 0.3, $"a -20 dBFS tone at 0.9 of Nyquist, delivered at {F(-20 + rolled)} dBFS, reads {F(level)} dBFS flattened");
 
-        // DC: the leak out, a tone 1 kHz from it untouched.
-        var dcOnly = new W1700kCondition { RateHz = 40e6, Flatten = false };
-        Check(Math.Abs(W1700kCondition.DcCornerHz(40e6) - 6.07) < 0.05, $"the DC blocker's corner at 40 MS/s: {F(W1700kCondition.DcCornerHz(40e6))} Hz");
-        // 1250 Hz: 32 whole cycles in the 1,024,000 samples averaged, so the tone's own mean is zero there.
-        double leakA = 32767 * Math.Pow(10, -37 / 20.0), tone = 32767 * Math.Pow(10, -30 / 20.0), wt = 2 * Math.PI * 1250 / 40e6;
-        double sI = 0, sQ = 0, pTone = 0;
-        int m = 0;
-        for (int s = 0, p = 0; s < 3000; s++)
+        // DC: the leak out, a tone a few kilohertz from it untouched, and the corner where it is said to be. Every tone is k x 39.0625 Hz:
+        // whole cycles in the 1,024,000 samples averaged, so its own mean there is zero and the DC read is the blocker's alone.
+        Check(W1700kCondition.DcCornerHz(40e6) == 200 && W1700kCondition.DcCornerHz(320e6) == 200, "the DC blocker's corner is 200 Hz at every rate");
+        (double Residual, double Tone, double WorstImageDbc) DcRun(double toneHz)
         {
-            for (int i = 0; i < 2048; i++, p++)
+            var dcOnly = new W1700kCondition { RateHz = 40e6, Flatten = false };
+            double leakA = 32767 * Math.Pow(10, -37 / 20.0), tone = 32767 * Math.Pow(10, -30 / 20.0), wt = 2 * Math.PI * toneHz / 40e6;
+            double sI = 0, sQ = 0, pTone = 0;
+            int m = 0;
+            // Where a stepped estimate's images of the tone would land: the 2048-sample block's (19.53 kHz +- f) and the 64-sample
+            // stretch's (625 kHz +- f); each is k x 39.0625 Hz for the tones used, so a single-bin DFT over the window reads it alone.
+            double[] probes = { toneHz, 19531.25 - toneHz, 19531.25 + toneHz, 625000 - toneHz, 625000 + toneHz, 2500000 - toneHz, 2500000 + toneHz };
+            var accR = new double[probes.Length];
+            var accI = new double[probes.Length];
+            for (int s = 0, p = 0; s < 1000; s++)
             {
-                block[2 * i] = (short)Math.Round(leakA + tone * Math.Cos(wt * p));
-                block[2 * i + 1] = (short)Math.Round(-leakA + tone * Math.Sin(wt * p));
+                for (int i = 0; i < 2048; i++, p++)
+                {
+                    block[2 * i] = (short)Math.Round(leakA + tone * Math.Cos(wt * p));
+                    block[2 * i + 1] = (short)Math.Round(-leakA + tone * Math.Sin(wt * p));
+                }
+                dcOnly.Process(block);
+                if (s < 500) continue;     // 1 M samples: over a hundred time constants
+                for (int i = 0; i < 2048; i++)
+                {
+                    double xr = block[2 * i], xi = block[2 * i + 1];
+                    sI += xr;
+                    sQ += xi;
+                    pTone += xr * xr + xi * xi;
+                    for (int k = 0; k < probes.Length; k++)
+                    {
+                        // x e^{-j w n}, w the probe's: the sample's correlation with a phasor at that frequency.
+                        double ph = -2 * Math.PI * probes[k] / 40e6 * (p - 2048 + i);
+                        double c = Math.Cos(ph), sn = Math.Sin(ph);
+                        accR[k] += xr * c - xi * sn;
+                        accI[k] += xr * sn + xi * c;
+                    }
+                    m++;
+                }
             }
-            dcOnly.Process(block);
-            if (s < 2500) continue;     // 5.1 M samples: five time constants
-            for (int i = 0; i < 2048; i++)
-            {
-                sI += block[2 * i];
-                sQ += block[2 * i + 1];
-                pTone += (double)block[2 * i] * block[2 * i] + (double)block[2 * i + 1] * block[2 * i + 1];
-                m++;
-            }
+            double At(int k) => Math.Sqrt(accR[k] * accR[k] + accI[k] * accI[k]) / m;
+            double worst = Enumerable.Range(1, probes.Length - 1).Max(k => 20 * Math.Log10(At(k) / At(0) + 1e-15));
+            return (20 * Math.Log10(Math.Sqrt(sI * sI + sQ * sQ) / m / 32767 + 1e-12), 10 * Math.Log10(pTone / m) - 20 * Math.Log10(32767), worst);
         }
-        double residual = 20 * Math.Log10(Math.Sqrt(sI * sI + sQ * sQ) / m / 32767 + 1e-12);
-        double toneLevel = 10 * Math.Log10(pTone / m) - 20 * Math.Log10(32767);
-        Check(residual < -75, $"the -37 dBFS leak, after five time constants: {F(residual)} dBFS of DC left");
-        Check(Math.Abs(toneLevel + 30) < 0.1, $"a -30 dBFS tone 1.25 kHz from the LO reads {F(toneLevel)} dBFS through it");
+        var far = DcRun(5000);
+        Check(far.Residual < -75, $"the -37 dBFS leak is gone: {F(far.Residual)} dBFS of DC left");
+        Check(Math.Abs(far.Tone + 30) < 0.05, $"a -30 dBFS tone 5 kHz from the LO reads {F(far.Tone)} dBFS through it");
+        Check(far.WorstImageDbc < -75, $"...and the blocker makes no images of it (a stepped estimate's, at 19.5 kHz, 625 kHz and 2.5 MHz +- 5 kHz): worst {F(far.WorstImageDbc)} dBc");
+        var near = DcRun(1015.625);
+        Check(Math.Abs(near.Tone + 30) < 0.3, $"...1 kHz from it, {F(near.Tone)} dBFS (a one-pole at 200 Hz: -0.17 dB)");
+        var corner = DcRun(195.3125);
+        Check(Math.Abs(corner.Tone + 33) < 0.6, $"...and at the corner, 195 Hz, {F(corner.Tone)} dBFS: 3 dB down, the notch where it is said to be");
 
         // An instrument line, never a check (a Debug build and a loaded machine both move it): what one slice costs.
         var both = new W1700kCondition { RateHz = 40e6 };
@@ -1096,11 +1120,22 @@ internal static partial class Program
         int port = int.Parse(args[1], CultureInfo.InvariantCulture), bins = 4096;
         double seconds = 5;
         long tune = 0;
+        var window = WindowKind.Hann;
+        var integration = IntegrationKind.Average;
+        bool quiet = false;
+        long span = 0;
+        var settings = new List<(string Key, string Value)>();
         for (int i = 2; i + 1 < args.Length; i += 2)
         {
+            if (args[i] == "--span") span = (long)double.Parse(args[i + 1], CultureInfo.InvariantCulture);
+            else if (args[i] == "--set" && args[i + 1].Contains('='))
+                settings.Add((args[i + 1].Substring(0, args[i + 1].IndexOf('=')), args[i + 1].Substring(args[i + 1].IndexOf('=') + 1)));
             if (args[i] == "--seconds") seconds = double.Parse(args[i + 1], CultureInfo.InvariantCulture);
             else if (args[i] == "--bins") bins = int.Parse(args[i + 1], CultureInfo.InvariantCulture);
             else if (args[i] == "--tune") tune = (long)double.Parse(args[i + 1], CultureInfo.InvariantCulture);
+            else if (args[i] == "--window") window = args[i + 1] switch { "bh" => WindowKind.BlackmanHarris, "rect" => WindowKind.Rectangular, _ => WindowKind.Hann };
+            else if (args[i] == "--integration") integration = args[i + 1] == "peak" ? IntegrationKind.Peak : IntegrationKind.Average;
+            else if (args[i] == "--quiet") quiet = args[i + 1] == "1";
         }
         try
         {
@@ -1125,14 +1160,32 @@ internal static partial class Program
             Console.WriteLine($"  LO {st.LoHz} Hz, {F(st.WideRateHz / 1e6, "0.###")} MS/s, {st.Antenna}, gain {(st.Agc ? "AGC" : F(st.GainDb, "0.0") + " dB")}, " +
                               $"bandwidth {(st.BandwidthHz > 0 ? F(st.BandwidthHz / 1e6, "0") + " MHz" : "not stated")}");
             if (ready != RadioStates.Ready) return 0;
-            using var pano = s.OpenPanorama(new PanoramaRequest { Bins = bins, Fps = 10, Integration = IntegrationKind.Average, Window = WindowKind.Hann });
+            if (settings.Count > 0 && tune == 0) s.ClaimLo();     // a setting is a change to the radio: the LO's owner's
+            foreach (var (k, v) in settings) Console.WriteLine($"  set {k} = {s.SetSetting(k, v)}");
+            using var pano = s.OpenPanorama(new PanoramaRequest { Bins = bins, Fps = 30, Integration = integration, Window = window, CenterHz = span > 0 ? st.LoHz : 0, SpanHz = span });
             pano.Connection.StartReader();
             var rows = RowsFor(pano, (int)(seconds * 1000));
-            Console.WriteLine($"  {rows.Count} rows in {seconds} s");
+            Console.WriteLine($"  {rows.Count} rows in {seconds} s, {window} window, {integration}, {bins} bins");
             if (rows.Count > 0)
             {
                 var (h, b) = rows[^1];
                 double fs = st.WideRateHz, binHz = fs / h.FftSize;
+                // What a display sees of DC and of the bands, over every row: the centre bin and its neighbours (median across rows),
+                // and the row's level distribution - floor (p5), median, and the bands' tops (p95, p99.5), averaged across rows.
+                int c = h.Bins / 2;
+                var around = Enumerable.Range(-4, 9).Select(k => rows.Select(r => r.bins[c + k] / 100.0).OrderBy(v => v).ElementAt(rows.Count / 2)).ToArray();
+                Console.WriteLine($"  DC (centre bin {F(binHz, "0")} Hz wide), bins -4..+4: {string.Join("  ", around.Select(v => F(v, "0.0")))} dBFS");
+                double P(short[] row, double q) { var v = row.Select(x => x / 100.0).OrderBy(x => x).ToArray(); return v[(int)Math.Min(v.Length - 1, q * v.Length)]; }
+                Console.WriteLine($"  levels (mean over rows): p5 {F(rows.Average(r => P(r.bins, 0.05)), "0.0")}, p50 {F(rows.Average(r => P(r.bins, 0.5)), "0.0")}, " +
+                                  $"p95 {F(rows.Average(r => P(r.bins, 0.95)), "0.0")}, p99.5 {F(rows.Average(r => P(r.bins, 0.995)), "0.0")} dBFS; " +
+                                  $"FFT {h.FftSize}, {h.Ffts} FFTs a row");
+                if (h.Bins <= 128)
+                {
+                    // A small row is printed whole, each bin the median across rows: the shape of what sits at the centre.
+                    var med = Enumerable.Range(0, h.Bins).Select(k => rows.Select(r => r.bins[k] / 100.0).OrderBy(v => v).ElementAt(rows.Count / 2));
+                    Console.WriteLine($"  row ({F(binHz, "0.0")} Hz bins, centre {h.Bins / 2}): {string.Join(" ", med.Select(v => F(v, "0")))}");
+                }
+                if (quiet) return 0;
                 var peaks = Enumerable.Range(2, h.Bins - 4).Where(i => b[i] >= b[i - 1] && b[i] > b[i + 1] && b[i] >= b[i - 2] && b[i] > b[i + 2])
                     .OrderByDescending(i => b[i]).Take(8);
                 foreach (int i in peaks)
