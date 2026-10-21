@@ -45,7 +45,12 @@ dotnet build ShackLinkUsrp.sln -c Release
 ShackLinkUsrp.exe --serial <serial> [--uhd <dir>] [--rate 10e6] [--linger 10]
 ShackLinkUsrp.exe --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>]
 ShackLinkUsrp.exe --list
+ShackLinkUsrp.exe --w1700k --port 5555 --persist [--w1700k-serve none] [--w1700k-bind 10.77.0.10:7700] [--w1700k-rates 40e6]
 ```
+
+`--w1700k` is a Gemtek W1700K running h0m3us3r/w1700k-sdr: its UDP export received here, receive only, joined from ShackLink as
+`usrp://127.0.0.1:<port>`. Run the RELEASE build: the roll-off correction cannot keep up with 40 MS/s in Debug. Its rules, measurements
+and what is not yet verified are in ShackLink's `docs/w1700k_support.md`.
 
 Either radio also takes `--tx-max-ms <ms>` (the ceiling on any transmission, default one hour) and
 `--tx-starve-ms <ms>` (a keyed IQ transmission fed nothing that long is ended, default 500). The sidecar

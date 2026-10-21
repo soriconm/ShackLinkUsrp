@@ -45,13 +45,28 @@ internal static class Program
 
     private static int RunServer(SidecarOptions opt)
     {
-        // The rendezvous key is the address grammar's (one owner): sim-<name>, iiod-<hw_serial> or the B2xx serial.
-        string key = opt.Address().RendezvousKey!;
+        // The rendezvous key is the address grammar's (one owner): sim-<name>, iiod-<hw_serial> or the B2xx serial. A W1700K is
+        // reached as a running sidecar (usrp://host:port), which the grammar gives no key: its log is keyed w1700k-<name>.
+        string key = opt.W1700k ? W1700kBackend.KeyFor(opt.W1700kName) : opt.Address().RendezvousKey!;
         if (opt.StateDirectory != null) Rendezvous.RootOverride = opt.StateDirectory;
         using var log = new SidecarLog(Rendezvous.LogPathFor(key), console: opt.Console);
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
 
-        RadioBackendBase backend = opt.Sim
+        RadioBackendBase backend = opt.W1700k
+            // A W1700K (C:\Dev\SDRW1700K docs/05 option 2): its export received here, its controller upstream's.
+            ? new W1700kBackend(log, new W1700kBackendOptions
+            {
+                Name = opt.W1700kName,
+                Bind = opt.W1700kBind,
+                ServeCommand = opt.W1700kServe,
+                RatesHz = opt.W1700kRatesHz,
+                WideRateHz = opt.RateHz,
+                LoHz = opt.LoHz,
+                SettleMs = opt.W1700kSettleMs,
+                Flatten = opt.W1700kFlatten,
+                RemoveDc = opt.W1700kRemoveDc,
+            })
+            : opt.Sim
             ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb, TxCouplingDbB = opt.SimTxCouplingDbB, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
             : opt.Iiod != null
             // A Pluto-class board: no UHD is loaded for it (ShackLink docs/plutosdr_support.md section 9.1 B2).
@@ -131,7 +146,8 @@ internal static class Program
             Exe = Environment.ProcessPath ?? "",
         };
         bool published = false;
-        if (opt.Listen.Equals(IPAddress.Loopback) || opt.Listen.Equals(IPAddress.Any))
+        // A W1700K is joined by its address only (usrp://host:port): no client finds it by a key, so nothing is published.
+        if (!opt.W1700k && (opt.Listen.Equals(IPAddress.Loopback) || opt.Listen.Equals(IPAddress.Any)))
         {
             try
             {
@@ -219,7 +235,17 @@ internal static class Program
 internal sealed class SidecarOptions
 {
     public const string Usage =
-        "ShackLinkUsrp --serial <serial> | --serial <hw_serial> --iiod <host[:port]|mdns|usb:<hw_serial>> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --list [--json <file>]\n" +
+        "ShackLinkUsrp --serial <serial> | --serial <hw_serial> --iiod <host[:port]|mdns|usb:<hw_serial>> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --w1700k [--w1700k-...] | --list [--json <file>]\n" +
+        "  --w1700k                    a Gemtek W1700K running h0m3us3r/w1700k-sdr: its UDP export received here, receive only (--rate default 40e6,\n" +
+        "                              --lo default 2442e6). Serve with --port and --persist, and join it from ShackLink as usrp://127.0.0.1:<port>\n" +
+        "  --w1700k-name <name>        the radio's name in its serial (w1700k-<name>) and its log (default unit)\n" +
+        "  --w1700k-bind <ip:port>     where the export arrives (default 10.77.0.10:7700, the unit's fixed destination)\n" +
+        "  --w1700k-serve <cmd|none>   upstream's controller, spoken to as JSON lines (default: w1700k serve in WSL's Ubuntu-24.04, ~/w1700k-sdr);\n" +
+        "                              none = receive the stream another program drives and change nothing on the unit\n" +
+        "  --w1700k-rates <S/s,...>    the wide rates offered: what the LINK carries (default 40e6, the most 2.5 GbE carries; the export never throttles)\n" +
+        "  --w1700k-settle-ms <ms>     samples skipped after a change, as milliseconds in flight from the unit (default 20, stated, not measured)\n" +
+        "  --w1700k-flatten on|off     correct the decimation's roll-off at the band's edges, in the samples (default on; the setting flatten)\n" +
+        "  --w1700k-dc on|off          take the LO's leak out of the centre (default on; the setting dc_removal)\n" +
         "  --iiod <host[:port]|mdns>   a Pluto-class board behind iiod, by its hw_serial: tried at this address first (a HINT), then\n" +
         "                              re-found by an _iio._tcp browse matched on the serial; mdns = no address known, browse at once.\n" +
         "  --iiod usb:<hw_serial>      ...or over the board's OWN USB pipes through WinUSB: no address, no browse; the serial is --serial's\n" +
@@ -295,6 +321,19 @@ internal sealed class SidecarOptions
     public string? SpawnToken;
     public bool Console;
     public string? StateDirectory;
+    public bool RateSet, LoSet;
+    public bool W1700k;
+    public string W1700kName = "unit";
+    public IPEndPoint W1700kBind = new(IPAddress.Parse("10.77.0.10"), 7700);
+    public bool W1700kBindSet;
+    /// <summary>Null = none: no controller.</summary>
+    public string? W1700kServe = ShackLinkUsrp.Radio.W1700kServe.DefaultCommand;
+    public bool W1700kServeSet;
+    public double[] W1700kRatesHz = { 40e6 };
+    public bool W1700kRatesSet;
+    public int W1700kSettleMs = 20;
+    public bool W1700kSettleSet;
+    public bool W1700kFlatten = true, W1700kRemoveDc = true, W1700kConditionSet;
 
     public static SidecarOptions Parse(string[] args)
     {
@@ -370,7 +409,7 @@ internal sealed class SidecarOptions
                     o.OtwSet = true;
                     if (o.OtwFormat != "sc16" && o.OtwFormat != "sc8") throw new ArgumentException("--otw is sc16 or sc8");
                     break;
-                case "--rate": o.RateHz = Double(a, Next()); break;
+                case "--rate": o.RateHz = Double(a, Next()); o.RateSet = true; break;
                 case "--dual-rates":
                     {
                         string v = Next();
@@ -384,7 +423,44 @@ internal sealed class SidecarOptions
                         o.DualRatesHz = rates.ToArray();
                         break;
                     }
-                case "--lo": o.LoHz = (long)Double(a, Next()); break;
+                case "--lo": o.LoHz = (long)Double(a, Next()); o.LoSet = true; break;
+                case "--w1700k": o.W1700k = true; break;
+                case "--w1700k-name": o.W1700kName = Next(); break;
+                case "--w1700k-bind":
+                    {
+                        string v = Next();
+                        if (!IPEndPoint.TryParse(v, out var ep) || ep.Port == 0)
+                            throw new ArgumentException($"--w1700k-bind needs ip:port, not \"{v}\"");
+                        o.W1700kBind = ep;
+                        o.W1700kBindSet = true;
+                        break;
+                    }
+                case "--w1700k-serve":
+                    {
+                        string v = Next().Trim();
+                        if (v.Length == 0) throw new ArgumentException("--w1700k-serve needs a command line, or none");
+                        o.W1700kServe = string.Equals(v, "none", StringComparison.OrdinalIgnoreCase) ? null : v;
+                        o.W1700kServeSet = true;
+                        break;
+                    }
+                case "--w1700k-rates":
+                    {
+                        string v = Next();
+                        var rates = new List<double>();
+                        foreach (var part in v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        {
+                            if (!double.TryParse(part, NumberStyles.Float, CultureInfo.InvariantCulture, out double r) || !W1700kRates.Contains(r))
+                                throw new ArgumentException($"--w1700k-rates takes the unit's rates ({string.Join(", ", W1700kRates.Select(x => x.ToString("0", CultureInfo.InvariantCulture)))}), comma-separated - not \"{v}\"");
+                            rates.Add(r);
+                        }
+                        if (rates.Count == 0) throw new ArgumentException("--w1700k-rates needs at least one rate");
+                        o.W1700kRatesHz = rates.Distinct().OrderBy(r => r).ToArray();
+                        o.W1700kRatesSet = true;
+                        break;
+                    }
+                case "--w1700k-settle-ms": o.W1700kSettleMs = Int(a, Next()); o.W1700kSettleSet = true; break;
+                case "--w1700k-flatten": o.W1700kFlatten = OnOff(a, Next()); o.W1700kConditionSet = true; break;
+                case "--w1700k-dc": o.W1700kRemoveDc = OnOff(a, Next()); o.W1700kConditionSet = true; break;
                 case "--dc-offset":
                     {
                         string v = Next();
@@ -407,6 +483,30 @@ internal sealed class SidecarOptions
             }
         }
         if (o.JsonPath != null && !o.List) throw new ArgumentException("--json <file> goes with --list");
+        bool w1700kOption = o.W1700kBindSet || o.W1700kServeSet || o.W1700kRatesSet || o.W1700kSettleSet || o.W1700kConditionSet || o.W1700kName != "unit";
+        if (w1700kOption && !o.W1700k) throw new ArgumentException("the --w1700k-... options go with --w1700k");
+        if (o.W1700k && !o.Help && !o.List)
+        {
+            if (o.Sim || o.Serial != null || o.Iiod != null)
+                throw new ArgumentException("--w1700k is its own radio: not with --sim, --serial or --iiod");
+            var uhdOnly = new List<string>();
+            if (o.UhdDirectory != null) uhdOnly.Add("--uhd");
+            if (o.ImagesDirectory != null) uhdOnly.Add("--images");
+            if (o.FpgaPath != null) uhdOnly.Add("--fpga");
+            if (o.DeviceArgs != null) uhdOnly.Add("--args");
+            if (o.AllowKnownCodecFault) uhdOnly.Add("--allow-known-codec-fault");
+            if (o.OtwSet) uhdOnly.Add("--otw");
+            if (o.DcOffsetHz != 0) uhdOnly.Add("--dc-offset");
+            if (uhdOnly.Count > 0)
+                throw new ArgumentException($"{string.Join(", ", uhdOnly)} {(uhdOnly.Count == 1 ? "is a" : "are")} UHD option{(uhdOnly.Count == 1 ? "" : "s")}; a W1700K (--w1700k) loads no UHD");
+            if (!o.RateSet) o.RateHz = o.W1700kRatesHz[0];
+            if (!o.LoSet) o.LoHz = 2_442_000_000;
+            if (!o.W1700kRatesHz.Contains(o.RateHz))
+                throw new ArgumentException($"--rate {o.RateHz.ToString("0", CultureInfo.InvariantCulture)} is not one of --w1700k-rates ({string.Join(", ", o.W1700kRatesHz.Select(r => r.ToString("0", CultureInfo.InvariantCulture)))})");
+            if (o.W1700kName.Length == 0 || o.W1700kName.Length > 48 || !o.W1700kName.All(c => char.IsAsciiLetterOrDigit(c) || c == '.' || c == '_' || c == '-'))
+                throw new ArgumentException($"--w1700k-name is letters, digits, '.', '_' or '-' (1-48 of them), not \"{o.W1700kName}\"");
+            return o;
+        }
         if (!o.Help && !o.List)
         {
             if (o.Sim == (o.Serial != null)) throw new ArgumentException("give exactly one of --serial <serial> or --sim");
@@ -455,6 +555,16 @@ internal sealed class SidecarOptions
     /// <summary>The radio this command line names, in the address grammar - the ONE spelling of its rendezvous key.</summary>
     public UsrpAddress Address() =>
         Sim ? UsrpAddress.Sim(SimName) : Iiod != null ? UsrpAddress.Iiod(Serial!) : UsrpAddress.Local(Serial!);
+
+    /// <summary>The unit's sample rates (upstream <c>host/w1700k/radio.py</c> SAMPLE_RATES); band 2's 640/2 is not offered.</summary>
+    public static readonly double[] W1700kRates = { 40e6, 80e6, 160e6, 320e6 };
+
+    private static bool OnOff(string opt, string v) => v.Trim().ToLowerInvariant() switch
+    {
+        "on" or "true" or "1" => true,
+        "off" or "false" or "0" => false,
+        _ => throw new ArgumentException($"{opt} is on or off, not \"{v}\""),
+    };
 
     private static double Double(string opt, string v) =>
         double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) && d > 0

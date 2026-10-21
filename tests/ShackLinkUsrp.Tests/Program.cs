@@ -32,6 +32,8 @@ internal static partial class Program
         Rendezvous.RootOverride = Path.Combine(_temp, "state");
         Thread.CurrentThread.CurrentCulture = new CultureInfo("de-DE");
         if (args.Length > 0 && args[0] == "--live") return LiveRun(args);
+        if (args.Length > 1 && args[0] == "--w1700k-replay") return W1700kReplay(args);
+        if (args.Length > 1 && args[0] == "--w1700k-probe") return W1700kProbe(args);
         // --only <text>: run the cases whose name contains it (a way to iterate, never how the gate is run).
         if (args.Length > 1 && args[0] == "--only") _only = args[1];
         var sw = Stopwatch.StartNew();
@@ -100,6 +102,16 @@ internal static partial class Program
         Run("9.23 DS2: both receive sides of the synthetic radio", SimTwoSides);
         Run("9.23 DS4: 2R2T - a transmission beside two receivers, heard on both", SimTwoSidesTx);
         Run("9.23 DS2: what only a board can prove, pinned in the source", SidesSourceRules);
+        Run("W1700K: the export's codec - upstream's conversion, raw and packed slices there and back", W1700kCodecCases);
+        Run("W1700K: the band follows the frequency, the gain on upstream's measured steps, the filter", W1700kRuleCases);
+        Run("W1700K: flatten (upstream's roll-off correction) and DC removal", W1700kConditionCases);
+        Run("W1700K: a fake unit end to end - open, panorama, losses, retune, band switch, gain, refusals, a stream that dies", W1700kEndToEnd);
+        Run("W1700K: closing stops the unit's stream", W1700kClose);
+        Run("W1700K: a unit already streaming, a cold one, one out of reach, a port another receiver holds", W1700kRefusals);
+        Run("W1700K: a stream that goes silent faults in words", W1700kSilence);
+        Run("W1700K: no controller - another program's stream, received as it is", W1700kNoController);
+        Run("W1700K: the command line", W1700kCommandLine);
+        Run("W1700K: the real executable, --w1700k fed by the fake export", W1700kSpawned);
         Run("Pluto P2: the command line - --iiod, its refusals, and the library's spawn line", PlutoCommandLine);
         Run("Pluto P2: the open - SafeIdle first, the sidecar's rate, the board's own caps (B9, B10)", PlutoOpen);
         Run("Pluto P2: found by its serial - a stale address re-found, another board never written (B6)", PlutoFind);
