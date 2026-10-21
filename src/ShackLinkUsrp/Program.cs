@@ -50,6 +50,9 @@ internal static class Program
         if (opt.StateDirectory != null) Rendezvous.RootOverride = opt.StateDirectory;
         using var log = new SidecarLog(Rendezvous.LogPathFor(key), console: opt.Console);
         log.Write($"{Version} (GPL-3.0-or-later) pid {Environment.ProcessId}: {string.Join(" ", Environment.GetCommandLineArgs().Skip(1))}");
+        // Before any thread of the stream starts (ShackLink docs/usrp_b210_support.md section 9.33).
+        string throttling = PowerThrottling.OptOut();
+        if (throttling.Length > 0) log.Write(throttling);
 
         RadioBackendBase backend = opt.W1700k
             // A W1700K (C:\Dev\SDRW1700K docs/05 option 2): its export received here, its controller upstream's.

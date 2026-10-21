@@ -1136,6 +1136,16 @@ internal static partial class Program
         int pid = a.SidecarPid;
         Check(File.Exists(Rendezvous.PathFor("sim-" + name)), "the sidecar published its rendezvous file in the redirected state directory");
         Check(a.WaitReady(5000) == RadioStates.Ready && a.Radio.Serial == "sim-" + name, "the spawned synthetic radio is ready");
+        // Section 9.33: the sidecar opted out of Windows power throttling - read back from Windows, with this gate's own
+        // process, which did not, as the control (a read that cannot tell the two apart proves nothing).
+        using (var child = Process.GetProcessById(pid))
+        {
+            var theirs = PowerThrottling.Read(child.Handle);
+            var mine = PowerThrottling.Read(Process.GetCurrentProcess().Handle);
+            Check(theirs is { } t && PowerThrottling.IsOptedOut(t) && mine is { } m && !PowerThrottling.IsOptedOut(m),
+                  $"the spawned sidecar runs with execution-speed throttling OFF (control {theirs?.ControlMask}, state {theirs?.StateMask}), " +
+                  $"where this gate's own process does not (control {mine?.ControlMask}, state {mine?.StateMask})");
+        }
         Check(a.Caps.MaxFftSize == 1 << 20 && a.Radio.KnownCodecFault == false && b.Caps.MaxFftSize == 1 << 20 && b.Radio.KnownCodecFault == false,
               "across the process boundary both hellos state max_fft_size 2^20 and known_codec_fault false (CRTU200 A3)");
         a.ClaimLo();
@@ -1165,6 +1175,8 @@ internal static partial class Program
         string logPath = Rendezvous.LogPathFor("sim-" + name);
         Check(File.Exists(logPath) && File.ReadAllText(logPath).Contains("stopping: the last client left"),
               "its log says why it stopped");
+        Check(File.Exists(logPath) && File.ReadAllText(logPath).Contains("power throttling: off for this process"),
+              "...and that it switched power throttling off for itself");
     }
 
     private static void FaultHookOptions()
