@@ -39,7 +39,8 @@ internal static partial class Program
         private long _lo;
         private double _rate;
         private byte[][] _slices = Array.Empty<byte[]>();
-        private int _dropNext, _eventsNext;
+        private int _dropNext, _eventsNext, _lateNext, _lateBehind;
+        private readonly List<(ulong Due, byte[] Datagram)> _late = new();
         public volatile bool Running;
         public volatile bool Packed;
         /// <summary>The LO's leak, as measured on the unit (C:\Dev\SDRW1700K, 2026-10-20).</summary>
@@ -72,6 +73,17 @@ internal static partial class Program
         public void DropNext(int n)
         {
             lock (_lock) _dropNext += n;
+        }
+
+        /// <summary>The next <paramref name="n"/> completions each arrive <paramref name="behind"/> datagrams after their place, as an
+        /// adapter that delivers out of order hands them over (an RTL8159 USB 10 GbE: up to 48 behind at 160 MS/s).</summary>
+        public void LateNext(int n, int behind)
+        {
+            lock (_lock)
+            {
+                _lateNext += n;
+                _lateBehind = behind;
+            }
         }
 
         /// <summary>The next completion is a firmware event: a short slice, no samples.</summary>
@@ -154,7 +166,8 @@ internal static partial class Program
                 for (; due < want && !_stop; due++)
                 {
                     byte[] slice;
-                    bool drop, isEvent;
+                    bool drop, isEvent, late;
+                    int behind;
                     lock (_lock)
                     {
                         if (packed != Packed)
@@ -166,14 +179,24 @@ internal static partial class Program
                         if (drop) _dropNext--;
                         isEvent = !drop && _eventsNext > 0;
                         if (isEvent) _eventsNext--;
+                        late = !drop && _lateNext > 0;
+                        if (late) _lateNext--;
+                        behind = _lateBehind;
                         slice = _slices[k % _slices.Length];
                     }
                     ulong seq = Seq++;
                     if (drop) continue;
                     int len = isEvent ? W1700kExport.Compose(dg, seq, ev) : W1700kExport.Compose(dg, seq, slice);
                     if (!isEvent) k++;
-                    try { _socket.SendTo(dg, 0, len, SocketFlags.None, _to); } catch (SocketException) { }
+                    if (late) _late.Add((seq + (ulong)behind, dg.AsSpan(0, len).ToArray()));
+                    else try { _socket.SendTo(dg, 0, len, SocketFlags.None, _to); } catch (SocketException) { }
                     Interlocked.Increment(ref Sent);
+                    for (int j = 0; j < _late.Count; j++)
+                    {
+                        if (_late[j].Due > seq) continue;
+                        try { _socket.SendTo(_late[j].Datagram, SocketFlags.None, _to); } catch (SocketException) { }
+                        _late.RemoveAt(j--);
+                    }
                 }
             }
         }
@@ -508,6 +531,167 @@ internal static partial class Program
 
     // ---------------------------------------------------------------- the cases
 
+    /// <summary>What a <see cref="W1700kReorder"/> handed on, in the order it did.</summary>
+    private sealed class ReorderLog : W1700kReorder.ISink
+    {
+        public readonly List<string> Said = new();
+        public readonly List<ulong> Delivered = new();
+        public readonly List<byte> FirstBytes = new();
+        public ulong MissingTotal;
+        public int MissingRuns;
+        public void Deliver(W1700kExport.Kind kind, ulong seq, int sliceBytes, ReadOnlySpan<byte> slice)
+        {
+            Said.Add($"D{seq}");
+            Delivered.Add(seq);
+            FirstBytes.Add(slice.Length > 0 ? slice[0] : (byte)0);
+            if (kind == W1700kExport.Kind.Unknown) Said[^1] += $"u{sliceBytes}/{slice.Length}";
+        }
+        public void Missing(ulong firstSeq, ulong count)
+        {
+            Said.Add($"M{firstSeq}x{count}");
+            MissingTotal += count;
+            MissingRuns++;
+        }
+        public string Text => string.Join(" ", Said);
+    }
+
+    private static void W1700kReorderCases()
+    {
+        var slice = new byte[W1700kExport.RawSliceBytes];
+        W1700kReorder.Placed Put(W1700kReorder r, ulong seq, byte mark = 0, W1700kExport.Kind kind = W1700kExport.Kind.Raw, int bytes = W1700kExport.RawSliceBytes)
+        {
+            var s = bytes <= slice.Length ? slice.AsSpan(0, bytes) : new byte[bytes];
+            s[0] = mark;
+            return r.Accept(kind, seq, bytes, s);
+        }
+
+        // In order: delivered at once, nothing held.
+        var log = new ReorderLog();
+        var r = new W1700kReorder(log, 4);
+        for (ulong s = 100; s < 104; s++) Check(Put(r, s) == W1700kReorder.Placed.Delivered, $"in order, {s} is delivered at once");
+        Check(log.Text == "D100 D101 D102 D103" && r.Held == 0 && r.Restored == 0, $"in order: {log.Text}, nothing held or restored");
+
+        // Two swapped: the later one waits for the earlier, and nothing is lost.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 4);
+        Put(r, 0);
+        Check(Put(r, 2) == W1700kReorder.Placed.Held && r.Held == 1, "2 ahead of 1 is HELD");
+        Check(Put(r, 1) == W1700kReorder.Placed.Delivered, "1 is delivered...");
+        Check(log.Text == "D0 D1 D2" && r.Held == 0, $"...and 2 behind it: {log.Text}");
+        Check(r.Restored == 1 && r.RestoredMax == 1 && log.MissingRuns == 0, $"one restored, 1 behind, nothing missing ({r.Restored}, {r.RestoredMax})");
+
+        // A real loss: the hole is given up once a datagram arrives a whole window ahead of it, in its place in the order.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 4);
+        Put(r, 0);
+        foreach (ulong s in new ulong[] { 2, 3, 4 }) Check(Put(r, s) == W1700kReorder.Placed.Held, $"{s} held behind the hole at 1");
+        Check(log.Text == "D0", "the hole at 1 is not given up inside the window");
+        Check(Put(r, 5) == W1700kReorder.Placed.Delivered, "5, a window ahead of 1, gives the hole up and is delivered");
+        Check(log.Text == "D0 M1x1 D2 D3 D4 D5" && r.Held == 0, $"the hole in its place, then the held ones and 5: {log.Text}");
+        Check(r.Restored == 0, "nothing was restored: 2-5 came in their own order");
+        Check(Put(r, 1) == W1700kReorder.Placed.Late && log.Delivered.Count == 5, "1, after its place was given up, is LATE and not delivered");
+        Check(Put(r, 5) == W1700kReorder.Placed.Late, "a repeat of a delivered one is late");
+
+        // A repeat of one still held.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 10);
+        Put(r, 12);
+        Check(Put(r, 12) == W1700kReorder.Placed.Late && r.Held == 1, "a repeat of a HELD one is late, and held once");
+
+        // Flush: everything held goes, its holes given up as runs.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 0);
+        Put(r, 2);
+        Put(r, 5);
+        r.Flush();
+        Check(log.Text == "D0 M1x1 D2 M3x2 D5" && r.Held == 0 && r.Next == 6, $"flushed: {log.Text}, next {r.Next}");
+        r.Flush();
+        Check(log.Text == "D0 M1x1 D2 M3x2 D5", "a second flush has nothing to say");
+
+        // Reset: a new run starts where its first datagram does; what was held is dropped.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 0);
+        Put(r, 3);
+        r.Reset();
+        Check(r.Next == null && r.Held == 0, "reset: no position, nothing held");
+        Put(r, 1000);
+        Check(log.Text == "D0 D1000", $"the new run starts at its first datagram: {log.Text}");
+
+        // A jump far past the window with nothing held: ONE missing run, and no walk over it.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 4);
+        Put(r, 0);
+        var sw = Stopwatch.StartNew();
+        Put(r, 1UL << 38);
+        Check(log.Text == "D0" && r.Held == 1, $"a jump of 2^38 is held: the places just before it are inside its window ({log.Text})");
+        r.Flush();
+        Check(log.Text == $"D0 M1x{(1UL << 38) - 1} D{1UL << 38}" && sw.ElapsedMilliseconds < 100,
+              $"...and flushed it is ONE run, in {sw.ElapsedMilliseconds} ms");
+        // ...and with something held: the held one delivered in its place, the rest one run.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 4);
+        Put(r, 0);
+        Put(r, 2);
+        Put(r, 1_000_000);
+        r.Flush();
+        Check(log.Text == "D0 M1x1 D2 M3x999997 D1000000", $"a far jump past a held one: {log.Text}");
+
+        // A loss of 5 that the window slides past one place at a time is still ONE run of 5.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 0);
+        for (ulong s = 6; s < 30; s++) Put(r, s);
+        Check(log.MissingRuns == 1 && log.MissingTotal == 5 && log.Said[1] == "M1x5" && log.Delivered.Count == 25,
+              $"one run of 5, said before the first delivery after it ({string.Join(" ", log.Said.Take(4))} ...)");
+
+        // A run's FIRST datagram sets where it starts: one from before it cannot be put back, and is late.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 50);
+        Check(Put(r, 49) == W1700kReorder.Placed.Late && log.Text == "D50", "a datagram from before the run's first is late");
+
+        // A held slice is a COPY: the socket's buffer is reused for the next datagram.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 0, mark: 10);
+        Put(r, 2, mark: 12);
+        Put(r, 3, mark: 13);
+        Put(r, 1, mark: 11);
+        Check(string.Join(",", log.FirstBytes) == "10,11,12,13", $"each slice delivered with its own bytes ({string.Join(",", log.FirstBytes)})");
+        // An event is held with its bytes; a slice of an unknown size too big to hold keeps its size and is delivered with none.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, 8);
+        Put(r, 0);
+        Put(r, 2, mark: 7, kind: W1700kExport.Kind.Event, bytes: 64);
+        Put(r, 3, kind: W1700kExport.Kind.Unknown, bytes: 9000);
+        Put(r, 1);
+        Check(log.Text == "D0 D1 D2 D3u9000/0" && log.FirstBytes[2] == 7, $"an event held with its bytes, an oversize unknown with its size: {log.Text}");
+        Check(RefusalOf(() => new W1700kReorder(log, 100)).Length > 0, "a window that is not a power of two is refused");
+
+        // The measured pattern (an RTL8159 at 160 MS/s): each datagram up to 48 behind. Every one delivered, in order, none missing.
+        log = new ReorderLog();
+        r = new W1700kReorder(log, W1700kReorder.DefaultWindow);
+        const int N = 100_000;
+        var order = Enumerable.Range(0, N).Select(i => (Key: i + new Random(i * 7919).Next(0, 49), Seq: (ulong)(5_000_000 + i))).OrderBy(x => x.Key).ThenBy(x => x.Seq).Select(x => x.Seq).ToList();
+        order.Remove(5_000_000UL);
+        order.Insert(0, 5_000_000UL);   // the run's first completion arrives first (one from before the first is late: above)
+        long outOfOrder = 0;
+        ulong high = 0;
+        foreach (var s in order)
+        {
+            if (s < high) outOfOrder++;
+            else high = s;
+            Put(r, s);
+        }
+        r.Flush();
+        bool inOrder = log.Delivered.Count == N && log.Delivered.Select((s, i) => s == (ulong)(5_000_000 + i)).All(x => x);
+        Check(inOrder && log.MissingRuns == 0 && r.Held == 0, $"{N} datagrams, {outOfOrder} out of order: all delivered in sequence, none missing");
+        Check(r.Restored == outOfOrder && r.RestoredMax <= 48, $"restored {r.Restored} (= the {outOfOrder} out of order), the furthest {r.RestoredMax} behind");
+    }
+
     private static void W1700kCodecCases()
     {
         // The word: 14 bits each, I in 29:16 and Q in 13:0, sign-extended and x4 to sc16 full scale.
@@ -791,6 +975,19 @@ internal static partial class Program
         }, 3000), "every lost sample is 2048 x (missing completions + slices the worker dropped + unknown slices): " + ledger);
         Check(tel.GetLong("events") == 1, "the event carried no samples and no gap: it is a completion");
         Check(tel.GetLong("malformed") == 0 && tel.GetLong("seq_late") == 0 && tel.GetLong("unknown_size") == 0, "nothing malformed, late or of an unknown size");
+        Check(tel.GetLong("seq_restored") == 0, "a lost run is not a reordering: nothing restored");
+
+        // Out of order, as a USB 10 GbE adapter delivers them (ShackLink docs/w1700k_support.md): put back in their place, so
+        // nothing is announced lost and nothing dropped late - before the reorder window each was a gap AND a late drop.
+        long missingBefore = tel.GetLong("seq_missing");
+        rig.Export.LateNext(3, 10);
+        Check(WaitFor(() => (W1700kTelemetry(s)?.GetLong("seq_restored") ?? 0) >= 3, 3000), "three datagrams, each 10 behind its place, reached the receiver");
+        tel = W1700kTelemetry(s)!;
+        Check(tel.GetLong("seq_restored") == 3 && tel.GetLong("seq_restored_max") == 10,
+              $"all three restored, the furthest 10 behind ({tel.GetLong("seq_restored")}, {tel.GetLong("seq_restored_max")})");
+        Check(tel.GetLong("seq_missing") == missingBefore && tel.GetLong("seq_late") == 0,
+              $"no completion given up and none late ({tel.GetLong("seq_missing")} missing as before, {tel.GetLong("seq_late")} late)");
+        Check(tel.GetLong("reorder_window") == W1700kReorder.DefaultWindow, $"the window is {tel.GetLong("reorder_window")} datagrams");
         Console.WriteLine($"  INFO  the conditioning worker: {tel.GetLong("queue_dropped")} slices dropped, deepest {tel.GetLong("queue_max_depth")} of {tel.GetLong("queue_capacity")}, " +
                           $"{tel.GetLong("raw")} raw slices in {F(rig.Export.Sent / 19531.25, "0.0")} s of export");
 
@@ -1317,6 +1514,7 @@ internal static partial class Program
             var src = tel.GetObject("source")!;
             Console.WriteLine($"  overflows {tel.GetLong("overflows")}; datagrams {src.GetLong("datagrams")}, raw {src.GetLong("raw")}, packed {src.GetLong("packed")}, " +
                               $"events {src.GetLong("events")}, seq missing {src.GetLong("seq_missing")} in {src.GetLong("seq_gaps")} gaps, late {src.GetLong("seq_late")}, " +
+                              $"restored {src.GetLong("seq_restored")} (furthest {src.GetLong("seq_restored_max")} behind, window {src.GetLong("reorder_window")}), " +
                               $"queue dropped {src.GetLong("queue_dropped")} (deepest {src.GetLong("queue_max_depth")}), flatten {src.GetBool("flattening")}, " +
                               $"dc {src.GetBool("dc_removal")}, clipped {src.GetLong("flatten_clipped")}");
         }

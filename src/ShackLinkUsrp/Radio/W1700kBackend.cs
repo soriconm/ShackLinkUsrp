@@ -48,6 +48,9 @@ internal sealed class W1700kBackendOptions
     /// <summary>A stream this sidecar started that delivers nothing this long is a fault, in words.</summary>
     public int SilenceFaultMs = 3000;
 
+    /// <summary>How far ahead of a hole a datagram may arrive before the hole is given up (<see cref="W1700kReorder"/>); a power of two.</summary>
+    public int ReorderWindow = W1700kReorder.DefaultWindow;
+
     public int ReceiveBufferBytes = 256 << 20;
     public int AttachTimeoutMs = 60_000;
     public int LoadTimeoutMs = 180_000;
@@ -68,12 +71,13 @@ internal sealed class W1700kBackendOptions
 /// upstream's measured steps (LNA 1 to 4: +6.8, +6.1, +5.8, +5.6 dB; LPF about 2 dB a step - include/hw/mt7996/phy.h), 0 dB = LNA 0
 /// LPF 1. LPF 0 does not follow the slope and is not on the axis.</item>
 /// <item><b>Lost completions are seen</b> (caps.overflow_oracle): <c>seq</c> counts every completion, and a gap is counted as 2048
-/// samples each (an event in the gap carried none: an upper bound).</item>
+/// samples each (an event in the gap carried none: an upper bound). <b>The datagrams are put back in order first</b>
+/// (<see cref="W1700kReorder"/>): an adapter may deliver them out of order, and a hole is lost only once the window has passed it.</item>
 /// <item><b>One controller at a time</b> (the unit keeps one state for every controller): a unit found already streaming is refused,
 /// naming both remedies, and <c>--w1700k-serve none</c> receives a stream as it is and changes nothing.</item>
 /// </list>
 /// </summary>
-internal sealed class W1700kBackend : RadioBackendBase
+internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
 {
     /// <summary>TUNE's reach per band (upstream <c>host/w1700k/radio.py</c> LO_RANGE): a band's span until the unit has measured its
     /// own lock edges (<c>rf.lo_range_hz</c>, stated for the band in force).</summary>
@@ -120,6 +124,8 @@ internal sealed class W1700kBackend : RadioBackendBase
     private long _datagrams, _bytes, _raw, _packed, _events, _malformed, _unknown, _beforeStream;
     private long _seqGaps, _seqMissing, _seqLate, _runs;
     private long _lastSeq = -1;
+    private bool _unknownSaid;
+    private readonly W1700kReorder _reorder;
     private long _lastDatagramTs;
     // The watch's own clock: from its start and from the end of every request to the unit (whose work may stop the stream a while).
     private long _watchFromTs;
@@ -134,6 +140,7 @@ internal sealed class W1700kBackend : RadioBackendBase
         _condRateHz = opt.WideRateHz;
         _cond.Flatten = opt.Flatten;
         _cond.RemoveDc = opt.RemoveDc;
+        _reorder = new W1700kReorder(this, opt.ReorderWindow);
     }
 
     /// <summary>The radio's serial: its address's rendezvous key, the grammar's ONE spelling (<c>usrp:w1700k:&lt;name&gt;</c>), so the
@@ -561,13 +568,12 @@ internal sealed class W1700kBackend : RadioBackendBase
         lock (_unitLock) socket = _socket;
         if (socket == null) return;
         var buf = new byte[65536];
-        ulong? expected = null;
-        bool unknownSaid = false;
         // The conditioner restarts where the stream did: a marker in the queue, in order with the slices - or, when even that has no
-        // room, a flag the worker takes before its next slice.
+        // room, a flag the worker takes before its next slice. What the old run still held goes in first, its holes given up.
         void Fresh()
         {
-            expected = null;
+            _reorder.Flush();
+            _reorder.Reset();
             if (!_queue.TryPut(SliceQueue.Reset, ReadOnlySpan<byte>.Empty)) _resetWanted = true;
         }
         while (!_stopRx)
@@ -579,6 +585,8 @@ internal sealed class W1700kBackend : RadioBackendBase
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
             {
+                // Half a second with nothing: a hole that is still open is not going to fill, and what waits behind it is released.
+                _reorder.Flush();
                 continue;
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.MessageSize)
@@ -618,59 +626,56 @@ internal sealed class W1700kBackend : RadioBackendBase
                 _resync = false;
                 Fresh();
             }
-            if (expected is ulong e)
+            if (_reorder.Next is ulong e && (seq > e && seq - e > (1UL << 39) || seq < e && e - seq > (1UL << 20)))
             {
-                if (seq > e && seq - e > (1UL << 39) || seq < e && e - seq > (1UL << 20))
-                {
-                    _runs++;
-                    Fresh();
-                    Log($"the export's sequence jumped from {e} to {seq}: a new run");
-                }
-                else if (seq > e)
-                {
-                    ulong gap = seq - e;
-                    _seqGaps++;
-                    _seqMissing += (long)gap;
-                    AddOverflows((long)gap * W1700kExport.SamplesPerSlice);
-                }
-                else if (seq < e)
-                {
-                    // Late or repeated: its place in the ring has been written past, and its gap was already counted.
-                    _seqLate++;
-                    continue;
-                }
+                _runs++;
+                Fresh();
+                Log($"the export's sequence jumped from {e} to {seq}: a new run");
             }
-            expected = seq + 1;
-            Volatile.Write(ref _lastSeq, (long)seq);
-            var slice = d.Slice(W1700kExport.HeaderBytes, sliceBytes);
-            switch (kind)
-            {
-                case W1700kExport.Kind.Event:
-                    _events++;
-                    break;
-                case W1700kExport.Kind.Raw:
-                case W1700kExport.Kind.Packed:
-                    if (kind == W1700kExport.Kind.Raw) _raw++;
-                    else _packed++;
-                    if (!_queue.TryPut(kind == W1700kExport.Kind.Raw ? SliceQueue.Raw : SliceQueue.Packed, slice))
-                    {
-                        _queueDropped++;
-                        AddOverflows(W1700kExport.SamplesPerSlice);
-                    }
-                    int depth = _queue.Depth;
-                    if (depth > _queueMaxDepth) _queueMaxDepth = depth;
-                    break;
-                default:
-                    _unknown++;
-                    AddOverflows(W1700kExport.SamplesPerSlice);
-                    if (!unknownSaid)
-                    {
-                        unknownSaid = true;
-                        Log($"a slice of {sliceBytes} bytes is neither raw ({W1700kExport.RawSliceBytes}) nor packed ({W1700kExport.PackedSliceBytes}): counted lost");
-                    }
-                    break;
-            }
+            // Late or repeated: its place in the ring has been written past, and its gap was already counted.
+            if (_reorder.Accept(kind, seq, sliceBytes, d.Slice(W1700kExport.HeaderBytes, sliceBytes)) == W1700kReorder.Placed.Late) _seqLate++;
         }
+    }
+
+    /// <summary>The next completion in order (<see cref="W1700kReorder"/>), on the receive thread.</summary>
+    void W1700kReorder.ISink.Deliver(W1700kExport.Kind kind, ulong seq, int sliceBytes, ReadOnlySpan<byte> slice)
+    {
+        Volatile.Write(ref _lastSeq, (long)seq);
+        switch (kind)
+        {
+            case W1700kExport.Kind.Event:
+                _events++;
+                break;
+            case W1700kExport.Kind.Raw:
+            case W1700kExport.Kind.Packed:
+                if (kind == W1700kExport.Kind.Raw) _raw++;
+                else _packed++;
+                if (!_queue.TryPut(kind == W1700kExport.Kind.Raw ? SliceQueue.Raw : SliceQueue.Packed, slice))
+                {
+                    _queueDropped++;
+                    AddOverflows(W1700kExport.SamplesPerSlice);
+                }
+                int depth = _queue.Depth;
+                if (depth > _queueMaxDepth) _queueMaxDepth = depth;
+                break;
+            default:
+                _unknown++;
+                AddOverflows(W1700kExport.SamplesPerSlice);
+                if (!_unknownSaid)
+                {
+                    _unknownSaid = true;
+                    Log($"a slice of {sliceBytes} bytes is neither raw ({W1700kExport.RawSliceBytes}) nor packed ({W1700kExport.PackedSliceBytes}): counted lost");
+                }
+                break;
+        }
+    }
+
+    /// <summary>Completions that never arrived, given up where they belong in the order.</summary>
+    void W1700kReorder.ISink.Missing(ulong firstSeq, ulong count)
+    {
+        _seqGaps++;
+        _seqMissing += (long)count;
+        AddOverflows((long)count * W1700kExport.SamplesPerSlice);
     }
 
     /// <summary>The worker: each slice to sc16, flattened and its DC taken out, into the ring - the ONLY writer of the ring, and the
@@ -943,6 +948,10 @@ internal sealed class W1700kBackend : RadioBackendBase
             .Set("seq_gaps", Interlocked.Read(ref _seqGaps))
             .Set("seq_missing", Interlocked.Read(ref _seqMissing))
             .Set("seq_late", Interlocked.Read(ref _seqLate))
+            .Set("seq_restored", Interlocked.Read(ref _reorder.Restored))
+            .Set("seq_restored_max", Interlocked.Read(ref _reorder.RestoredMax))
+            .Set("reorder_window", _reorder.Window)
+            .Set("reorder_held", _reorder.Held)
             .Set("runs", Interlocked.Read(ref _runs))
             .Set("last_seq", Volatile.Read(ref _lastSeq))
             .Set("ms_since_datagram", Math.Round(since))

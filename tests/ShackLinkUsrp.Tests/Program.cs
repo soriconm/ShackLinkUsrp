@@ -112,6 +112,7 @@ internal static partial class Program
         Run("9.23 DS4: 2R2T - a transmission beside two receivers, heard on both", SimTwoSidesTx);
         Run("9.23 DS2: what only a board can prove, pinned in the source", SidesSourceRules);
         Run("W1700K: the export's codec - upstream's conversion, raw and packed slices there and back", W1700kCodecCases);
+        Run("W1700K: the reorder window - out of order put back, a hole given up in its place, late after that", W1700kReorderCases);
         Run("W1700K: the band follows the frequency, the gain on upstream's measured steps, the filter", W1700kRuleCases);
         Run("W1700K: flatten (upstream's roll-off correction) and DC removal", W1700kConditionCases);
         Run("W1700K: a fake unit end to end - open, panorama, losses, retune, band switch, gain, refusals, a stream that dies", W1700kEndToEnd);
