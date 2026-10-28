@@ -163,19 +163,36 @@ internal sealed class W1700kCondition
 
     // ------------------------------------------------------------ the running filter
 
+    /// <summary>The most slices one <see cref="ProcessBatch"/> takes (64 Ki samples).</summary>
+    public const int MaxBatch = 32;
+
+    private const int Hist = 4 * Delay;  // the filter's history, as floats: 2 Delay complex samples
     private readonly int _block;
-    private readonly float[] _work;      // [history: 2 Delay complex][this block: _block complex][SIMD tail]
-    private readonly float[] _out;
+    private readonly int _n2;            // floats a slice
+    private readonly int _subs;          // DC stretches a slice
+    // Per slice of a batch, each touched by that slice's job alone: [history: Hist][this slice: _n2][SIMD tail], the filter's output,
+    // and the slice before it (its history); per stretch the sums before the DC comes off (I, Q), and the DC that comes off (I, Q).
+    private readonly float[]?[] _in = new float[MaxBatch][];
+    private readonly float[]?[] _out = new float[MaxBatch][];
+    private readonly short[]?[] _before = new short[MaxBatch][];
+    private readonly double[] _sums;
+    private readonly float[] _dc;
+    private readonly float[] _hist = new float[Hist];   // the last slice's input tail: the next batch's first history
     private float[]? _taps;
     private double _rateHz;
     private double _dcI, _dcQ;           // the DC estimate, in sc16 units
     private bool _primed;
+    private short[]? _single;
+    private short[][]? _singleSet;
+    private Action<int, short[]>? _singleFill;
 
     public W1700kCondition(int blockSamples = W1700kExport.SamplesPerSlice)
     {
         _block = blockSamples;
-        _work = new float[2 * (2 * Delay + _block) + 32];
-        _out = new float[2 * _block + 32];
+        _n2 = 2 * _block;
+        _subs = (_n2 + 2 * DcSubSamples - 1) / (2 * DcSubSamples);
+        _sums = new double[MaxBatch * 2 * _subs];
+        _dc = new float[MaxBatch * 2 * _subs];
     }
 
     /// <summary>Flatten the stream (when its rate has a table).</summary>
@@ -216,39 +233,88 @@ internal sealed class W1700kCondition
     /// about -30 dBc for one 5 kHz away (the gate caught it as that tone reading 0.23 dB high). Stepping every 16 samples (2.5 MHz at
     /// 40 MS/s) puts them near (corner / step rate) = -82 dBc of the signal, and the gate measures them (64 was -70).</para>
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Process(Span<short> iq)
     {
+        _single ??= new short[_n2];
+        _singleSet ??= new[] { _single };
+        _singleFill ??= (_, _) => { };              // the slice is in place already, and a batch of one never asks for the one before
+        iq.Slice(0, _n2).CopyTo(_single);
+        ProcessBatch(1, _singleFill, _singleSet, null);
+        _single.CopyTo(iq);
+    }
+
+    /// <summary>
+    /// Condition <paramref name="count"/> CONSECUTIVE slices (at most <see cref="MaxBatch"/>, no reset among them) into
+    /// <paramref name="iqs"/>[0 .. count), the same samples <see cref="Process"/> gives them one at a time - bit for bit
+    /// (W1700kConditionBatchCases, against the conditioner as it ran before). <paramref name="fill"/>(j, dst) writes slice j's sc16
+    /// samples; it may be called for a slice twice, for the slice after it needs its tail as the filter's history, so it must not
+    /// consume anything.
+    /// <para>What each slice needs only of itself is shared by <paramref name="team"/> (null: this thread): the fill, the slice before's
+    /// tail, the filter, and each stretch's sums - 95 % of the work. In order, on this thread: the DC estimate's recursion over those
+    /// sums (128 steps a slice), then the DC off, rounding and clipping.</para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public void ProcessBatch(int count, Action<int, short[]> fill, short[][] iqs, WorkTeam? team)
+    {
+        if (count <= 0) return;
+        if (count > MaxBatch) throw new ArgumentOutOfRangeException(nameof(count), $"at most {MaxBatch} slices a batch");
         bool flatten = Flattening, dc = RemoveDc;
-        if (!flatten && !dc) return;
-        int n2 = 2 * _block;
-        int hist = 4 * Delay;
-        if (flatten)
+        var taps = _taps;
+        if (flatten && !_primed)
         {
-            if (!_primed)
-            {
-                Array.Clear(_work, 0, hist);
-                _primed = true;
-            }
-            ToFloat(iq, _work.AsSpan(hist, n2));
-            Fir(_taps!, _work, _out, n2);
-            // The history for the next block: the last 2 Delay complex samples of this one's input.
-            Array.Copy(_work, n2, _work, 0, hist);
+            Array.Clear(_hist);
+            _primed = true;
         }
-        else ToFloat(iq, _out.AsSpan(0, n2));
-        long clipped = 0;
-        if (!dc) clipped = ToShort(_out, 0, iq, 0, 0, out _, out _);
-        else
+        int step = 2 * DcSubSamples;
+        void One(int j)
         {
-            double share = DcShare(_rateHz, DcSubSamples);
-            int step = 2 * DcSubSamples;
-            for (int at = 0; at < n2; at += step)
+            var iq = iqs[j];
+            fill(j, iq);
+            if (!flatten && !dc) return;
+            var o = _out[j] ??= new float[_n2 + 32];
+            if (flatten)
             {
-                int len = Math.Min(step, n2 - at);
-                clipped += ToShort(_out, at, iq.Slice(at, len), (float)_dcI, (float)_dcQ, out double sumI, out double sumQ);
-                _dcI += share * (sumI / (len / 2) - _dcI);
-                _dcQ += share * (sumQ / (len / 2) - _dcQ);
+                var x = _in[j] ??= new float[Hist + _n2 + 32];
+                if (j == 0) _hist.CopyTo(x, 0);
+                else
+                {
+                    // The slice before, read again: its job is writing its own buffer at this moment.
+                    var b = _before[j] ??= new short[_n2];
+                    fill(j - 1, b);
+                    ToFloat(b.AsSpan(_n2 - Hist, Hist), x.AsSpan(0, Hist));
+                }
+                ToFloat(iq.AsSpan(0, _n2), x.AsSpan(Hist, _n2));
+                Fir(taps!, x, o, _n2);
             }
+            else ToFloat(iq.AsSpan(0, _n2), o.AsSpan(0, _n2));
+            if (dc) Sums(o, _n2, step, _sums.AsSpan(j * 2 * _subs, 2 * _subs));
+        }
+        if (team == null || count == 1)
+            for (int j = 0; j < count; j++) One(j);
+        else team.Run(count, One);
+        if (!flatten && !dc) return;
+        if (flatten) Array.Copy(_in[count - 1]!, _n2, _hist, 0, Hist);   // the last slice's input tail, for the next batch
+        long clipped = 0;
+        double share = DcShare(_rateHz, DcSubSamples);
+        for (int j = 0; j < count; j++)
+        {
+            if (!dc)
+            {
+                clipped += ToShort(_out[j]!, _n2, step, ReadOnlySpan<float>.Empty, iqs[j]);
+                continue;
+            }
+            // The estimate each stretch has taken off it, and then moved by that stretch's mean: the serial chain, in order.
+            var sums = _sums.AsSpan(j * 2 * _subs, 2 * _subs);
+            var sub = _dc.AsSpan(j * 2 * _subs, 2 * _subs);
+            for (int at = 0, s = 0; at < _n2; at += step, s += 2)
+            {
+                int half = Math.Min(step, _n2 - at) / 2;
+                sub[s] = (float)_dcI;
+                sub[s + 1] = (float)_dcQ;
+                _dcI += share * (sums[s] / half - _dcI);
+                _dcQ += share * (sums[s + 1] / half - _dcQ);
+            }
+            clipped += ToShort(_out[j]!, _n2, step, sub, iqs[j]);
         }
         if (clipped > 0) Interlocked.Add(ref Clipped, clipped);
     }
@@ -275,52 +341,80 @@ internal sealed class W1700kCondition
     }
 
     /// <summary>
-    /// float to sc16: <paramref name="src"/> from float index <paramref name="at"/> into <paramref name="dst"/>, the DC
-    /// (<paramref name="subI"/>, <paramref name="subQ"/>) taken off, rounded to nearest, saturated at full scale with every saturated
-    /// sample counted. <paramref name="sumI"/> / <paramref name="sumQ"/>: the stretch's sums BEFORE the DC is taken off - what the
-    /// estimate moves by.
+    /// Each stretch of <paramref name="step"/> floats of <paramref name="src"/>: its sums BEFORE the DC is taken off, I and Q - what
+    /// the estimate moves by. The same additions in the same order as when they were taken inside the conversion to sc16 (eight lanes
+    /// summed sixteen floats at a time, then the lanes into a double, I from the even ones), so the estimate is the same to the bit.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static long ToShort(float[] src, int at, Span<short> dst, float subI, float subQ, out double sumI, out double sumQ)
+    private static void Sums(float[] src, int n2, int step, Span<double> sums)
     {
-        int n = dst.Length, i = 0;
-        long clipped = 0;
-        sumI = 0;
-        sumQ = 0;
-        if (Vector256.IsHardwareAccelerated && Avx.IsSupported)
+        bool vector = Vector256.IsHardwareAccelerated && Avx.IsSupported;
+        ref float s0 = ref MemoryMarshal.GetArrayDataReference(src);
+        for (int at = 0, k = 0; at < n2; at += step, k += 2)
         {
-            ref float s = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(src), at);
-            var sub = Vector256.Create(subI, subQ, subI, subQ, subI, subQ, subI, subQ);
-            var max = Vector256.Create(32767f);
-            var min = Vector256.Create(-32768f);
-            var sum = Vector256<float>.Zero;
-            for (; i + 16 <= n; i += 16)
+            int len = Math.Min(step, n2 - at), i = 0;
+            double sumI = 0, sumQ = 0;
+            if (vector)
             {
-                var a = Vector256.LoadUnsafe(ref s, (nuint)i);
-                var b = Vector256.LoadUnsafe(ref s, (nuint)(i + 8));
-                sum += a + b;
-                a -= sub;
-                b -= sub;
-                uint over = Vector256.ExtractMostSignificantBits(Vector256.GreaterThan(a, max) | Vector256.LessThan(a, min)) |
-                            Vector256.ExtractMostSignificantBits(Vector256.GreaterThan(b, max) | Vector256.LessThan(b, min)) << 8;
-                clipped += BitOperations.PopCount(over);
-                var ia = Vector256.ConvertToInt32(Avx.RoundToNearestInteger(Vector256.Min(Vector256.Max(a, min), max)));
-                var ib = Vector256.ConvertToInt32(Avx.RoundToNearestInteger(Vector256.Min(Vector256.Max(b, min), max)));
-                Vector256.Narrow(ia, ib).CopyTo(dst.Slice(i, 16));
+                ref float s = ref Unsafe.Add(ref s0, at);
+                var sum = Vector256<float>.Zero;
+                for (; i + 16 <= len; i += 16) sum += Vector256.LoadUnsafe(ref s, (nuint)i) + Vector256.LoadUnsafe(ref s, (nuint)(i + 8));
+                for (int e = 0; e < 8; e += 2)
+                {
+                    sumI += sum.GetElement(e);
+                    sumQ += sum.GetElement(e + 1);
+                }
             }
-            // Lanes alternate I, Q.
-            for (int k = 0; k < 8; k += 2)
+            for (; i < len; i += 2)
             {
-                sumI += sum.GetElement(k);
-                sumQ += sum.GetElement(k + 1);
+                sumI += src[at + i];
+                sumQ += src[at + i + 1];
             }
+            sums[k] = sumI;
+            sums[k + 1] = sumQ;
         }
-        for (; i < n; i += 2)
+    }
+
+    /// <summary>
+    /// float to sc16: <paramref name="src"/>'s <paramref name="n2"/> floats into <paramref name="dst"/>, each stretch of
+    /// <paramref name="step"/> with its own DC taken off (<paramref name="dc"/>: I, Q a stretch; empty = none), rounded to nearest,
+    /// saturated at full scale with every saturated sample counted.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static long ToShort(float[] src, int n2, int step, ReadOnlySpan<float> dc, Span<short> dst)
+    {
+        long clipped = 0;
+        bool vector = Vector256.IsHardwareAccelerated && Avx.IsSupported;
+        ref float s0 = ref MemoryMarshal.GetArrayDataReference(src);
+        var max = Vector256.Create(32767f);
+        var min = Vector256.Create(-32768f);
+        if (dc.IsEmpty) step = n2;
+        for (int at = 0, k = 0; at < n2; at += step, k += 2)
         {
-            sumI += src[at + i];
-            sumQ += src[at + i + 1];
-            dst[i] = Sat(MathF.Round(src[at + i] - subI), ref clipped);
-            dst[i + 1] = Sat(MathF.Round(src[at + i + 1] - subQ), ref clipped);
+            int len = Math.Min(step, n2 - at), i = 0;
+            float subI = dc.IsEmpty ? 0 : dc[k], subQ = dc.IsEmpty ? 0 : dc[k + 1];
+            var d = dst.Slice(at, len);
+            if (vector)
+            {
+                ref float s = ref Unsafe.Add(ref s0, at);
+                var sub = Vector256.Create(subI, subQ, subI, subQ, subI, subQ, subI, subQ);
+                for (; i + 16 <= len; i += 16)
+                {
+                    var a = Vector256.LoadUnsafe(ref s, (nuint)i) - sub;
+                    var b = Vector256.LoadUnsafe(ref s, (nuint)(i + 8)) - sub;
+                    uint over = Vector256.ExtractMostSignificantBits(Vector256.GreaterThan(a, max) | Vector256.LessThan(a, min)) |
+                                Vector256.ExtractMostSignificantBits(Vector256.GreaterThan(b, max) | Vector256.LessThan(b, min)) << 8;
+                    clipped += BitOperations.PopCount(over);
+                    var ia = Vector256.ConvertToInt32(Avx.RoundToNearestInteger(Vector256.Min(Vector256.Max(a, min), max)));
+                    var ib = Vector256.ConvertToInt32(Avx.RoundToNearestInteger(Vector256.Min(Vector256.Max(b, min), max)));
+                    Vector256.Narrow(ia, ib).CopyTo(d.Slice(i, 16));
+                }
+            }
+            for (; i < len; i += 2)
+            {
+                d[i] = Sat(MathF.Round(src[at + i] - subI), ref clipped);
+                d[i + 1] = Sat(MathF.Round(src[at + i + 1] - subQ), ref clipped);
+            }
         }
         return clipped;
     }
@@ -346,6 +440,33 @@ internal sealed class W1700kCondition
         ref float o = ref MemoryMarshal.GetArrayDataReference(output);
         ref float t = ref MemoryMarshal.GetArrayDataReference(taps);
         int f = 0;
+        // 512 bits where the processor runs them at full width (Zen 5: the filter 9.1 -> see docs/w1700k_support.md): the same
+        // multiply-adds in the same order for every output, so the same result to the bit as the 256-bit loop below.
+        if (Vector512.IsHardwareAccelerated)
+        {
+            for (; f + 64 <= n2; f += 64)
+            {
+                var c = Vector512.Create(Unsafe.Add(ref t, Delay));
+                nuint m = (nuint)(f + 2 * Delay);
+                var a0 = c * Vector512.LoadUnsafe(ref x, m);
+                var a1 = c * Vector512.LoadUnsafe(ref x, m + 16);
+                var a2 = c * Vector512.LoadUnsafe(ref x, m + 32);
+                var a3 = c * Vector512.LoadUnsafe(ref x, m + 48);
+                for (int k = 0; k < Delay; k++)
+                {
+                    var h = Vector512.Create(Unsafe.Add(ref t, k));
+                    nuint lo = (nuint)(f + 2 * k), hi = (nuint)(f + 2 * (Taps - 1 - k));
+                    a0 = Vector512.FusedMultiplyAdd(h, Vector512.LoadUnsafe(ref x, lo) + Vector512.LoadUnsafe(ref x, hi), a0);
+                    a1 = Vector512.FusedMultiplyAdd(h, Vector512.LoadUnsafe(ref x, lo + 16) + Vector512.LoadUnsafe(ref x, hi + 16), a1);
+                    a2 = Vector512.FusedMultiplyAdd(h, Vector512.LoadUnsafe(ref x, lo + 32) + Vector512.LoadUnsafe(ref x, hi + 32), a2);
+                    a3 = Vector512.FusedMultiplyAdd(h, Vector512.LoadUnsafe(ref x, lo + 48) + Vector512.LoadUnsafe(ref x, hi + 48), a3);
+                }
+                a0.StoreUnsafe(ref o, (nuint)f);
+                a1.StoreUnsafe(ref o, (nuint)f + 16);
+                a2.StoreUnsafe(ref o, (nuint)f + 32);
+                a3.StoreUnsafe(ref o, (nuint)f + 48);
+            }
+        }
         if (Vector256.IsHardwareAccelerated)
         {
             for (; f + 32 <= n2; f += 32)

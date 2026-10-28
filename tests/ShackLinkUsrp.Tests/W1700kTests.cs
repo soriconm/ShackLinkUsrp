@@ -728,6 +728,39 @@ internal static partial class Program
         W1700kExport.ConvertPacked(packed, back);
         Check(back.SequenceEqual(s), "a packed slice (8 samples in 7 words, upstream's rule): 2048 samples there and back, bit for bit");
 
+        // The vector conversions against the word-by-word reading, on EVERY bit pattern (spare bits set too, which a raw slice never
+        // carries): a raw word's I and Q; a packed group's seven words and its eighth sample out of their spare bits.
+        bool rawSame = true, packedSame = true;
+        var rb = new byte[W1700kExport.RawSliceBytes];
+        var pb = new byte[W1700kExport.PackedSliceBytes];
+        var got = new short[2 * W1700kExport.SamplesPerSlice];
+        for (int t = 0; t < 300; t++)
+        {
+            rnd.NextBytes(rb);
+            rnd.NextBytes(pb);
+            W1700kExport.ConvertRaw(rb, got);
+            for (int k = 0; k < W1700kExport.SamplesPerSlice; k++)
+            {
+                uint w = BinaryPrimitives.ReadUInt32LittleEndian(rb.AsSpan(4 * k));
+                if (got[2 * k] != W1700kExport.I(w) || got[2 * k + 1] != W1700kExport.Q(w)) rawSame = false;
+            }
+            W1700kExport.ConvertPacked(pb, got);
+            for (int g = 0; g < W1700kExport.SamplesPerSlice / 8; g++)
+            {
+                uint w7 = 0;
+                for (int k = 0; k < 7; k++)
+                {
+                    uint o = BinaryPrimitives.ReadUInt32LittleEndian(pb.AsSpan(4 * (7 * g + k)));
+                    uint w = o & ~W1700kExport.SpareMask;
+                    w7 |= (o & W1700kExport.SpareMask) >> (14 - 2 * k);
+                    if (got[2 * (8 * g + k)] != W1700kExport.I(w) || got[2 * (8 * g + k) + 1] != W1700kExport.Q(w)) packedSame = false;
+                }
+                if (got[2 * (8 * g + 7)] != W1700kExport.I(w7) || got[2 * (8 * g + 7) + 1] != W1700kExport.Q(w7)) packedSame = false;
+            }
+        }
+        Check(rawSame, "300 raw slices of random words: the vector conversion is the word-by-word one, sample for sample");
+        Check(packedSame, "300 packed slices of random words: the vector conversion is the word-by-word one, the eighth sample too");
+
         var dg = new byte[W1700kExport.HeaderBytes + W1700kExport.RawSliceBytes];
         int len = W1700kExport.Compose(dg, 123_456_789_012UL, raw);
         Check(W1700kExport.Classify(dg.AsSpan(0, len), out ulong seq, out int sb) == W1700kExport.Kind.Raw && seq == 123_456_789_012UL && sb == 8192,
@@ -899,6 +932,212 @@ internal static partial class Program
         double us = sw.Elapsed.TotalMilliseconds * 1000 / 2000;
         Console.WriteLine($"  INFO  flatten + DC: {F(us, "0.0")} us a slice, {F(2048 / us, "0.0")} MS/s on one thread ({F(us * 19531 / 1e4, "0.0")} % of a core at 40 MS/s)");
     }
+
+    private static void W1700kConditionBatchCases()
+    {
+        // The team: every item exactly once, across runs of every size; an item that throws comes back to the caller, the rest still run.
+        using (var t = new WorkTeam(3, "gate-team", ThreadPriority.Normal))
+        {
+            bool once = true;
+            for (int run = 0; run < 2000; run++)
+            {
+                int count = 1 + run % 40;
+                var hits = new int[count];
+                t.Run(count, j => Interlocked.Increment(ref hits[j]));
+                if (hits.Any(h => h != 1)) once = false;
+            }
+            Check(once, "2000 runs of 1-40 items over 3 helpers and the caller: every item done exactly once, and done when Run returns");
+            int ran = 0;
+            string thrown = RefusalOf(() => t.Run(8, j => { Interlocked.Increment(ref ran); if (j == 5) throw new InvalidOperationException("item 5"); }));
+            Check(thrown.Contains("item 5") && ran == 8, $"an item that throws reaches the caller ({thrown}), and the other 7 still ran ({ran})");
+            int after = 0;
+            t.Run(10, _ => Interlocked.Increment(ref after));
+            Check(after == 10, "...and the team works on after it");
+        }
+        Check(WorkTeam.HelpersFor(4) == 1 && WorkTeam.HelpersFor(16) == 2 && WorkTeam.HelpersFor(32) == 3 && WorkTeam.HelpersFor(128) == 3,
+              "helpers: one per eight logical processors, 1 to 3");
+        int alone = 0;
+        Check(RefusalOf(() => { using var none = new WorkTeam(0, "gate-none", ThreadPriority.Normal); none.Run(5, _ => alone++); }) == "" && alone == 5,
+              "a team of no helpers runs every item on the caller, and disposes cleanly");
+
+        // The batched conditioner against the one that ran on the unit (W1700kConditionReference, frozen): the same samples bit for bit,
+        // and the same clipped count, whatever the batches, with or without the team, at every rate and every setting.
+        const int Slices = 300, N2 = 2 * W1700kExport.SamplesPerSlice;
+        var rnd = new Random(11);
+        var source = new short[Slices][];
+        double p = 0;
+        for (int s = 0; s < Slices; s++)
+        {
+            var b = source[s] = new short[N2];
+            for (int i = 0; i < W1700kExport.SamplesPerSlice; i++, p++)
+            {
+                // A leak at DC that moves, a tone near the edge, one near the LO, noise - and every 37th slice driven past full scale.
+                double drive = s % 37 == 0 ? 3.0 : 1.0;
+                double re = 900 + 300 * Math.Sin(p * 1e-5) + 6000 * Math.Cos(0.44 * Math.PI * p) + 2500 * Math.Cos(2e-4 * p) + rnd.Next(-40, 41);
+                double im = -700 + 6000 * Math.Sin(0.44 * Math.PI * p) + 2500 * Math.Sin(2e-4 * p) + rnd.Next(-40, 41);
+                b[2 * i] = (short)Math.Clamp(Math.Round(re * drive), -16384, 16382);
+                b[2 * i + 1] = (short)Math.Clamp(Math.Round(im * drive), -16384, 16382);
+            }
+        }
+        var resets = new HashSet<int> { 0, 77, 78, 150, 151, 152, 260 };    // a restart before these slices
+        using var team = new WorkTeam(3, "gate-cond", ThreadPriority.Normal);
+        foreach (double rate in new[] { 40e6, 160e6, 320e6 })
+        foreach (var (flatten, dc) in new[] { (true, true), (true, false), (false, true), (false, false) })
+        foreach (bool shared in new[] { true, false })
+        {
+            var reference = new W1700kConditionReference { RateHz = rate, Flatten = flatten, RemoveDc = dc };
+            var want = new short[Slices][];
+            for (int s = 0; s < Slices; s++)
+            {
+                if (resets.Contains(s)) reference.Reset();
+                want[s] = (short[])source[s].Clone();
+                reference.Process(want[s]);
+            }
+            var cond = new W1700kCondition { RateHz = rate, Flatten = flatten, RemoveDc = dc };
+            var iqs = Enumerable.Range(0, W1700kCondition.MaxBatch).Select(_ => new short[N2]).ToArray();
+            var batchRnd = new Random((int)(rate / 1e6) + (flatten ? 1 : 0) + (dc ? 2 : 0));
+            int at = 0, first = -1;
+            bool same = true;
+            int largest = 0;
+            while (at < Slices)
+            {
+                if (resets.Contains(at)) cond.Reset();
+                // A batch never runs across a restart: it ends before the next one, as the worker's does at a reset marker.
+                int n = Math.Min(batchRnd.Next(1, W1700kCondition.MaxBatch + 1), Slices - at);
+                for (int k = 1; k < n; k++)
+                    if (resets.Contains(at + k)) { n = k; break; }
+                int from = at;
+                cond.ProcessBatch(n, (j, dst) => source[from + j].CopyTo(dst, 0), iqs, shared ? team : null);
+                for (int j = 0; j < n; j++)
+                    if (!iqs[j].AsSpan().SequenceEqual(want[at + j]))
+                    {
+                        if (first < 0) first = at + j;
+                        same = false;
+                    }
+                largest = Math.Max(largest, n);
+                at += n;
+            }
+            string setting = $"{rate / 1e6:0} MS/s, flatten {(flatten ? "on" : "off")}, DC {(dc ? "on" : "off")}, {(shared ? "team of 3" : "this thread")}";
+            Check(same && cond.Clipped == reference.Clipped,
+                  $"{setting}: {Slices} slices in batches of 1-{largest}, 7 restarts - bit for bit the reference" +
+                  (same ? $", clipped {cond.Clipped} = {reference.Clipped}" : $" - FIRST DIFFERENCE at slice {first}") + (cond.Clipped == reference.Clipped ? "" : $" - clipped {cond.Clipped} against {reference.Clipped}"));
+        }
+
+        // One at a time (Process, what the other cases drive) is the reference too.
+        var single = new W1700kCondition { RateHz = 160e6 };
+        var refOne = new W1700kConditionReference { RateHz = 160e6 };
+        bool oneSame = true;
+        for (int s = 0; s < 50; s++)
+        {
+            var a = (short[])source[s].Clone();
+            var b = (short[])source[s].Clone();
+            single.Process(a);
+            refOne.Process(b);
+            if (!a.AsSpan().SequenceEqual(b)) oneSame = false;
+        }
+        Check(oneSame, "Process, one slice at a time: bit for bit the reference");
+    }
+
+    /// <summary>
+    /// <c>--w1700k-cost [slices]</c>: what each stage of the conditioning worker costs a slice, on this machine, in this build, and the
+    /// share of one core each rate asks of it. An INSTRUMENT: it always exits 0. Run it from a Release build.
+    /// </summary>
+    private static int W1700kCost(string[] args)
+    {
+        int n = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 20000;
+        var rnd = new Random(1);
+        var raws = Enumerable.Range(0, 64).Select(_ => { var b = new byte[W1700kExport.RawSliceBytes]; rnd.NextBytes(b); return b; }).ToArray();
+        var packs = Enumerable.Range(0, 64).Select(_ => { var b = new byte[W1700kExport.PackedSliceBytes]; rnd.NextBytes(b); return b; }).ToArray();
+        var iq = new short[2 * W1700kExport.SamplesPerSlice];
+        var ring = new ShackLinkUsrp.Dsp.WideRing(1 << 24);
+        double Time(Action<int> one)
+        {
+            for (int i = 0; i < 3000; i++) one(i);                 // past the JIT's tiers
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < n; i++) one(i);
+            return sw.Elapsed.TotalMilliseconds * 1000 / n;
+        }
+        Console.WriteLine($"{n} slices a stage, {Environment.ProcessorCount} logical processors, {(Debugger.IsAttached ? "debugger" : "no debugger")}, " +
+                          $"Vector256 {Vector256Accelerated()}, Vector512 {System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated}");
+        var rows = new List<(string Name, double Us)>
+        {
+            ("convert raw", Time(i => W1700kExport.ConvertRaw(raws[i & 63], iq))),
+            ("convert packed", Time(i => W1700kExport.ConvertPacked(packs[i & 63], iq))),
+        };
+        foreach (double rate in new[] { 160e6, 320e6 })
+        {
+            var both = new W1700kCondition { RateHz = rate };
+            var flat = new W1700kCondition { RateHz = rate, RemoveDc = false };
+            var dc = new W1700kCondition { RateHz = rate, Flatten = false };
+            string r = $"{rate / 1e6:0}";
+            rows.Add(($"flatten + DC at {r}", Time(i => { W1700kExport.ConvertRaw(raws[i & 63], iq); both.Process(iq); }) - rows[0].Us));
+            rows.Add(($"flatten alone at {r}", Time(i => { W1700kExport.ConvertRaw(raws[i & 63], iq); flat.Process(iq); }) - rows[0].Us));
+            rows.Add(($"DC alone at {r}", Time(i => { W1700kExport.ConvertRaw(raws[i & 63], iq); dc.Process(iq); }) - rows[0].Us));
+        }
+        rows.Add(("ring write", Time(i => ring.Write(iq))));
+        foreach (var (name, us) in rows)
+            Console.WriteLine($"  {name,-22} {F(us, "0.00"),7} us   {F(2048 / us, "0"),6} MS/s on one thread   at 160 MS/s {F(us * 78125 / 1e4, "0"),4} % of a core, at 320 {F(us * 156250 / 1e4, "0"),4} %");
+
+        // The worker as it runs: a batch filled from the raw slices, conditioned (shared by the team), written to the ring in order.
+        // Wall time a slice, against the time between slices: 12.8 us at 160 MS/s, 6.4 at 320.
+        var iqs = Enumerable.Range(0, W1700kCondition.MaxBatch).Select(_ => new short[2 * W1700kExport.SamplesPerSlice]).ToArray();
+        foreach (int helpers in new[] { 0, WorkTeam.HelpersFor(Environment.ProcessorCount) })
+        {
+            using var team = new WorkTeam(helpers, "cost", ThreadPriority.AboveNormal);
+            foreach (var (rate, packed) in new[] { (160e6, false), (320e6, true) })
+            {
+                var cond = new W1700kCondition { RateHz = rate };
+                var src = packed ? packs : raws;
+                foreach (int b in new[] { 1, 4, 8, 16, 32 })
+                {
+                    int at = 0;
+                    Action<int, short[]> fill = packed ? (j, d) => W1700kExport.ConvertPacked(src[(at + j) & 63], d) : (j, d) => W1700kExport.ConvertRaw(src[(at + j) & 63], d);
+                    void Batch()
+                    {
+                        cond.ProcessBatch(b, fill, iqs, team);
+                        for (int j = 0; j < b; j++) ring.Write(iqs[j]);
+                        at += b;
+                    }
+                    for (int k = 0; k < 3000 / b + 1; k++) Batch();
+                    var sw = Stopwatch.StartNew();
+                    int batches = n / b;
+                    for (int k = 0; k < batches; k++) Batch();
+                    double us = sw.Elapsed.TotalMilliseconds * 1000 / (batches * b);
+                    double budget = 2048 / (rate / 1e6);
+                    Console.WriteLine($"  {rate / 1e6:0} MS/s {(packed ? "packed" : "raw   ")}, {helpers} helpers, batches of {b,2}: {F(us, "0.00"),6} us a slice, " +
+                                      $"{F(100 * us / budget, "0"),4} % of the time between slices{(us > budget ? "  - FALLS BEHIND" : "")}");
+                }
+            }
+        }
+
+        // Where the batch's time goes: the team alone on a fixed body (its scaling and hand-over), and the in-order part alone.
+        {
+            var x = new float[4 * W1700kCondition.Delay + 4096 + 32];
+            var o = new float[4096 + 32];
+            var taps = W1700kCondition.TapsFor(160e6)!;
+            var xs = Enumerable.Range(0, 32).Select(_ => (float[])x.Clone()).ToArray();
+            var os = Enumerable.Range(0, 32).Select(_ => (float[])o.Clone()).ToArray();
+            foreach (int helpers in new[] { 0, 1, 2, 3, 5, 7 })
+            {
+                using var team = new WorkTeam(helpers, "scale", ThreadPriority.AboveNormal);
+                for (int k = 0; k < 200; k++) team.Run(32, j => W1700kCondition.Fir(taps, xs[j], os[j], 4096));
+                var sw = Stopwatch.StartNew();
+                int runs = n / 32;
+                for (int k = 0; k < runs; k++) team.Run(32, j => W1700kCondition.Fir(taps, xs[j], os[j], 4096));
+                Console.WriteLine($"  the filter alone, 32 a run, {helpers} helpers: {F(sw.Elapsed.TotalMilliseconds * 1000 / (runs * 32), "0.00")} us a slice");
+            }
+            var seq = new W1700kCondition { RateHz = 160e6, Flatten = false };     // DC alone: what stays in order is most of it
+            int at2 = 0;
+            Action<int, short[]> fill2 = (j, d) => W1700kExport.ConvertRaw(raws[(at2 + j) & 63], d);
+            for (int k = 0; k < 200; k++) seq.ProcessBatch(32, fill2, iqs, null);
+            var sw2 = Stopwatch.StartNew();
+            for (int k = 0; k < n / 32; k++) { seq.ProcessBatch(32, fill2, iqs, null); for (int j = 0; j < 32; j++) ring.Write(iqs[j]); }
+            Console.WriteLine($"  DC + ring write, no filter, one thread: {F(sw2.Elapsed.TotalMilliseconds * 1000 / (n / 32 * 32), "0.00")} us a slice");
+        }
+        return 0;
+    }
+
+    private static bool Vector256Accelerated() => System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated;
 
     private static void W1700kEndToEnd()
     {

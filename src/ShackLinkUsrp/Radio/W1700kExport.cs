@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace ShackLinkUsrp.Radio;
 
@@ -60,26 +64,74 @@ internal static class W1700kExport
     /// <summary>What an sc16 sample here is, in the radio's 14-bit counts.</summary>
     public const int Scale = 2;
 
-    /// <summary>A raw slice's 2048 samples into <paramref name="iq"/> (interleaved I, Q: 4096 shorts).</summary>
+    /// <summary>One word's sample as the pair of shorts it becomes, read as one little-endian uint: I low, Q high.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint Pair(uint w) => (ushort)I(w) | ((uint)(ushort)Q(w) << 16);
+
+    /// <summary><see cref="I"/> and <see cref="Q"/> of eight words at once, as <see cref="Pair"/>s: the same shifts, lane by lane.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<uint> Pairs(Vector256<uint> w)
+    {
+        var i = Vector256.ShiftRightArithmetic(((w << 2) & Vector256.Create(0xFFFC_0000u)).AsInt32(), 17).AsUInt32();
+        var q = Vector256.ShiftRightArithmetic((w << 18).AsInt32(), 17).AsUInt32();
+        return (i & Vector256.Create(0xFFFFu)) | (q << 16);
+    }
+
+    /// <summary>A raw slice's 2048 samples into <paramref name="iq"/> (interleaved I, Q: 4096 shorts). Eight words at a time: the
+    /// per-word reading cost 4.6 us a slice, a third of a core at 160 MS/s (measured, Release, 2026-10-27).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void ConvertRaw(ReadOnlySpan<byte> slice, Span<short> iq)
     {
-        for (int k = 0, j = 0; k < SamplesPerSlice; k++, j += 2)
+        var words = MemoryMarshal.Cast<byte, uint>(slice.Slice(0, RawSliceBytes));
+        var pairs = MemoryMarshal.Cast<short, uint>(iq.Slice(0, 2 * SamplesPerSlice));
+        int k = 0;
+        if (Vector256.IsHardwareAccelerated && BitConverter.IsLittleEndian)
+        {
+            ref uint w = ref MemoryMarshal.GetReference(words);
+            ref uint o = ref MemoryMarshal.GetReference(pairs);
+            for (; k + 8 <= SamplesPerSlice; k += 8) Pairs(Vector256.LoadUnsafe(ref w, (nuint)k)).StoreUnsafe(ref o, (nuint)k);
+        }
+        for (; k < SamplesPerSlice; k++)
         {
             uint w = BinaryPrimitives.ReadUInt32LittleEndian(slice.Slice(4 * k));
-            iq[j] = I(w);
-            iq[j + 1] = Q(w);
+            iq[2 * k] = I(w);
+            iq[2 * k + 1] = Q(w);
         }
     }
 
     /// <summary>
     /// A packed slice's 2048 samples into <paramref name="iq"/>: each 7 words carry 8 samples. Words 0-6 are samples 0-6 with
     /// their spare bits cleared; sample 7 is the OR over k of <c>(o_k &amp; 0xC000C000) &gt;&gt; (14 - 2k)</c> (upstream's
-    /// pack: <c>o_k = w_k | ((w7 &lt;&lt; (14 - 2k)) &amp; 0xC000C000)</c>, docs/01 section 4).
+    /// pack: <c>o_k = w_k | ((w7 &lt;&lt; (14 - 2k)) &amp; 0xC000C000)</c>, docs/01 section 4). A group's seven words at once (AVX2:
+    /// the eighth lane, the next group's first word, is shifted out of sample 7 and its pair overwritten by it); the last group, whose
+    /// eighth word is past the slice, one word at a time. Per word it cost 6.7 us a slice, a core at 320 MS/s (measured).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void ConvertPacked(ReadOnlySpan<byte> slice, Span<short> iq)
     {
-        int j = 0;
-        for (int g = 0; g < SamplesPerSlice / 8; g++)
+        var words = MemoryMarshal.Cast<byte, uint>(slice.Slice(0, PackedSliceBytes));
+        var pairs = MemoryMarshal.Cast<short, uint>(iq.Slice(0, 2 * SamplesPerSlice));
+        const int Groups = SamplesPerSlice / 8;
+        int g = 0;
+        if (Avx2.IsSupported && BitConverter.IsLittleEndian)
+        {
+            ref uint w = ref MemoryMarshal.GetReference(words);
+            ref uint o = ref MemoryMarshal.GetReference(pairs);
+            var spare = Vector256.Create(SpareMask);
+            var keep = Vector256.Create(~SpareMask);
+            var shifts = Vector256.Create(14u, 12u, 10u, 8u, 6u, 4u, 2u, 32u);   // 32: the next group's word contributes nothing
+            for (; g < Groups - 1; g++)
+            {
+                var v = Vector256.LoadUnsafe(ref w, (nuint)(7 * g));
+                Pairs(v & keep).StoreUnsafe(ref o, (nuint)(8 * g));
+                var s = Avx2.ShiftRightLogicalVariable(v & spare, shifts);
+                var h = s.GetLower() | s.GetUpper();
+                h |= Vector128.Shuffle(h, Vector128.Create(2u, 3u, 0u, 1u));
+                h |= Vector128.Shuffle(h, Vector128.Create(1u, 0u, 3u, 2u));
+                Unsafe.Add(ref o, 8 * g + 7) = Pair(h.ToScalar());
+            }
+        }
+        for (; g < Groups; g++)
         {
             uint w7 = 0;
             for (int k = 0; k < 7; k++)
@@ -87,11 +139,11 @@ internal static class W1700kExport
                 uint o = BinaryPrimitives.ReadUInt32LittleEndian(slice.Slice(4 * (7 * g + k)));
                 uint w = o & ~SpareMask;
                 w7 |= (o & SpareMask) >> (14 - 2 * k);
-                iq[j++] = I(w);
-                iq[j++] = Q(w);
+                iq[2 * (8 * g + k)] = I(w);
+                iq[2 * (8 * g + k) + 1] = Q(w);
             }
-            iq[j++] = I(w7);
-            iq[j++] = Q(w7);
+            iq[2 * (8 * g + 7)] = I(w7);
+            iq[2 * (8 * g + 7) + 1] = Q(w7);
         }
     }
 

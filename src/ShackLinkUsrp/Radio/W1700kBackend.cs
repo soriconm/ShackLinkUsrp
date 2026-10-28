@@ -48,6 +48,10 @@ internal sealed class W1700kBackendOptions
     /// <summary>A stream this sidecar started that delivers nothing this long is a fault, in words.</summary>
     public int SilenceFaultMs = 3000;
 
+    /// <summary>Threads beside the conditioning worker that share a batch's slices (<see cref="WorkTeam"/>): by default one per eight
+    /// logical processors, 1 to 3. They sleep while the worker keeps up alone.</summary>
+    public int ConditionHelpers = WorkTeam.HelpersFor(Environment.ProcessorCount);
+
     /// <summary>How far ahead of a hole a datagram may arrive before the hole is given up (<see cref="W1700kReorder"/>); a power of two.</summary>
     public int ReorderWindow = W1700kReorder.DefaultWindow;
 
@@ -517,6 +521,7 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
         private readonly int _mask;
         private readonly SemaphoreSlim _items = new(0);
         private long _head, _tail;
+        private long _taken;      // the worker's: slots handed to it and not yet released (between _tail and here)
 
         public SliceQueue(int slots)
         {
@@ -542,25 +547,29 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
             return true;
         }
 
-        /// <summary>The worker's: the next slot, left in place (the writer cannot reuse it) until <see cref="Done"/>.</summary>
+        /// <summary>The worker's: the next slot, left in place (the writer cannot reuse it) until <see cref="Done"/> releases it. Several
+        /// may be taken before any is released (a batch).</summary>
         public bool TryTake(int timeoutMs, out byte kind, out byte[] data)
         {
             kind = 0;
             data = Array.Empty<byte>();
             if (!_items.Wait(timeoutMs)) return false;
-            int i = (int)(_tail & _mask);
+            int i = (int)(_taken & _mask);
+            _taken++;
             kind = _kind[i];
             data = _data[i];
             return true;
         }
 
-        public void Done() => Volatile.Write(ref _tail, _tail + 1);
+        /// <summary>The oldest <paramref name="n"/> slots taken are free for the writer again.</summary>
+        public void Done(int n = 1) => Volatile.Write(ref _tail, _tail + n);
     }
 
     private readonly SliceQueue _queue = new(4096);       // 32 MiB: 0.2 s at 40 MS/s
     private Thread? _worker;
     private volatile bool _resetWanted;
     private long _queueDropped, _queueMaxDepth;
+    private long _batches, _batchMax;           // the worker's: batches conditioned, and the largest
 
     private void ReceiveLoop()
     {
@@ -678,15 +687,48 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
         AddOverflows((long)count * W1700kExport.SamplesPerSlice);
     }
 
-    /// <summary>The worker: each slice to sc16, flattened and its DC taken out, into the ring - the ONLY writer of the ring, and the
-    /// only thread that touches the conditioner, at the rate the unit last stated (picked up between slices, never under one).</summary>
+    /// <summary>The worker: the slices to sc16, flattened and their DC taken out, into the ring - the ONLY writer of the ring, and the
+    /// only thread that drives the conditioner, at the rate the unit last stated (picked up between batches, never under one).
+    /// <para>It takes what has piled up as ONE batch (up to <see cref="W1700kCondition.MaxBatch"/>, never across a restart marker) and
+    /// a <see cref="WorkTeam"/> shares each slice's own work: one thread could not flatten 160 MS/s (12.2 us a slice against 12.8
+    /// between slices, measured Release, 2026-10-27). While it keeps up a batch is one slice and the team sleeps.</para></summary>
     private void ConditionLoop()
     {
-        var iq = new short[2 * W1700kExport.SamplesPerSlice];
+        const int Max = W1700kCondition.MaxBatch;
         var ring = RingOf(RxSides.A);
+        var kinds = new byte[Max];
+        var raws = new byte[Max][];
+        var iqs = new short[Max][];
+        for (int j = 0; j < Max; j++) iqs[j] = new short[2 * W1700kExport.SamplesPerSlice];
+        Action<int, short[]> fill = (j, dst) =>
+        {
+            if (kinds[j] == SliceQueue.Raw) W1700kExport.ConvertRaw(raws[j], dst);
+            else W1700kExport.ConvertPacked(raws[j], dst);
+        };
+        using var team = new WorkTeam(_opt.ConditionHelpers, "W1700kCondition+", ThreadPriority.AboveNormal);
         while (!_stopRx)
         {
             if (!_queue.TryTake(200, out byte kind, out byte[] data)) continue;
+            int n = 0, taken = 1;
+            bool resetAfter = false;
+            if (kind == SliceQueue.Reset) resetAfter = true;
+            else
+            {
+                kinds[0] = kind;
+                raws[0] = data;
+                n = 1;
+                while (n < Max && _queue.TryTake(0, out kind, out data))
+                {
+                    taken++;
+                    if (kind == SliceQueue.Reset)
+                    {
+                        resetAfter = true;
+                        break;
+                    }
+                    kinds[n] = kind;
+                    raws[n++] = data;
+                }
+            }
             try
             {
                 if (_resetWanted)
@@ -694,22 +736,21 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
                     _resetWanted = false;
                     _cond.Reset();
                 }
-                if (kind == SliceQueue.Reset)
+                if (n > 0)
                 {
-                    _cond.Reset();
-                    continue;
+                    double rate = Volatile.Read(ref _condRateHz);
+                    if (rate != _cond.RateHz) _cond.RateHz = rate;
+                    _cond.ProcessBatch(n, fill, iqs, team);
+                    if (n > _batchMax) _batchMax = n;
+                    _batches++;
                 }
-                if (kind == SliceQueue.Raw) W1700kExport.ConvertRaw(data, iq);
-                else W1700kExport.ConvertPacked(data, iq);
             }
             finally
             {
-                _queue.Done();
+                _queue.Done(taken);
             }
-            double rate = Volatile.Read(ref _condRateHz);
-            if (rate != _cond.RateHz) _cond.RateHz = rate;
-            _cond.Process(iq);
-            ring.Write(iq);
+            for (int j = 0; j < n; j++) ring.Write(iqs[j]);
+            if (resetAfter) _cond.Reset();
         }
     }
 
@@ -964,6 +1005,9 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
             .Set("queue_max_depth", Interlocked.Read(ref _queueMaxDepth))
             .Set("queue_capacity", _queue.Capacity)
             .Set("queue_dropped", Interlocked.Read(ref _queueDropped))
+            .Set("condition_helpers", _opt.ConditionHelpers)
+            .Set("condition_batches", Interlocked.Read(ref _batches))
+            .Set("condition_batch_max", Interlocked.Read(ref _batchMax))
             .Set("unit_busy", st?.GetString("busy") ?? "")
             .Set("unit_error", st?.GetString("error") ?? "")
             .Set("unit_stream_running", st?.GetObject("stream")?.GetBool("running") ?? false);

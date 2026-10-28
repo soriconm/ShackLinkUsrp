@@ -34,6 +34,7 @@ internal static partial class Program
         if (args.Length > 0 && args[0] == "--live") return LiveRun(args);
         if (args.Length > 1 && args[0] == "--w1700k-replay") return W1700kReplay(args);
         if (args.Length > 1 && args[0] == "--w1700k-probe") return W1700kProbe(args);
+        if (args.Length > 0 && args[0] == "--w1700k-cost") return W1700kCost(args);
         // P0 of ShackLink docs/skimmer_support.md section 26 (BandChannelProbe.cs): instruments, never gates.
         if (args.Length > 0 && args[0] == "--fir-response") return FirResponse(args);
         if (args.Length > 0 && args[0] == "--fir-scaling") return FirScaling(args);
@@ -115,6 +116,7 @@ internal static partial class Program
         Run("W1700K: the reorder window - out of order put back, a hole given up in its place, late after that", W1700kReorderCases);
         Run("W1700K: the band follows the frequency, the gain on upstream's measured steps, the filter", W1700kRuleCases);
         Run("W1700K: flatten (upstream's roll-off correction) and DC removal", W1700kConditionCases);
+        Run("W1700K: the conditioner in batches shared by a team - bit for bit the one that ran on the unit", W1700kConditionBatchCases);
         Run("W1700K: a fake unit end to end - open, panorama, losses, retune, band switch, gain, refusals, a stream that dies", W1700kEndToEnd);
         Run("W1700K: closing stops the unit's stream", W1700kClose);
         Run("W1700K: a unit already streaming, a cold one, one out of reach, a port another receiver holds", W1700kRefusals);
