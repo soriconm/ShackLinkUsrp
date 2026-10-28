@@ -687,47 +687,80 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
         AddOverflows((long)count * W1700kExport.SamplesPerSlice);
     }
 
+    /// <summary>The batch the worker has taken: its raw slots (not yet released) and their kinds - read only by its shared part, so
+    /// ONE set serves, refilled once that is done (the batch in hand keeps its slices in the <see cref="W1700kCondition.Overlap"/>).</summary>
+    private sealed class TakenBatch
+    {
+        public readonly byte[] Kinds = new byte[W1700kCondition.MaxBatch];
+        public readonly byte[][] Raws = new byte[W1700kCondition.MaxBatch][];
+        public readonly Action<int, short[]> Fill;
+        public int Count, Taken;
+        public bool ResetAfter;
+
+        public TakenBatch()
+        {
+            Fill = (j, dst) =>
+            {
+                if (Kinds[j] == SliceQueue.Raw) W1700kExport.ConvertRaw(Raws[j], dst);
+                else W1700kExport.ConvertPacked(Raws[j], dst);
+            };
+        }
+    }
+
+    /// <summary>What has piled up, as one batch into <paramref name="s"/>: never across a restart marker (it ends the batch, and
+    /// <see cref="TakenBatch.ResetAfter"/> says so). False = nothing arrived within <paramref name="waitMs"/>.</summary>
+    private bool TakeBatch(TakenBatch s, int waitMs)
+    {
+        s.Count = 0;
+        s.Taken = 0;
+        s.ResetAfter = false;
+        if (!_queue.TryTake(waitMs, out byte kind, out byte[] data)) return false;
+        s.Taken = 1;
+        if (kind == SliceQueue.Reset)
+        {
+            s.ResetAfter = true;
+            return true;
+        }
+        s.Kinds[0] = kind;
+        s.Raws[0] = data;
+        s.Count = 1;
+        while (s.Count < W1700kCondition.MaxBatch && _queue.TryTake(0, out kind, out data))
+        {
+            s.Taken++;
+            if (kind == SliceQueue.Reset)
+            {
+                s.ResetAfter = true;
+                break;
+            }
+            s.Kinds[s.Count] = kind;
+            s.Raws[s.Count++] = data;
+        }
+        return true;
+    }
+
     /// <summary>The worker: the slices to sc16, flattened and their DC taken out, into the ring - the ONLY writer of the ring, and the
     /// only thread that drives the conditioner, at the rate the unit last stated (picked up between batches, never under one).
     /// <para>It takes what has piled up as ONE batch (up to <see cref="W1700kCondition.MaxBatch"/>, never across a restart marker) and
     /// a <see cref="WorkTeam"/> shares each slice's own work: one thread could not flatten 160 MS/s (12.2 us a slice against 12.8
-    /// between slices, measured Release, 2026-10-27). While it keeps up a batch is one slice and the team sleeps.</para></summary>
+    /// between slices, measured Release, 2026-10-27). Each batch's in-order part and ring write run beside the NEXT one's shared part
+    /// (<see cref="W1700kCondition.Overlap"/>). While it keeps up a batch is one slice and the team sleeps.</para></summary>
     private void ConditionLoop()
     {
-        const int Max = W1700kCondition.MaxBatch;
         var ring = RingOf(RxSides.A);
-        var kinds = new byte[Max];
-        var raws = new byte[Max][];
-        var iqs = new short[Max][];
-        for (int j = 0; j < Max; j++) iqs[j] = new short[2 * W1700kExport.SamplesPerSlice];
-        Action<int, short[]> fill = (j, dst) =>
+        Action<short[][], int> write = (iqs, n) =>
         {
-            if (kinds[j] == SliceQueue.Raw) W1700kExport.ConvertRaw(raws[j], dst);
-            else W1700kExport.ConvertPacked(raws[j], dst);
+            for (int j = 0; j < n; j++) ring.Write(iqs[j]);
         };
+        var s = new TakenBatch();
         using var team = new WorkTeam(_opt.ConditionHelpers, "W1700kCondition+", ThreadPriority.AboveNormal);
+        // Each batch's shared part on the team BESIDE the batch before it ending here (W1700kCondition.Overlap, the one owner of that order).
+        var overlap = new W1700kCondition.Overlap(_cond, team);
         while (!_stopRx)
         {
-            if (!_queue.TryTake(200, out byte kind, out byte[] data)) continue;
-            int n = 0, taken = 1;
-            bool resetAfter = false;
-            if (kind == SliceQueue.Reset) resetAfter = true;
-            else
+            if (!TakeBatch(s, overlap.Holding ? 0 : 200))
             {
-                kinds[0] = kind;
-                raws[0] = data;
-                n = 1;
-                while (n < Max && _queue.TryTake(0, out kind, out data))
-                {
-                    taken++;
-                    if (kind == SliceQueue.Reset)
-                    {
-                        resetAfter = true;
-                        break;
-                    }
-                    kinds[n] = kind;
-                    raws[n++] = data;
-                }
+                overlap.Flush(write);                       // nothing has piled up: finish the one in hand, then wait
+                continue;
             }
             try
             {
@@ -736,21 +769,21 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
                     _resetWanted = false;
                     _cond.Reset();
                 }
-                if (n > 0)
+                if (s.Count > 0)
                 {
                     double rate = Volatile.Read(ref _condRateHz);
                     if (rate != _cond.RateHz) _cond.RateHz = rate;
-                    _cond.ProcessBatch(n, fill, iqs, team);
-                    if (n > _batchMax) _batchMax = n;
+                    overlap.Next(s.Count, s.Fill, write);
+                    if (s.Count > _batchMax) _batchMax = s.Count;
                     _batches++;
                 }
+                else overlap.Flush(write);
             }
             finally
             {
-                _queue.Done(taken);
+                _queue.Done(s.Taken);                       // its raw slots are read
             }
-            for (int j = 0; j < n; j++) ring.Write(iqs[j]);
-            if (resetAfter) _cond.Reset();
+            if (s.ResetAfter) _cond.Reset();
         }
     }
 

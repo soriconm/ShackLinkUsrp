@@ -14,7 +14,7 @@ namespace ShackLinkUsrp.Radio;
 /// </summary>
 internal sealed class WorkTeam : IDisposable
 {
-    private sealed class Job
+    internal sealed class Job
     {
         public Action<int> Body = null!;
         public int Count, Next, Remaining;
@@ -75,6 +75,39 @@ internal sealed class WorkTeam : IDisposable
         var job = new Job { Body = body, Count = count, Remaining = count, Done = _done };
         _job = job;
         _go.Release(Math.Min(_threads.Length, count - 1));
+        job.Work();
+        _done.Wait();
+        job.Error?.Throw();
+    }
+
+    /// <summary>A job the helpers have started and the caller has not joined yet (<see cref="Start"/>).</summary>
+    internal sealed class Started
+    {
+        internal Job? Job;
+    }
+
+    /// <summary>body(0) .. body(count - 1) started on the HELPERS alone, so the caller can do other work meanwhile; <see cref="Join"/>
+    /// then works what is left and waits for the rest. ONE started job at a time: join it before starting another (the team's
+    /// completion signal is one per job). No helpers: nothing starts, and Join does it all.</summary>
+    public Started Start(int count, Action<int> body)
+    {
+        if (count <= 0) return new Started();
+        var job = new Job { Body = body, Count = count, Remaining = count, Done = _done };
+        if (_threads.Length > 0 && !_stop)
+        {
+            _job = job;
+            _go.Release(Math.Min(_threads.Length, count));
+        }
+        return new Started { Job = job };
+    }
+
+    /// <summary>The caller works what is left of a <see cref="Start"/>ed job, then waits for the helpers' items; the first exception
+    /// any item threw is rethrown here.</summary>
+    public void Join(Started started)
+    {
+        var job = started.Job;
+        if (job == null) return;
+        started.Job = null;
         job.Work();
         _done.Wait();
         job.Error?.Throw();

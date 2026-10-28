@@ -170,29 +170,129 @@ internal sealed class W1700kCondition
     private readonly int _block;
     private readonly int _n2;            // floats a slice
     private readonly int _subs;          // DC stretches a slice
-    // Per slice of a batch, each touched by that slice's job alone: [history: Hist][this slice: _n2][SIMD tail], the filter's output,
-    // and the slice before it (its history); per stretch the sums before the DC comes off (I, Q), and the DC that comes off (I, Q).
-    private readonly float[]?[] _in = new float[MaxBatch][];
-    private readonly float[]?[] _out = new float[MaxBatch][];
-    private readonly short[]?[] _before = new short[MaxBatch][];
-    private readonly double[] _sums;
-    private readonly float[] _dc;
     private readonly float[] _hist = new float[Hist];   // the last slice's input tail: the next batch's first history
     private float[]? _taps;
     private double _rateHz;
     private double _dcI, _dcQ;           // the DC estimate, in sc16 units
     private bool _primed;
+    private readonly Batch _own;         // ProcessBatch's
     private short[]? _single;
     private short[][]? _singleSet;
     private Action<int, short[]>? _singleFill;
+
+    /// <summary>
+    /// One batch between its SHARED part (<see cref="Job"/>, per slice, any thread) and its IN-ORDER part (<see cref="End"/>). A worker
+    /// keeps two, so one batch's in-order part runs beside the next one's shared part (<see cref="Begin"/>). Per slice, each touched by
+    /// that slice's job alone: [history: Hist][this slice][SIMD tail], the filter's output, the slice before it (its history); per
+    /// stretch the sums before the DC comes off (I, Q), and the DC that comes off (I, Q). And what the batch was begun with.
+    /// </summary>
+    public sealed class Batch
+    {
+        internal readonly float[]?[] In = new float[MaxBatch][];
+        internal readonly float[]?[] Out = new float[MaxBatch][];
+        internal readonly short[]?[] Before = new short[MaxBatch][];
+        internal readonly double[] Sums;
+        internal readonly float[] Dc;
+        internal int Count;
+        internal bool Flatten, RemoveDc;
+        internal float[]? Taps;
+        internal double RateHz;
+        internal Action<int, short[]> Fill = (_, _) => { };
+        internal short[][] Iqs = Array.Empty<short[]>();
+
+        /// <summary>The shared part of slice j: hand it to <see cref="WorkTeam.Run"/> or <see cref="WorkTeam.Start"/> for 0 .. count - 1.</summary>
+        public Action<int> Job { get; }
+
+        internal Batch(W1700kCondition owner)
+        {
+            Sums = new double[MaxBatch * 2 * owner._subs];
+            Dc = new float[MaxBatch * 2 * owner._subs];
+            Job = j => owner.SharedOne(this, j);
+        }
+    }
 
     public W1700kCondition(int blockSamples = W1700kExport.SamplesPerSlice)
     {
         _block = blockSamples;
         _n2 = 2 * _block;
         _subs = (_n2 + 2 * DcSubSamples - 1) / (2 * DcSubSamples);
-        _sums = new double[MaxBatch * 2 * _subs];
-        _dc = new float[MaxBatch * 2 * _subs];
+        _own = new Batch(this);
+    }
+
+    /// <summary>A batch of this conditioner's own (a worker that overlaps keeps two).</summary>
+    public Batch NewBatch() => new(this);
+
+    /// <summary>
+    /// The worker's schedule (<c>W1700kBackend.ConditionLoop</c>), the ONE owner of its order, which the gate drives as it is: each
+    /// batch's shared part runs on the team while the batch before it ENDS on the caller - its in-order part, then
+    /// <c>finished</c>(its slices, its count), where the caller writes the ring - and is then joined. With nothing in hand there is
+    /// nothing to overlap, and a batch runs as <see cref="ProcessBatch"/> would (one slice: on the caller, no hand-over). Measured,
+    /// Release, 3 helpers: 320 MS/s packed 5.5 -> 4.0 us a slice (6.4 between slices), 160 raw 5.3 -> 3.7 (12.8).
+    /// <para>Between two calls the caller may <see cref="Reset"/> the conditioner or change its rate: that falls between one batch's
+    /// <see cref="Shared"/> and the next one's <see cref="Begin"/>, which is where both belong.</para>
+    /// </summary>
+    public sealed class Overlap
+    {
+        private readonly W1700kCondition _cond;
+        private readonly WorkTeam? _team;
+        private readonly (Batch Batch, short[][] Iqs)[] _sets;
+        private int _next;
+        private int _holding = -1;               // the set whose in-order part has not run yet
+
+        public Overlap(W1700kCondition cond, WorkTeam? team)
+        {
+            _cond = cond;
+            _team = team;
+            _sets = new (Batch, short[][])[2];
+            for (int k = 0; k < 2; k++)
+                _sets[k] = (cond.NewBatch(), Enumerable.Range(0, MaxBatch).Select(_ => new short[cond._n2]).ToArray());
+        }
+
+        /// <summary>A batch is in hand: its shared part is done and its in-order part is not (<see cref="Flush"/> finishes it).</summary>
+        public bool Holding => _holding >= 0;
+
+        /// <summary>The next <paramref name="count"/> consecutive slices (<paramref name="fill"/> as for <see cref="ProcessBatch"/>; it
+        /// is not called again once this returns). The batch in hand, if any, is finished meanwhile; this one is then in hand.</summary>
+        public void Next(int count, Action<int, short[]> fill, Action<short[][], int> finished)
+        {
+            var (batch, iqs) = _sets[_next];
+            _cond.Begin(batch, count, fill, iqs);
+            if (_holding < 0)
+            {
+                if (_team == null) for (int j = 0; j < count; j++) batch.Job(j);
+                else _team.Run(count, batch.Job);
+            }
+            else
+            {
+                var (held, heldIqs) = _sets[_holding];
+                if (_team == null)
+                {
+                    for (int j = 0; j < count; j++) batch.Job(j);
+                    _cond.End(held);
+                    finished(heldIqs, held.Count);
+                }
+                else
+                {
+                    var started = _team.Start(count, batch.Job);
+                    _cond.End(held);
+                    finished(heldIqs, held.Count);
+                    _team.Join(started);
+                }
+            }
+            _cond.Shared(batch);
+            _holding = _next;
+            _next ^= 1;
+        }
+
+        /// <summary>Finish the batch in hand, if any: its in-order part, then <paramref name="finished"/>.</summary>
+        public void Flush(Action<short[][], int> finished)
+        {
+            if (_holding < 0) return;
+            var (held, heldIqs) = _sets[_holding];
+            _holding = -1;
+            _cond.End(held);
+            finished(heldIqs, held.Count);
+        }
     }
 
     /// <summary>Flatten the stream (when its rate has a table).</summary>
@@ -253,59 +353,95 @@ internal sealed class W1700kCondition
     /// tail, the filter, and each stretch's sums - 95 % of the work. In order, on this thread: the DC estimate's recursion over those
     /// sums (128 steps a slice), then the DC off, rounding and clipping.</para>
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void ProcessBatch(int count, Action<int, short[]> fill, short[][] iqs, WorkTeam? team)
     {
         if (count <= 0) return;
-        if (count > MaxBatch) throw new ArgumentOutOfRangeException(nameof(count), $"at most {MaxBatch} slices a batch");
-        bool flatten = Flattening, dc = RemoveDc;
-        var taps = _taps;
-        if (flatten && !_primed)
+        Begin(_own, count, fill, iqs);
+        if (team == null || count == 1)
+            for (int j = 0; j < count; j++) _own.Job(j);
+        else team.Run(count, _own.Job);
+        Shared(_own);
+        End(_own);
+    }
+
+    /// <summary>
+    /// Begin <paramref name="b"/> as the next <paramref name="count"/> consecutive slices (see <see cref="ProcessBatch"/>): it takes
+    /// the settings in force now, and the history the batch before left. Then run its <see cref="Batch.Job"/> for every slice, call
+    /// <see cref="Shared"/>, and later <see cref="End"/>. Batches are begun, shared and ended in stream order; the one rule the overlap
+    /// adds is that a batch's <see cref="Shared"/> comes before the next one's Begin, and its End before the next one's End.
+    /// </summary>
+    public void Begin(Batch b, int count, Action<int, short[]> fill, short[][] iqs)
+    {
+        if (count <= 0 || count > MaxBatch) throw new ArgumentOutOfRangeException(nameof(count), $"1 to {MaxBatch} slices a batch");
+        b.Count = count;
+        b.Fill = fill;
+        b.Iqs = iqs;
+        b.Flatten = Flattening;
+        b.RemoveDc = RemoveDc;
+        b.Taps = _taps;
+        b.RateHz = _rateHz;
+        if (b.Flatten && !_primed)
         {
             Array.Clear(_hist);
             _primed = true;
         }
-        int step = 2 * DcSubSamples;
-        void One(int j)
+    }
+
+    /// <summary>The shared part of slice j: the fill, the slice before's tail (or the history), the filter, the stretch sums.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private void SharedOne(Batch b, int j)
+    {
+        var iq = b.Iqs[j];
+        b.Fill(j, iq);
+        if (!b.Flatten && !b.RemoveDc) return;
+        var o = b.Out[j] ??= new float[_n2 + 32];
+        if (b.Flatten)
         {
-            var iq = iqs[j];
-            fill(j, iq);
-            if (!flatten && !dc) return;
-            var o = _out[j] ??= new float[_n2 + 32];
-            if (flatten)
+            var x = b.In[j] ??= new float[Hist + _n2 + 32];
+            if (j == 0) _hist.CopyTo(x, 0);
+            else
             {
-                var x = _in[j] ??= new float[Hist + _n2 + 32];
-                if (j == 0) _hist.CopyTo(x, 0);
-                else
-                {
-                    // The slice before, read again: its job is writing its own buffer at this moment.
-                    var b = _before[j] ??= new short[_n2];
-                    fill(j - 1, b);
-                    ToFloat(b.AsSpan(_n2 - Hist, Hist), x.AsSpan(0, Hist));
-                }
-                ToFloat(iq.AsSpan(0, _n2), x.AsSpan(Hist, _n2));
-                Fir(taps!, x, o, _n2);
+                // The slice before, read again: its job is writing its own buffer at this moment.
+                var before = b.Before[j] ??= new short[_n2];
+                b.Fill(j - 1, before);
+                ToFloat(before.AsSpan(_n2 - Hist, Hist), x.AsSpan(0, Hist));
             }
-            else ToFloat(iq.AsSpan(0, _n2), o.AsSpan(0, _n2));
-            if (dc) Sums(o, _n2, step, _sums.AsSpan(j * 2 * _subs, 2 * _subs));
+            ToFloat(iq.AsSpan(0, _n2), x.AsSpan(Hist, _n2));
+            Fir(b.Taps!, x, o, _n2);
         }
-        if (team == null || count == 1)
-            for (int j = 0; j < count; j++) One(j);
-        else team.Run(count, One);
-        if (!flatten && !dc) return;
-        if (flatten) Array.Copy(_in[count - 1]!, _n2, _hist, 0, Hist);   // the last slice's input tail, for the next batch
+        else ToFloat(iq.AsSpan(0, _n2), o.AsSpan(0, _n2));
+        if (b.RemoveDc) Sums(o, _n2, 2 * DcSubSamples, b.Sums.AsSpan(j * 2 * _subs, 2 * _subs));
+    }
+
+    /// <summary>Every slice's shared part is done: the last one's input tail becomes the next batch's history. Before the next
+    /// <see cref="Begin"/>; nothing else may run beside it.</summary>
+    public void Shared(Batch b)
+    {
+        if (b.Flatten && b.Count > 0) Array.Copy(b.In[b.Count - 1]!, _n2, _hist, 0, Hist);
+    }
+
+    /// <summary>
+    /// The in-order part: the DC estimate's recursion over the batch's sums, then the DC off, rounding and clipping, into its slices.
+    /// The ONE place the DC estimate moves, so batches end in stream order; it touches nothing the next batch's shared part does, so it
+    /// may run beside it.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public void End(Batch b)
+    {
+        if (!b.Flatten && !b.RemoveDc) return;
+        int step = 2 * DcSubSamples;
         long clipped = 0;
-        double share = DcShare(_rateHz, DcSubSamples);
-        for (int j = 0; j < count; j++)
+        double share = DcShare(b.RateHz, DcSubSamples);
+        for (int j = 0; j < b.Count; j++)
         {
-            if (!dc)
+            if (!b.RemoveDc)
             {
-                clipped += ToShort(_out[j]!, _n2, step, ReadOnlySpan<float>.Empty, iqs[j]);
+                clipped += ToShort(b.Out[j]!, _n2, step, ReadOnlySpan<float>.Empty, b.Iqs[j]);
                 continue;
             }
             // The estimate each stretch has taken off it, and then moved by that stretch's mean: the serial chain, in order.
-            var sums = _sums.AsSpan(j * 2 * _subs, 2 * _subs);
-            var sub = _dc.AsSpan(j * 2 * _subs, 2 * _subs);
+            var sums = b.Sums.AsSpan(j * 2 * _subs, 2 * _subs);
+            var sub = b.Dc.AsSpan(j * 2 * _subs, 2 * _subs);
             for (int at = 0, s = 0; at < _n2; at += step, s += 2)
             {
                 int half = Math.Min(step, _n2 - at) / 2;
@@ -314,7 +450,7 @@ internal sealed class W1700kCondition
                 _dcI += share * (sums[s] / half - _dcI);
                 _dcQ += share * (sums[s + 1] / half - _dcQ);
             }
-            clipped += ToShort(_out[j]!, _n2, step, sub, iqs[j]);
+            clipped += ToShort(b.Out[j]!, _n2, step, sub, b.Iqs[j]);
         }
         if (clipped > 0) Interlocked.Add(ref Clipped, clipped);
     }

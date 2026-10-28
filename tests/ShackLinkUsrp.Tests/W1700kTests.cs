@@ -959,6 +959,35 @@ internal static partial class Program
         int alone = 0;
         Check(RefusalOf(() => { using var none = new WorkTeam(0, "gate-none", ThreadPriority.Normal); none.Run(5, _ => alone++); }) == "" && alone == 5,
               "a team of no helpers runs every item on the caller, and disposes cleanly");
+        // Start / Join: the helpers begin alone, the caller works meanwhile, then joins what is left.
+        using (var t = new WorkTeam(3, "gate-start", ThreadPriority.Normal))
+        {
+            bool once = true, beside = true;
+            for (int run = 0; run < 1000; run++)
+            {
+                int count = 1 + run % 33;
+                var hits = new int[count];
+                var started = t.Start(count, j => Interlocked.Increment(ref hits[j]));
+                int callerWork = 0;
+                for (int k = 0; k < 50; k++) callerWork += k;          // the caller's own work, meanwhile
+                if (callerWork != 1225) beside = false;
+                t.Join(started);
+                if (hits.Any(h => h != 1)) once = false;
+            }
+            Check(once && beside, "1000 started jobs of 1-33 items: every item done exactly once by the time Join returns, the caller free meanwhile");
+            int ran = 0;
+            var bad = t.Start(6, j => { Interlocked.Increment(ref ran); if (j == 2) throw new InvalidOperationException("item 2"); });
+            Check(RefusalOf(() => t.Join(bad)).Contains("item 2") && ran == 6, "a started item that throws reaches Join, and the others still ran");
+            Check(RefusalOf(() => t.Join(t.Start(0, _ => { }))) == "", "an empty start joins at once");
+        }
+        int noneRan = 0;
+        using (var none = new WorkTeam(0, "gate-none2", ThreadPriority.Normal))
+        {
+            var s = none.Start(4, _ => noneRan++);
+            Check(noneRan == 0, "no helpers: Start begins nothing...");
+            none.Join(s);
+            Check(noneRan == 4, "...and Join does it all on the caller");
+        }
 
         // The batched conditioner against the one that ran on the unit (W1700kConditionReference, frozen): the same samples bit for bit,
         // and the same clipped count, whatever the batches, with or without the team, at every rate and every setting.
@@ -983,8 +1012,9 @@ internal static partial class Program
         using var team = new WorkTeam(3, "gate-cond", ThreadPriority.Normal);
         foreach (double rate in new[] { 40e6, 160e6, 320e6 })
         foreach (var (flatten, dc) in new[] { (true, true), (true, false), (false, true), (false, false) })
-        foreach (bool shared in new[] { true, false })
+        foreach (string schedule in new[] { "team of 3", "this thread", "overlapped" })
         {
+            bool shared = schedule != "this thread";
             var reference = new W1700kConditionReference { RateHz = rate, Flatten = flatten, RemoveDc = dc };
             var want = new short[Slices][];
             for (int s = 0; s < Slices; s++)
@@ -994,11 +1024,32 @@ internal static partial class Program
                 reference.Process(want[s]);
             }
             var cond = new W1700kCondition { RateHz = rate, Flatten = flatten, RemoveDc = dc };
-            var iqs = Enumerable.Range(0, W1700kCondition.MaxBatch).Select(_ => new short[N2]).ToArray();
             var batchRnd = new Random((int)(rate / 1e6) + (flatten ? 1 : 0) + (dc ? 2 : 0));
             int at = 0, first = -1;
             bool same = true;
             int largest = 0;
+            void Compare(short[][] got, int from, int n)
+            {
+                for (int j = 0; j < n; j++)
+                    if (!got[j].AsSpan().SequenceEqual(want[from + j]))
+                    {
+                        if (first < 0) first = from + j;
+                        same = false;
+                    }
+            }
+            // The overlapped schedule is the WORKER's own (W1700kCondition.Overlap, which ConditionLoop drives): each batch's shared part
+            // started on the helpers while the one before it ends here; a restart applied between two Next calls, as the worker applies a
+            // reset marker; and a Flush now and then, as the worker flushes when nothing has piled up.
+            var overlap = new W1700kCondition.Overlap(cond, team);
+            var finishedAt = new Queue<(int From, int N)>();
+            Action<short[][], int> finished = (got, n) =>
+            {
+                var (from, count) = finishedAt.Dequeue();
+                if (count != n) { same = false; if (first < 0) first = from; }
+                Compare(got, from, n);
+            };
+            var flushRnd = new Random(5);
+            var iqs = Enumerable.Range(0, W1700kCondition.MaxBatch).Select(_ => new short[N2]).ToArray();
             while (at < Slices)
             {
                 if (resets.Contains(at)) cond.Reset();
@@ -1007,17 +1058,24 @@ internal static partial class Program
                 for (int k = 1; k < n; k++)
                     if (resets.Contains(at + k)) { n = k; break; }
                 int from = at;
-                cond.ProcessBatch(n, (j, dst) => source[from + j].CopyTo(dst, 0), iqs, shared ? team : null);
-                for (int j = 0; j < n; j++)
-                    if (!iqs[j].AsSpan().SequenceEqual(want[at + j]))
-                    {
-                        if (first < 0) first = at + j;
-                        same = false;
-                    }
+                Action<int, short[]> fill = (j, dst) => source[from + j].CopyTo(dst, 0);
+                if (schedule != "overlapped")
+                {
+                    cond.ProcessBatch(n, fill, iqs, shared ? team : null);
+                    Compare(iqs, from, n);
+                }
+                else
+                {
+                    finishedAt.Enqueue((from, n));
+                    overlap.Next(n, fill, finished);
+                    if (flushRnd.Next(4) == 0) overlap.Flush(finished);
+                }
                 largest = Math.Max(largest, n);
                 at += n;
             }
-            string setting = $"{rate / 1e6:0} MS/s, flatten {(flatten ? "on" : "off")}, DC {(dc ? "on" : "off")}, {(shared ? "team of 3" : "this thread")}";
+            overlap.Flush(finished);
+            if (finishedAt.Count != 0) { same = false; if (first < 0) first = -2; }
+            string setting = $"{rate / 1e6:0} MS/s, flatten {(flatten ? "on" : "off")}, DC {(dc ? "on" : "off")}, {schedule}";
             Check(same && cond.Clipped == reference.Clipped,
                   $"{setting}: {Slices} slices in batches of 1-{largest}, 7 restarts - bit for bit the reference" +
                   (same ? $", clipped {cond.Clipped} = {reference.Clipped}" : $" - FIRST DIFFERENCE at slice {first}") + (cond.Clipped == reference.Clipped ? "" : $" - clipped {cond.Clipped} against {reference.Clipped}"));
@@ -1105,6 +1163,39 @@ internal static partial class Program
                     double us = sw.Elapsed.TotalMilliseconds * 1000 / (batches * b);
                     double budget = 2048 / (rate / 1e6);
                     Console.WriteLine($"  {rate / 1e6:0} MS/s {(packed ? "packed" : "raw   ")}, {helpers} helpers, batches of {b,2}: {F(us, "0.00"),6} us a slice, " +
+                                      $"{F(100 * us / budget, "0"),4} % of the time between slices{(us > budget ? "  - FALLS BEHIND" : "")}");
+                }
+            }
+        }
+
+        // The worker as it runs NOW: the next batch's shared part started on the helpers while the previous one ends and is written to
+        // the ring on this thread (W1700kBackend.ConditionLoop's schedule), against the back-to-back figures above.
+        {
+            int helpers = WorkTeam.HelpersFor(Environment.ProcessorCount);
+            using var team = new WorkTeam(helpers, "cost-ov", ThreadPriority.AboveNormal);
+            foreach (var (rate, packed) in new[] { (160e6, false), (320e6, true) })
+            {
+                var cond = new W1700kCondition { RateHz = rate };
+                var src = packed ? packs : raws;
+                foreach (int b in new[] { 4, 8, 16, 32 })
+                {
+                    var overlap = new W1700kCondition.Overlap(cond, team);
+                    Action<short[][], int> write = (got, count) => { for (int j = 0; j < count; j++) ring.Write(got[j]); };
+                    int at = 0;
+                    void Batch()
+                    {
+                        int from = at;
+                        Action<int, short[]> fill = packed ? (j, d) => W1700kExport.ConvertPacked(src[(from + j) & 63], d) : (j, d) => W1700kExport.ConvertRaw(src[(from + j) & 63], d);
+                        overlap.Next(b, fill, write);
+                        at += b;
+                    }
+                    for (int k = 0; k < 3000 / b + 1; k++) Batch();
+                    var sw = Stopwatch.StartNew();
+                    int batches = n / b;
+                    for (int k = 0; k < batches; k++) Batch();
+                    double us = sw.Elapsed.TotalMilliseconds * 1000 / (batches * b);
+                    double budget = 2048 / (rate / 1e6);
+                    Console.WriteLine($"  OVERLAPPED {rate / 1e6:0} MS/s {(packed ? "packed" : "raw   ")}, {helpers} helpers, batches of {b,2}: {F(us, "0.00"),6} us a slice, " +
                                       $"{F(100 * us / budget, "0"),4} % of the time between slices{(us > budget ? "  - FALLS BEHIND" : "")}");
                 }
             }
