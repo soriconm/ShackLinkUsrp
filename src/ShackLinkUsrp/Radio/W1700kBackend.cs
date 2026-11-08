@@ -57,7 +57,10 @@ internal sealed class W1700kBackendOptions
 
     public int ReceiveBufferBytes = 256 << 20;
     public int AttachTimeoutMs = 60_000;
-    public int LoadTimeoutMs = 180_000;
+    /// <summary>The unit's configure (a band switch, a rate change: stop, RATE, start) and start. A CLIENT waits at least this
+    /// for set_lo, set_antenna and set_rate on this radio (ShackLink docs/w1700k_support.md rule 9), so it is the protocol's
+    /// number, never a second one: a longer wait here would answer after the client had given up and broken its connection.</summary>
+    public int LoadTimeoutMs = ProtocolConstants.W1700kConfigureMs;
     public int CommandTimeoutMs = 30_000;
 }
 
