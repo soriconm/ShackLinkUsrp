@@ -266,6 +266,11 @@ internal static partial class Program
         public int Attaches;
         /// <summary>The controller refuses every request of this op up front, with these words and this <c>reason</c>.</summary>
         public (string Op, string Error, string? Reason)? Refuse;
+        /// <summary>The transmit preparation disconnected the capture: nothing is exported, whatever the stream says, until a load.</summary>
+        public Func<bool>? CaptureBroken;
+        public Action? OnLoad;
+        /// <summary>This controller's input closed: it has exited.</summary>
+        public volatile bool Closed;
 
         public FakeUnit(FakeExport export, bool loaded = true, bool running = false)
         {
@@ -278,7 +283,7 @@ internal static partial class Program
             new Thread(Worker) { IsBackground = true, Name = "FakeUnit" }.Start();
         }
 
-        public W1700kServe Serve(Action<string> log) => new(In, Out, () => { _work.CompleteAdding(); Out.End(); }, log);
+        public W1700kServe Serve(Action<string> log) => new(In, Out, () => { Closed = true; _work.CompleteAdding(); Out.End(); }, log);
 
         /// <summary>The unit realises an LO on its synthesizer's grid: here, 4 Hz on band 0 (2.98 on the real one).</summary>
         public static long Realise(int band, long hz) => band == 0 ? hz / 4 * 4 : hz;
@@ -381,6 +386,23 @@ internal static partial class Program
                 if (op != "load" && op != "configure" && !Loaded) throw new InvalidOperationException("the radio is not loaded");
                 switch (op)
                 {
+                    case "load":
+                        {
+                            // Upstream's load: the radio up from cold, EVERY band at the unit's own rate, gain and filter.
+                            if (r.TryGetLong("band", out long lb))
+                            {
+                                if (lb < 0 || lb > 2) throw new InvalidOperationException("band 0, 1 or 2");
+                                Band = (int)lb;
+                            }
+                            Loaded = true;
+                            for (int k = 0; k < 3; k++)
+                            {
+                                Rate[k] = 320_000_000;
+                                Rf[k] = new JsonObject().Set("agc", true).Set("lna", null).Set("lpf", null).Set("filter_mhz", 320);
+                            }
+                            OnLoad?.Invoke();
+                            break;
+                        }
                     case "configure":
                         {
                             int b = (int)r.GetLong("band", -1);
@@ -428,7 +450,7 @@ internal static partial class Program
                         throw new InvalidOperationException($"unknown op '{op}'");
                 }
                 Export.Tune(Lo[Band], Rate[Band]);
-                Export.Running = Running;
+                Export.Running = Running && !(CaptureBroken?.Invoke() ?? false);
             }
         }
 

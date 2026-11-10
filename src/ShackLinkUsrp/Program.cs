@@ -61,6 +61,7 @@ internal static class Program
                 Name = opt.W1700kName,
                 Bind = opt.W1700kBind,
                 ServeCommand = opt.W1700kServe,
+                TxServeCommand = opt.W1700kTxServe,
                 RatesHz = opt.W1700kRatesHz,
                 WideRateHz = opt.RateHz,
                 LoHz = opt.LoHz,
@@ -244,6 +245,8 @@ internal sealed class SidecarOptions
         "  --w1700k-serve <cmd|none>   upstream's controller, spoken to as JSON lines (default: the bundled w1700k.exe beside this program, serve;\n" +
         "                              a WSL checkout is wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd ~/w1700k-sdr && exec host/bin/w1700k serve\");\n" +
         "                              none = receive the stream another program drives and change nothing on the unit\n" +
+        "  --w1700k-tx-serve <cmd|none> the unit's TRANSMIT service, this sidecar's child on stdio (default none: the radio states no transmitter).\n" +
+        "                              Taking the transmitter stops this radio's reception until it is released; needs a controller (--w1700k-serve)\n" +
         "  --w1700k-config <file>      a station's own config for the controller, given to it as --config \"<file>\" before serve (default none:\n" +
         "                              the controller's own %USERPROFILE%\\.config\\w1700k\\config.json; a second router uses a file of its own)\n" +
         "  --w1700k-rates <S/s,...>    the wide rates offered (default every rate the unit has: 40e6,80e6,160e6,320e6; the operator picks one, and a\n" +
@@ -334,6 +337,8 @@ internal sealed class SidecarOptions
     /// <summary>Null = none: no controller.</summary>
     public string? W1700kServe = ShackLinkUsrp.Radio.W1700kServe.DefaultCommand;
     public bool W1700kServeSet;
+    /// <summary>The unit's transmit service; null = none (the default): the radio states no transmitter.</summary>
+    public string? W1700kTxServe;
     /// <summary>A station's own config file for the controller ("" = the controller's default folder), put before its subcommand.</summary>
     public string W1700kConfig = "";
     public double[] W1700kRatesHz = ShackLinkUsrp.Client.W1700kDefaults.UnitRatesHz();
@@ -450,6 +455,13 @@ internal sealed class SidecarOptions
                         o.W1700kServeSet = true;
                         break;
                     }
+                case "--w1700k-tx-serve":
+                    {
+                        string v = Next().Trim();
+                        if (v.Length == 0) throw new ArgumentException("--w1700k-tx-serve needs a command line, or none");
+                        o.W1700kTxServe = string.Equals(v, "none", StringComparison.OrdinalIgnoreCase) ? null : v;
+                        break;
+                    }
                 case "--w1700k-config":
                     {
                         string v = Next().Trim();
@@ -497,7 +509,7 @@ internal sealed class SidecarOptions
             }
         }
         if (o.JsonPath != null && !o.List) throw new ArgumentException("--json <file> goes with --list");
-        bool w1700kOption = o.W1700kBindSet || o.W1700kServeSet || o.W1700kRatesSet || o.W1700kSettleSet || o.W1700kConditionSet || o.W1700kName != "unit" ||
+        bool w1700kOption = o.W1700kBindSet || o.W1700kServeSet || o.W1700kTxServe != null || o.W1700kRatesSet || o.W1700kSettleSet || o.W1700kConditionSet || o.W1700kName != "unit" ||
                            o.W1700kConfig.Length > 0;
         if (w1700kOption && !o.W1700k) throw new ArgumentException("the --w1700k-... options go with --w1700k");
         if (o.W1700k && !o.Help && !o.List)

@@ -62,6 +62,16 @@ internal sealed class W1700kBackendOptions
     /// number, never a second one: a longer wait here would answer after the client had given up and broken its connection.</summary>
     public int LoadTimeoutMs = ProtocolConstants.W1700kConfigureMs;
     public int CommandTimeoutMs = 30_000;
+
+    /// <summary>The command line of the unit's TRANSMIT service (C:\Dev\SDRW1700K <c>tools\w1700k-tx-serve.py</c>; ShackLink
+    /// docs/w1700k_support.md "Transmit"); null = NONE, the default: this radio states no transmitter.</summary>
+    public string? TxServeCommand;
+
+    /// <summary>A gate's transmit service in place of <see cref="TxServeCommand"/>'s process.</summary>
+    public Func<W1700kTxServe>? TxServeFactory;
+
+    /// <summary>A transmit-service request that touches nothing slow (hello, caps, start).</summary>
+    public int TxRequestTimeoutMs = 10_000;
 }
 
 /// <summary>
@@ -84,7 +94,7 @@ internal sealed class W1700kBackendOptions
 /// naming both remedies, and <c>--w1700k-serve none</c> receives a stream as it is and changes nothing.</item>
 /// </list>
 /// </summary>
-internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
+internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITxHandoverBackend
 {
     /// <summary>TUNE's reach per band (upstream <c>host/w1700k/radio.py</c> LO_RANGE): a band's span until the unit has measured its
     /// own lock edges (<c>rf.lo_range_hz</c>, stated for the band in force).</summary>
@@ -320,6 +330,7 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
         st = serve.Request(Req("start"), _opt.LoadTimeoutMs);
         TakeUnitState(st, announce: false);
         StartWatch();
+        LearnTransmitter();
     }
 
     private static JsonObject Req(string op) => new JsonObject().Set("op", op);
@@ -357,6 +368,19 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
     protected override void CloseRadio()
     {
         _closing = true;
+        // A radio closed while taken: the service's input closes, and it unkeys and closes its station. The unit is left needing
+        // a load, which the next open's controller gives it (a configure of a radio that does not receive loads it).
+        W1700kTxServe? tx;
+        lock (_handoverLock)
+        {
+            tx = _txServe;
+            _txServe = null;
+        }
+        if (tx != null)
+        {
+            tx.Dispose();
+            Log("the transmit service closed with the radio: the unit's reception needs a load (w1700k load) before it is used again");
+        }
         W1700kServe? serve;
         lock (_unitLock) serve = _serve;
         if (serve != null)
@@ -478,6 +502,9 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
 
     private JsonObject Unit(JsonObject request, int? timeoutMs = null)
     {
+        if (_taken)
+            throw new RadioRefusal(ErrorCodes.NotReady,
+                "the radio's transmitter is taken, so its receiver is stopped: release the transmitter (release_tx) to tune or set the receiver");
         W1700kServe serve;
         lock (_unitLock)
             serve = _serve ?? throw new RadioRefusal(ErrorCodes.NotReady, "the unit's controller is not running");
@@ -799,6 +826,12 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
             while (!_stopRx && !_closing)
             {
                 Thread.Sleep(250);
+                if (_taken)
+                {
+                    // The silence is the transmitter's: the receive stream was stopped on purpose.
+                    Volatile.Write(ref _watchFromTs, Stopwatch.GetTimestamp());
+                    continue;
+                }
                 if (Volatile.Read(ref _unitInFlight) > 0) continue;
                 double ms = Stopwatch.GetElapsedTime(Math.Max(Volatile.Read(ref _lastDatagramTs), Volatile.Read(ref _watchFromTs))).TotalMilliseconds;
                 if (ms < _opt.SilenceFaultMs)
@@ -1046,21 +1079,381 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink
             .Set("condition_batch_max", Interlocked.Read(ref _batchMax))
             .Set("unit_busy", st?.GetString("busy") ?? "")
             .Set("unit_error", st?.GetString("error") ?? "")
-            .Set("unit_stream_running", st?.GetObject("stream")?.GetBool("running") ?? false);
+            .Set("unit_stream_running", st?.GetObject("stream")?.GetBool("running") ?? false)
+            .Set("tx_taken", _taken)
+            .Set("tx_unit_rate_hz", Volatile.Read(ref _unitTxRateHz));
     }
 
-    // ------------------------------------------------------------ no transmitter
+    // ------------------------------------------------------------ the transmitter (ShackLink docs/w1700k_support.md "Transmit")
 
-    protected override TxCaps? RadioTxCaps() => null;
+    private readonly object _handoverLock = new();
+    // What the transmitter IS never changes after the open, and the server asks on every transmit request - and through a
+    // take that runs for the unit's eleven seconds. So these two are read with NO lock; the handover lock is the handover's.
+    private volatile W1700kTxCapsInfo? _txInfo;
+    private volatile TxCaps? _txCapsWire;
+    private W1700kTxServe? _txServe;
+    private W1700kTxBand? _txBand;
+    private volatile bool _taken;
+    /// <summary>A prepare was sent since the take: the unit's capture is disconnected, and only a load restores reception.</summary>
+    private bool _txTouchedUnit;
+    private double _txGainDb = double.NaN;
+    private double _unitTxRateHz;
+
+    /// <summary>A transmitter needs BOTH children: the service that keys the unit, and the controller this sidecar stops for it
+    /// and starts again after it. Without <c>--w1700k-tx-serve</c> this radio states none, as it always did.</summary>
+    private bool TxConfigured => _controlled && (_opt.TxServeCommand != null || _opt.TxServeFactory != null);
+
+    /// <summary>The radio is a transmitter now: its receiver is stopped until the transmitter is released.</summary>
+    internal bool Taken => _taken;
+
+    private W1700kTxServe NewTxServe()
+    {
+        var s = _opt.TxServeFactory != null ? _opt.TxServeFactory() : W1700kTxServe.Spawn(_opt.TxServeCommand!, Log);
+        try
+        {
+            s.Start();
+            var hello = s.Request(Req("hello"), _opt.TxRequestTimeoutMs);
+            int wire = (int)hello.GetLong("wire", 0);
+            if (wire != W1700kTxCapsInfo.WireVersion)
+                throw new InvalidDataException($"the transmit service speaks wire {wire}; this sidecar speaks wire {W1700kTxCapsInfo.WireVersion}");
+            return s;
+        }
+        catch
+        {
+            s.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>At open: ask the service what the transmitter is - its <c>caps</c>, which touch nothing on the unit - and let it
+    /// go again. A service that cannot state one is no transmitter, said in the log; the receiver is unaffected.</summary>
+    private void LearnTransmitter()
+    {
+        if (!TxConfigured) return;
+        W1700kTxServe? s = null;
+        try
+        {
+            s = NewTxServe();
+            var info = W1700kTxCapsInfo.Parse(s.Request(Req("caps"), _opt.TxRequestTimeoutMs));
+            var caps = TxCapsFrom(info);
+            _txInfo = info;
+            _txCapsWire = caps;
+            InitTxState(st =>
+            {
+                st.RateHz = info.InputRateHz;
+                st.GainDb = double.NaN;
+                st.CenterHz = 0;
+                st.LoHz = 0;
+                st.Taken = false;
+            }, info.InputRateHz);
+            Log($"transmitter: {info.BandsWords()}; {info.InputRateHz:0} S/s in, at most {info.MaxMs} ms a key-down; taking it stops this radio's " +
+                $"reception (about {caps.TakeMs} ms to take, {caps.GiveMs} ms to give back). Level is dB under each band's most, never dBm");
+        }
+        catch (Exception ex)
+        {
+            Log("no transmitter: the transmit service could not state one - " + (ex is W1700kTxRefusal r ? r.Said : ex.Message));
+        }
+        finally
+        {
+            s?.Dispose();
+        }
+    }
+
+    /// <summary><c>caps.tx</c> from the service's own statement. The gain axis is the level's, moved to start at 0 (the wire's
+    /// negative gain means "unset"): gain = level - the band's lowest level. First build: ShackLink's IQ and a tone (T9).</summary>
+    internal static TxCaps TxCapsFrom(W1700kTxCapsInfo info) => StateSources(new TxCaps
+    {
+        FreqMinHz = info.Bands.Min(b => b.CenterMinHz),
+        FreqMaxHz = info.Bands.Max(b => b.CenterMaxHz),
+        GainMinDb = 0,
+        GainMaxDb = info.LevelSpanDb,
+        GainStepDb = info.Bands.Min(b => b.LevelStepDb),
+        RatesHz = new[] { info.InputRateHz },
+        Antennas = Array.Empty<string>(),
+        MaxMs = info.MaxMs,
+        QuantumSamples = info.MaxBlockSamples,
+        MaxLoOffsetHz = 0,
+        Timebase = TxTimebases.Host,
+        TakesRadio = true,
+        TakeMs = info.LoadMs,
+        GiveMs = info.CloseMs + info.LoadMs,
+    }, TxSourceKinds.Iq, TxSourceKinds.Tone);
+
+    protected override TxCaps? RadioTxCaps() => _txCapsWire?.Clone();
 
     private static RadioRefusal NoTx() =>
-        new(ErrorCodes.Unsupported, "this radio does not transmit: upstream's firmware keeps the MT7996's transmit path disabled");
+        new(ErrorCodes.Unsupported, "this radio states no transmitter: its sidecar was started without a transmit service (--w1700k-tx-serve)");
 
-    protected override double ApplyTxRate(double hz) => throw NoTx();
-    protected override double ApplyTxGain(double db) => throw NoTx();
-    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz) => throw NoTx();
-    protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open) => throw NoTx();
+    private W1700kTxCapsInfo TxInfo() => _txInfo ?? throw NoTx();
+
+    protected override double ApplyTxRate(double hz)
+    {
+        var info = TxInfo();
+        if (Math.Abs(hz - info.InputRateHz) >= 0.5)
+            throw new RadioRefusal(ErrorCodes.OutOfRange, $"this transmitter takes {info.InputRateHz:0} S/s and nothing else");
+        return info.InputRateHz;
+    }
+
+    /// <summary>The level the next key-down asks for, kept on the unit's own steps. Nothing is written to the unit here: the
+    /// service realises a level at its <c>start</c>, from measured PA indices, and the grant states what it realised.</summary>
+    protected override double ApplyTxGain(double db)
+    {
+        var info = TxInfo();
+        W1700kTxBand? band;
+        lock (_handoverLock) band = _txBand;
+        double step = band?.LevelStepDb ?? info.Bands.Min(b => b.LevelStepDb);
+        double span = band != null ? band.LevelMaxDb - band.LevelMinDb : info.LevelSpanDb;
+        double eff = Math.Clamp(Math.Round(db / step) * step, 0, span);
+        lock (_handoverLock) _txGainDb = eff;
+        return eff;
+    }
+
+    /// <summary>
+    /// THE TAKE (T4, T5), or a move of a radio already taken: the receive stream stopped, the controller EXITED (two controllers
+    /// would interleave on the unit's mailbox), the transmit service started and the unit prepared at <paramref name="centerHz"/>.
+    /// It runs for the unit's prepare - about eleven seconds today - and is therefore never part of a key-up. A unit that could
+    /// not be prepared is given back to its receiver rather than left neither.
+    /// </summary>
+    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz)
+    {
+        var info = TxInfo();
+        var band = info.BandAt(centerHz) ?? throw new RadioRefusal(ErrorCodes.OutOfRange,
+            $"{Mhz(centerHz)} MHz is in no band this unit transmits in: {info.BandsWords()}");
+        lock (_handoverLock)
+        {
+            if (_closing) throw new RadioRefusal(ErrorCodes.NotReady, "the radio is closing");
+            bool first = !_taken;
+            if (first) TakeForTransmit();
+            var tx = _txServe!;
+            JsonObject r;
+            try
+            {
+                _txTouchedUnit = true;
+                r = tx.Request(Req("prepare").Set("center_hz", centerHz), _opt.LoadTimeoutMs);
+            }
+            catch (Exception ex)
+            {
+                bool refused = ex is W1700kTxRefusal;
+                string words = ex is W1700kTxRefusal f ? f.Said : "the unit's transmitter could not be prepared: " + ex.Message;
+                // A refusal of a MOVE leaves the earlier preparation standing (the service refuses before it touches the unit) -
+                // unless the service SAYS nothing is prepared any more ("prepared": false: the preparation failed after it touched
+                // the unit). That, and anything that is no refusal, leaves a unit that is no transmitter: back to its receiver.
+                bool unprepared = ex is W1700kTxRefusal g && g.Reply != null && g.Reply.Has("prepared") && !g.Reply.GetBool("prepared");
+                if (first || !refused || unprepared)
+                {
+                    GiveBackLocked("the preparation failed");
+                    words += "; the radio was given back to its receiver";
+                }
+                else
+                {
+                    words += "; the transmitter stays prepared where it was";
+                }
+                throw new RadioRefusal(refused ? ErrorCodes.OutOfRange : ErrorCodes.RadioFault, words);
+            }
+            long eff = r.GetLong("center_hz", centerHz);
+            long lo = r.GetLong("lo_hz", eff);
+            _txBand = info.BandAt(eff) ?? band;
+            UpdateTxState(s => s.Taken = true);
+            string path = r.GetString("path", "") ?? "";
+            Log($"the transmitter is prepared at {Mhz(eff)} MHz ({_txBand.Name}), LO {Mhz(lo)} MHz" +
+                (path.Length > 0 ? $", by {path}" : "") +
+                (r.TryGetLong("took_ms", out long took) ? $" in {took} ms" : "") +
+                (r.TryGetLong("settle_ms", out long settle) ? $"; its carrier settles for about {settle} ms" : ""));
+            return (eff, lo);
+        }
+    }
+
+    /// <summary>RX off, the controller gone, the service up. Under <see cref="_handoverLock"/>.</summary>
+    private void TakeForTransmit()
+    {
+        W1700kServe? serve;
+        lock (_unitLock) serve = _serve;
+        if (serve == null) throw new RadioRefusal(ErrorCodes.NotReady, "the unit's controller is not running");
+        Log("taking the radio for its transmitter: reception stops until the transmitter is released");
+        _taken = true;                        // the watch and the unit's state events stand down from here
+        bool ours = _streamOurs;
+        _streamOurs = false;
+        _accept = false;
+        try
+        {
+            if (ours) serve.Request(Req("stop"), _opt.CommandTimeoutMs);
+        }
+        catch (Exception ex)
+        {
+            _accept = true;
+            _streamOurs = ours;
+            _taken = false;
+            throw new RadioRefusal(ErrorCodes.RadioFault,
+                "the receive stream could not be stopped, so the transmitter was not taken: " + (ex is W1700kServeException se ? se.Said : ex.Message));
+        }
+        lock (_unitLock) _serve = null;
+        serve.Dispose();                      // its input closes and it EXITS
+        try
+        {
+            var tx = NewTxServe();
+            tx.Exited += why => OnTxServiceLost(tx, why);
+            _txServe = tx;
+            _txTouchedUnit = false;
+        }
+        catch (Exception ex)
+        {
+            string words = "the transmit service did not start, so the transmitter was not taken: " + (ex is W1700kTxRefusal r ? r.Said : ex.Message);
+            GiveBackLocked("the transmit service did not start");
+            throw new RadioRefusal(ErrorCodes.RadioFault, words + "; the radio was given back to its receiver");
+        }
+    }
+
+    /// <summary>The TX owner let go, or its connection closed (<see cref="ITxHandoverBackend"/>): the claim was the take's lifetime.</summary>
+    public void TxOwnerLeft()
+    {
+        lock (_handoverLock)
+        {
+            _txGainDb = double.NaN;           // the next owner states its own level
+            if (!_taken) return;
+            GiveBackLocked("its owner released it");
+        }
+        UpdateState(_ => { }, announce: true);
+    }
+
+    /// <summary>The service ended under a taken radio and not by this side: the unit unkeys by itself, and the radio goes back
+    /// to its receiver. Never on the caller's thread - the caller is the service's own reader, or a transmission's sender - and
+    /// never on the thread pool: a pool that is busy or starved would leave the radio neither receiver nor transmitter.</summary>
+    internal void OnTxServiceLost(W1700kTxServe serve, string why = "")
+    {
+        new Thread(() =>
+        {
+            lock (_handoverLock)
+            {
+                if (_closing || !ReferenceEquals(_txServe, serve)) return;
+                Log("the transmit service is gone" + (why.Length > 0 ? $" ({why})" : "") + ": the unit unkeys by itself");
+                GiveBackLocked("the transmit service ended");
+            }
+            UpdateState(_ => { }, announce: true);
+        })
+        { IsBackground = true, Name = "W1700kGiveBack" }.Start();
+    }
+
+    /// <summary>The service closed (it unkeys, closes its station and exits), then the receiver restored. Under <see cref="_handoverLock"/>.</summary>
+    private void GiveBackLocked(string why)
+    {
+        var tx = _txServe;
+        _txServe = null;
+        bool load = _txTouchedUnit;
+        _txTouchedUnit = false;
+        _txBand = null;
+        tx?.Dispose();
+        Log($"the transmitter is released ({why}): giving the radio back to its receiver" + (load ? " - a load, since the preparation disconnected its capture" : ""));
+        RestoreReceive(load);
+        // Only now: until reception is back the radio is still not a receiver, and its state must not say it is.
+        UpdateTxState(s =>
+        {
+            s.Taken = false;
+            s.CenterHz = 0;
+            s.LoHz = 0;
+        });
+        _taken = false;
+    }
+
+    /// <summary>The controller started again and the receive stream with it, at the LO, rate, gain and filter the radio had.
+    /// After a preparation only a LOAD restores reception (SDRW1700K docs/08 T12), and a load puts every band at the unit's own
+    /// rate, gain and filter - so each is stated again. A radio that cannot be given back is a FAULT, in words.</summary>
+    private void RestoreReceive(bool load)
+    {
+        if (_closing) return;
+        var before = GetState();
+        int band;
+        lock (_unitLock) band = _band;
+        try
+        {
+            var serve = _opt.ServeFactory != null ? _opt.ServeFactory() : W1700kServe.Spawn(_opt.ServeCommand!, Log);
+            lock (_unitLock) _serve = serve;
+            serve.StateChanged += OnUnitState;
+            serve.Exited += why => { if (!_closing) Fault($"w1700k serve ended under the radio: {why}"); };
+            serve.Start();
+            serve.WaitAttached(_opt.AttachTimeoutMs);
+            if (load) serve.Request(Req("load").Set("band", band), _opt.LoadTimeoutMs);
+            var st = serve.Request(Req("configure").Set("band", band).Set("sample_rate", (long)Math.Round(before.WideRateHz)).Set("lo_hz", before.LoHz),
+                                   _opt.LoadTimeoutMs);
+            if (!before.Agc)
+            {
+                var (lna, lpf) = GainFor(before.GainDb);
+                st = serve.Request(Req("gain").Set("agc", false).Set("lna", lna).Set("lpf", lpf), _opt.CommandTimeoutMs);
+            }
+            if (before.BandwidthHz > 0)
+                st = serve.Request(Req("filter").Set("mhz", FilterFor(before.BandwidthHz)), _opt.CommandTimeoutMs);
+            TakeUnitState(st, announce: false);
+            _resync = true;
+            _streamSeenRunning = false;
+            _accept = true;
+            _streamOurs = true;
+            st = serve.Request(Req("start"), _opt.LoadTimeoutMs);
+            TakeUnitState(st, announce: false);
+            Volatile.Write(ref _watchFromTs, Stopwatch.GetTimestamp());
+            Log($"reception is back: band {band}, {Mhz(LoHz)} MHz at {WideRateHz:0} S/s");
+        }
+        catch (Exception ex)
+        {
+            Fault("the radio could not be given back to its receiver: " + (ex is W1700kServeException se ? se.Said : ex.Message));
+        }
+    }
+
+    /// <summary>The unit's own sample clock as its feeder measured it over a key-down: telemetry, never arithmetic.</summary>
+    internal void NoteUnitTxRate(double hz) => Volatile.Write(ref _unitTxRateHz, hz);
+
+    protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open) =>
+        throw new RadioRefusal(ErrorCodes.Unsupported,
+            "this transmitter cannot move a keyed carrier: a new frequency is a new preparation of the unit - end the transmission (tx_stop) first");
+
     protected override double TxTickHz => 0;
-    protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo) => throw NoTx();
-    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal) => throw NoTx();
+
+    protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo) =>
+        throw new RadioRefusal(ErrorCodes.Unsupported, "this transmitter runs no stepped sweep: every step would be a new preparation of the unit");
+
+    /// <summary>The service's <c>start</c>, then the sender. An IQ transmission states envelope <c>any</c> - ShackLink scales and
+    /// shapes its samples - so above a band's linear limit the SERVICE refuses it, in its words (T9).</summary>
+    protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
+    {
+        var info = TxInfo();
+        W1700kTxServe tx;
+        W1700kTxBand band;
+        double gain;
+        lock (_handoverLock)
+        {
+            if (!_taken || _txServe == null || _txBand == null)
+                throw new RadioRefusal(ErrorCodes.NotReady,
+                    "the radio's transmitter is not taken: set_tx a centre first - that stops its reception and prepares the unit, and is never part of a key-up");
+            tx = _txServe;
+            band = _txBand;
+            gain = _txGainDb;
+        }
+        if (double.IsNaN(gain))
+            throw new RadioRefusal(ErrorCodes.BadRequest, "the TX gain was never set (set_tx gain_db): a transmission keys at a stated level");
+        if (request.IsGenerated && info.PassbandHalfWidthHz > 0 && Math.Abs((double)request.OffsetHz) > info.PassbandHalfWidthHz)
+            throw new RadioRefusal(ErrorCodes.OutOfRange,
+                $"a carrier {request.OffsetHz} Hz from the centre is outside this transmitter's passband of +-{info.PassbandHalfWidthHz:0} Hz: " +
+                "it would be filtered away and the unit would key on nothing - prepare the unit at the frequency itself");
+        double level = Math.Min(band.LevelMaxDb, band.LevelMinDb + gain);
+        var start = Req("start").Set("max_ms", request.MaxMs).Set("level_db", level).Set("envelope", "any");
+        JsonObject r;
+        try
+        {
+            r = tx.Request(start, _opt.TxRequestTimeoutMs);
+        }
+        catch (W1700kTxRefusal ex)
+        {
+            throw new RadioRefusal(ErrorCodes.OutOfRange, ex.Said);
+        }
+        catch (Exception ex) when (ex is TimeoutException || ex is IOException)
+        {
+            throw new RadioRefusal(ErrorCodes.RadioFault, "the unit's transmitter did not start: " + ex.Message);
+        }
+        double realised = r.GetDouble("level_db", level);
+        grant.GainDb = realised - band.LevelMinDb;
+        UpdateTxState(s => s.GainDb = grant.GainDb);
+        grant.MaxBlockSamples = info.MaxBlockSamples;
+        if (!request.IsGenerated) grant.QueueSamples = Math.Max(info.MaxBlockSamples * 2, (int)Math.Ceiling(info.InputRateHz * 0.05));
+        Log($"the unit's transmitter is armed at level {realised.ToString("0.#", CultureInfo.InvariantCulture)} dB under {band.Name}'s most" +
+            (r.TryGetDouble("leakage_dbc", out double leak) ? $", its carrier leakage about {leak.ToString("0.#", CultureInfo.InvariantCulture)} dBc" : ""));
+        return new W1700kTransmission(this, tx, info.MaxBlockSamples, request, grant, signal);
+    }
 }

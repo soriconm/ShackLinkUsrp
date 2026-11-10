@@ -778,6 +778,17 @@ internal abstract class RadioBackendBase : IRadioBackend, IRxSidesBackend, ITxBa
         return caps;
     }
 
+    /// <summary>For a radio that builds FEWER than every source (a W1700K: ShackLink's IQ and a tone - a stepped sweep would be a
+    /// new preparation of the unit at every step, and its modulations wait for a stated envelope): the one place a subset is
+    /// stated, beside the whole list, so no radio lists its own. A source this sidecar does not build cannot be offered.</summary>
+    protected static TxCaps StateSources(TxCaps caps, params string[] built)
+    {
+        foreach (string s in built)
+            if (Array.IndexOf(BuiltSources, s) < 0) throw new ArgumentException("this sidecar does not build a '" + s + "' source", nameof(built));
+        caps.Sources = (string[])built.Clone();
+        return caps;
+    }
+
     public event Action<long>? TxUnderflow;
 
     /// <summary>The clock rows and blocks carry, which stamps the server's <c>tx</c> events.</summary>
