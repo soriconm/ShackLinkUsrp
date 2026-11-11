@@ -14,7 +14,7 @@ namespace ShackLinkUsrp.Radio;
 /// bench has a stuck RX data line and three programs need an end-to-end source that tells the truth.
 /// Its hello says <c>source = sim</c>, and its serial is <c>sim-&lt;name&gt;</c>, on every connection.
 /// </summary>
-internal sealed class SimBackend : RadioBackendBase
+internal sealed class SimBackend : RadioBackendBase, ShackLinkUsrp.Server.ITxHandoverBackend
 {
     /// <summary>One signal in the synthetic scene.</summary>
     public sealed record SimSignal(long FreqHz, double LevelDbfs, char Mod, double ModRateHz, double DepthOrDeviation);
@@ -106,6 +106,19 @@ internal sealed class SimBackend : RadioBackendBase
     private SimTransmission? _simTx;     // the generator's to mix; written by StartTx, cleared when it finishes
     private double _txGainDb;
 
+    /// <summary>
+    /// The synthetic radio as one whose transmitter TAKES it (<c>--sim-takes-radio</c>; ShackLink docs/w1700k_support.md
+    /// "Transmit" T4, T5 - a W1700K's shape, for a CLIENT's gate): <c>caps.tx.takes_radio</c>, <c>set_tx</c>'s centre takes it
+    /// (<see cref="TakeMs"/>), its owner's release or disconnect gives it back (<see cref="GiveMs"/>), and a key-up on a
+    /// radio that was not taken is refused. A MODEL, and it says so: a taken W1700K's reception really stops, and this one
+    /// still hears itself - which is what lets a gate SEE what a taken radio sent.
+    /// </summary>
+    public bool TakesRadio { get; init; }
+
+    public const int TakeMs = 300, GiveMs = 300;
+
+    private volatile bool _taken;
+
     public SimBackend(SidecarLog log, string name, double wideRateHz, long loHz = 100_000_000, double noiseDbfs = -65)
         : base(log,
                new RadioInfo { Serial = "sim-" + name, Product = "Synthetic B210", Name = name, Source = RadioSources.Sim, KnownCodecFault = false },
@@ -152,12 +165,14 @@ internal sealed class SimBackend : RadioBackendBase
         double txRate = TxRates(_initial.RateHz).FirstOrDefault();
         InitTxState(s =>
         {
-            s.CenterHz = 100_000_000;
-            s.LoHz = 100_000_000;
+            // A radio that takes has no transmitter until it is taken: no centre, and "taken" stated as false.
+            s.CenterHz = TakesRadio ? 0 : 100_000_000;
+            s.LoHz = TakesRadio ? 0 : 100_000_000;
             s.LoOffsetHz = 0;
             s.RateHz = txRate;
             s.GainDb = 0;
             s.Antenna = "TX/RX";
+            if (TakesRadio) s.Taken = false;
         }, txRate);
         _generator = new Thread(Generate) { IsBackground = true, Name = "SimRadio", Priority = ThreadPriority.AboveNormal };
         _generator.Start();
@@ -199,6 +214,9 @@ internal sealed class SimBackend : RadioBackendBase
             DualRx = true,
             // One clock paces both directions: a key edge falls at an exact ring position (plutosdr 9.2 item 2).
             Timebase = TxTimebases.Radio,
+            TakesRadio = TakesRadio,
+            TakeMs = TakesRadio ? TakeMs : 0,
+            GiveMs = TakesRadio ? GiveMs : 0,
         });
     }
 
@@ -212,7 +230,34 @@ internal sealed class SimBackend : RadioBackendBase
         return eff;
     }
 
-    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz) => (centerHz, centerHz + loOffsetHz);
+    protected override (long CenterHz, long LoHz) ApplyTxTune(long centerHz, long loOffsetHz)
+    {
+        if (TakesRadio && !_taken)
+        {
+            // THE TAKE: a centre from the TX owner, and it costs what the radio says it costs.
+            Thread.Sleep(TakeMs);
+            _taken = true;
+            UpdateTxState(s => s.Taken = true);
+            Log($"the synthetic radio is TAKEN for its transmitter at {centerHz} Hz (--sim-takes-radio)");
+        }
+        return (centerHz, centerHz + loOffsetHz);
+    }
+
+    /// <summary>The TX owner let go, or its connection closed: the radio goes back to its receiver.</summary>
+    public void TxOwnerLeft()
+    {
+        if (!TakesRadio || !_taken) return;
+        Thread.Sleep(GiveMs);
+        _taken = false;
+        UpdateTxState(s =>
+        {
+            s.Taken = false;
+            s.CenterHz = 0;
+            s.LoHz = 0;
+        });
+        Log("the synthetic radio is given back to its receiver");
+        UpdateState(_ => { }, announce: true);
+    }
 
     protected override (long CenterHz, long LoHz, string Retune) ApplyTxPark(long centerHz, long loOffsetHz, RadioTransmission open)
     {
@@ -231,6 +276,9 @@ internal sealed class SimBackend : RadioBackendBase
 
     protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
+        if (TakesRadio && !_taken)
+            throw new ShackLinkUsrp.Server.RadioRefusal(ErrorCodes.NotReady,
+                "the radio's transmitter is not taken: set_tx a centre first - that takes the radio, and is never part of a key-up");
         if (!TxRules.DividesWideRate(grant.RateHz, WideRateHz))
             throw new ShackLinkUsrp.Server.RadioRefusal(ErrorCodes.OutOfRange,
                 $"the TX rate {grant.RateHz:0} S/s does not divide the wide rate {WideRateHz:0} S/s");

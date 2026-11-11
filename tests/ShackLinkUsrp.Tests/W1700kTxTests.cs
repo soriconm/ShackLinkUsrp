@@ -484,6 +484,12 @@ internal static partial class Program
               caps.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }) && caps.MaxLoOffsetHz == 0,
               "...it takes the radio (11 s to take, 12 s to give back), stamps on the host's clock, and builds iq and tone only");
 
+        var adopting = FakeTxService.DefaultCaps();
+        adopting.GetObject("costs").GetObject("prepare").Set("adopt_ms", 1300);
+        var adoptCaps = W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(adopting));
+        Check(adoptCaps.TakeMs == 1300 && adoptCaps.GiveMs == 12000,
+              "a service that adopts the radio the receiver left states its take as the adopt's 1.3 s; the give-back is still a load");
+
         string Why(Action<JsonObject> breakIt)
         {
             var c = FakeTxService.DefaultCaps();
@@ -834,6 +840,8 @@ internal static partial class Program
         var took = s.SetTx(new TxSettings { CenterHz = 2_392_000_000, GainDb = 20 });
         Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 2_392_000_000 && rig.Units[0].Closed && rig.Units[0].Taken("stop").Count == 1,
               "it is taken and prepared at 2392 MHz, the controller gone first");
+        Check(rig.Units[0].Taken("load").Count == 0 && rig.Units[0].Requests.All(q => q.GetString("op") != "unload"),
+              "...and left LOADED: the controller was stopped and closed, never unloaded, which is what the service's adopt relies on");
 
         var events = TxEvents(s, out var ev);
         var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 10_000 });
@@ -880,5 +888,55 @@ internal static partial class Program
         Check(back.Tx?.Taken == false && rig.UnitCount == 2 && rig.Unit.Taken("start").Count == 1 && s.GetState().Readiness == RadioStates.Ready,
               "released: the service's input closed, the controller started again, the radio receives");
         ev.Dispose();
+    }
+
+    /// <summary>The synthetic radio's own take (<c>--sim-takes-radio</c>): what ShackLink's gate keys through.</summary>
+    private static void SimTakesRadio()
+    {
+        using var log = new SidecarLog(null, console: false);
+        var backend = new SimBackend(log, "takes", 2e6) { TakesRadio = true };
+        var server = new UsrpServer(backend, new UsrpServerOptions { Port = 0, SidecarVersion = "test", LingerSeconds = 60 });
+        server.Start();
+        backend.Start();
+        try
+        {
+            using var s = Connect(server, "sim-takes");
+            s.WaitReady(5000);
+            var tx = s.Caps.Tx;
+            Check(tx != null && tx.TakesRadio && tx.TakeMs == SimBackend.TakeMs && tx.GiveMs == SimBackend.GiveMs && s.GetState().Tx?.Taken == false &&
+                  s.GetState().Tx!.CenterHz == 0, "the synthetic radio states that its transmitter takes it, and that it is not taken");
+            double rate = tx!.RatesHz.Min();
+            s.ClaimTx();
+            s.SetTx(new TxSettings { GainDb = 40, RateHz = rate });
+            var early = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000 }));
+            Check(early != null && s.GetState().Tx?.Taken == false, "a key-up on it before the take is refused: " + early?.Message);
+            var sw = Stopwatch.StartNew();
+            var took = s.SetTx(new TxSettings { CenterHz = 100_400_000 });
+            Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 100_400_000 && sw.ElapsedMilliseconds >= SimBackend.TakeMs - 20,
+                  $"set_tx's centre takes it, and costs what it says ({sw.ElapsedMilliseconds} ms)");
+            sw.Restart();
+            s.SetTx(new TxSettings { CenterHz = 100_500_000 });
+            Check(sw.ElapsedMilliseconds < SimBackend.TakeMs - 50 && s.GetState().Tx?.Taken == true, $"a move of a taken radio is not a second take ({sw.ElapsedMilliseconds} ms)");
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 10_000 });
+            var iq = new short[2 * 50_000];
+            t.Stream!.Write(iq, 0, 50_000);
+            var r = t.Stop(drain: true);
+            Check(r.Acked && r.Samples == 50_000 && s.GetState().Tx?.Taken == true, $"it keys while taken, and stays taken after the key-down ({r})");
+            var back = s.ReleaseTx();
+            Check(back.Tx?.Taken == false && back.Tx.CenterHz == 0, "release_tx gives it back");
+
+            using var watcher = Connect(server, "sim-watch");
+            var owner = Connect(server, "sim-owner");
+            owner.ClaimTx();
+            owner.SetTx(new TxSettings { CenterHz = 100_400_000 });
+            Check(watcher.GetState().Tx?.Taken == true, "taken again by another client");
+            owner.Dispose();
+            Check(WaitFor(() => watcher.GetState().Tx?.Taken == false && watcher.GetState().Tx?.Owner == null, 4000), "...whose disconnect gives it back");
+        }
+        finally
+        {
+            server.Dispose();
+            backend.Dispose();
+        }
     }
 }

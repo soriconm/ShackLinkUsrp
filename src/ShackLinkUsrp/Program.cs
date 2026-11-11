@@ -70,7 +70,7 @@ internal static class Program
                 RemoveDc = opt.W1700kRemoveDc,
             })
             : opt.Sim
-            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TxCouplingDb = opt.SimTxCouplingDb, TxCouplingDbB = opt.SimTxCouplingDbB, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
+            ? new SimBackend(log, opt.SimName, opt.RateHz, opt.LoHz) { FaultAfterMs = opt.SimFaultAfterMs, SettleMs = opt.SimSettleMs, TakesRadio = opt.SimTakesRadio, TxCouplingDb = opt.SimTxCouplingDb, TxCouplingDbB = opt.SimTxCouplingDbB, SideBGainDb = opt.SimSideBGainDb, SideBPhaseDeg = opt.SimSideBPhaseDeg }
             : opt.Iiod != null
             // A Pluto-class board: no UHD is loaded for it (ShackLink docs/plutosdr_support.md section 9.1 B2).
             ? new PlutoBackend(log, new PlutoBackendOptions
@@ -262,6 +262,8 @@ internal sealed class SidecarOptions
         "  --json <file>               (with --list) write the answer there as one JSON object, whatever happened\n" +
         "  --sim-fault-after <ms>      (tests) the synthetic radio faults this long after it starts streaming\n" +
         "  --sim-settle-ms <ms>        (tests) a synthetic radio change takes effect this long after it is asked for, like in-flight USB buffers\n" +
+        "  --sim-takes-radio           (tests) the synthetic radio's transmitter TAKES it: set_tx's centre takes, release_tx gives back, a key-up on a\n" +
+        "                              radio not taken is refused (a W1700K's shape; it still hears itself, which a real one does not)\n" +
         "  --sim-tx-coupling <dB>      how the synthetic radio hears its own transmission: L dBFS at a TX gain of G is heard at L + G + this (default -80)\n" +
         "  --sim-side-b-gain-db <dB>   what the synthetic radio's RX B hears the scene at, relative to RX A (default -6)\n" +
         "  --sim-side-b-phase-deg <d>  ...and at which phase from RX A (default 30)\n" +
@@ -299,6 +301,8 @@ internal sealed class SidecarOptions
     public string SimName = UsrpAddress.DefaultSimName;
     public int SimFaultAfterMs;
     public int SimSettleMs;
+    /// <summary>(tests) the synthetic radio's transmitter TAKES it, as a W1700K's does (ShackLink docs/w1700k_support.md "Transmit").</summary>
+    public bool SimTakesRadio;
     public double SimTxCouplingDb = SimBackend.DefaultTxCouplingDb;
     public double SimTxCouplingDbB = SimBackend.DefaultTxCouplingDbB;
     public double SimSideBGainDb = SimBackend.DefaultSideBGainDb;
@@ -366,6 +370,7 @@ internal sealed class SidecarOptions
                 case "--sim-name": o.SimName = Next(); break;
                 case "--sim-fault-after": o.SimFaultAfterMs = Int(a, Next()); break;
                 case "--sim-settle-ms": o.SimSettleMs = Int(a, Next()); break;
+                case "--sim-takes-radio": o.SimTakesRadio = true; break;
                 case "--sim-tx-coupling":
                     {
                         string v = Next();

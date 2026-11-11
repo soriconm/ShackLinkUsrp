@@ -1175,7 +1175,9 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         MaxLoOffsetHz = 0,
         Timebase = TxTimebases.Host,
         TakesRadio = true,
-        TakeMs = info.LoadMs,
+        // The take is the service's FIRST preparation: an adopt of the radio this sidecar's controller left loaded where the
+        // service states one, else a load. The give-back is its close and this sidecar's own load: no figure but the load's.
+        TakeMs = info.AdoptMs > 0 ? info.AdoptMs : info.LoadMs,
         GiveMs = info.CloseMs + info.LoadMs,
     }, TxSourceKinds.Iq, TxSourceKinds.Tone);
 
@@ -1286,6 +1288,8 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
             throw new RadioRefusal(ErrorCodes.RadioFault,
                 "the receive stream could not be stopped, so the transmitter was not taken: " + (ex is W1700kServeException se ? se.Said : ex.Message));
         }
+        // NEVER an unload: the service's first preparation ADOPTS the radio as this controller leaves it - loaded, its stream
+        // stopped - with one band's setup in place of a reload (about a second instead of six to twelve).
         lock (_unitLock) _serve = null;
         serve.Dispose();                      // its input closes and it EXITS
         try

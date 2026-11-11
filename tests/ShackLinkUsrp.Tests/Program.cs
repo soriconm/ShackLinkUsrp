@@ -123,6 +123,7 @@ internal static partial class Program
         Run("W1700K TX: take, key IQ and a tone, drain on the unit's word, the service's refusals, give back and receive again", W1700kTxEndToEnd);
         Run("W1700K TX: a service that ends a transmission, dies, or does not answer a stop; an owner that disconnects; a prepare refused", W1700kTxFaults);
         Run("W1700K TX: the SDRW1700K session's own service in its no-unit mode, where it is on this machine", W1700kTxRealService);
+        Run("Sim: --sim-takes-radio, the synthetic radio whose transmitter takes it (what ShackLink's gate keys through)", SimTakesRadio);
         Run("W1700K: a unit already streaming, a cold one, one out of reach, a port another receiver holds", W1700kRefusals);
         Run("W1700K: a stream that goes silent faults in words", W1700kSilence);
         Run("W1700K: no controller - another program's stream, received as it is", W1700kNoController);

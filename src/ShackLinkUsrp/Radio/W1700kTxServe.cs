@@ -61,6 +61,9 @@ internal sealed class W1700kTxCapsInfo
     /// <summary>The first passband's half width: how far from the centre anything sent survives. 0 = not stated.</summary>
     public double PassbandHalfWidthHz;
     public long LoadMs, TuneMs, SetupMs, CloseMs;
+    /// <summary>A first preparation on the radio the receiver left LOADED: one band's setup, no reload (the service's path
+    /// <c>adopt</c>). 0 = not stated: such a service's first preparation is a load.</summary>
+    public long AdoptMs;
     public JsonObject Raw = new();
 
     public static W1700kTxCapsInfo Parse(JsonObject o)
@@ -117,6 +120,7 @@ internal sealed class W1700kTxCapsInfo
         c.LoadMs = Math.Max(0, prepare?.GetLong("load_ms", 0) ?? 0);
         c.TuneMs = Math.Max(0, prepare?.GetLong("tune_ms", 0) ?? 0);
         c.SetupMs = Math.Max(0, prepare?.GetLong("setup_ms", 0) ?? 0);
+        c.AdoptMs = Math.Max(0, prepare?.GetLong("adopt_ms", 0) ?? 0);
         c.CloseMs = Math.Max(0, costs?.GetLong("close_ms", 0) ?? 0);
         return c;
     }
