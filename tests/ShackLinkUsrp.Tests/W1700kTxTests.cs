@@ -372,13 +372,14 @@ internal static partial class Program
         public int UnitCount { get { lock (_lock) return Units.Count; } }
 
         /// <param name="txCommand">A REAL service's command line in place of the fake one (it must touch no unit).</param>
-        public W1700kTxRig(string name, bool tx = true, JsonObject? caps = null, string? txCommand = null)
+        /// <param name="configure">Set the options before the backend has them (the built-in service's launch value, folder, version reader).</param>
+        public W1700kTxRig(string name, bool tx = true, JsonObject? caps = null, string? txCommand = null, Action<W1700kBackendOptions>? configure = null)
         {
             if (caps != null) Caps = caps;
             var bind = new IPEndPoint(IPAddress.Loopback, FreeUdpPort());
             Export = new FakeExport(bind, W1700kScene, 2_442_000_000, 40e6);
             Log = new SidecarLog(null, console: Environment.GetEnvironmentVariable("W1700K_TX_LOG") == "1");
-            Backend = new W1700kBackend(Log, new W1700kBackendOptions
+            var options = new W1700kBackendOptions
             {
                 Name = name,
                 Bind = bind,
@@ -391,7 +392,9 @@ internal static partial class Program
                 LoadTimeoutMs = 5000,
                 CommandTimeoutMs = 5000,
                 TxRequestTimeoutMs = 3000,
-            });
+            };
+            configure?.Invoke(options);
+            Backend = new W1700kBackend(Log, options);
             Server = new UsrpServer(Backend, new UsrpServerOptions { Port = 0, SidecarVersion = "test", LingerSeconds = 60 });
             Server.Start();
             Backend.Start();
@@ -863,9 +866,11 @@ internal static partial class Program
             Console.WriteLine("  SKIP  the service did not state a transmitter here (no Python, or a module it needs is missing): nothing checked");
             return;
         }
-        Check(tx.TakesRadio && tx.RatesHz.SequenceEqual(new[] { 48000.0 }) && tx.MaxMs == 15000 && tx.GainMinDb == 0 && tx.GainMaxDb == 40 &&
+        // The longest key-down is the SERVICE's figure and moves with its measurements (T24: 15 s by policy; T25, 2026-11-10: 30 min
+        // measured): only its presence is asserted, never a number this file would have to chase.
+        Check(tx.TakesRadio && tx.RatesHz.SequenceEqual(new[] { 48000.0 }) && tx.MaxMs > 0 && tx.GainMinDb == 0 && tx.GainMaxDb == 40 &&
               tx.FreqMinHz == 2_391_000_000 && tx.FreqMaxHz == 5_849_000_000 && tx.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }),
-              $"the REAL service's caps are read: 48 kS/s, 15 s, gain 0..{tx.GainMaxDb} dB, 2391-5849 MHz, taking the radio ({tx.TakeMs} ms to take)");
+              $"the REAL service's caps are read: 48 kS/s, at most {tx.MaxMs} ms a key-down, gain 0..{tx.GainMaxDb} dB, 2391-5849 MHz, taking the radio ({tx.TakeMs} ms to take)");
         // TX4: the REAL service's own band facts reach the wire - the fake's shape is not evidence of the service's (names, the linear
         // limit, the settle after a load keyed by band name). The figures are the service's and only their presence is asserted.
         var r13 = tx.BandAt(2_392_000_000);

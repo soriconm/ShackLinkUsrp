@@ -1723,9 +1723,12 @@ internal static partial class Program
         o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").ToArray());
         Check(o.W1700k && o.W1700kServe == W1700kServe.DefaultCommand && o.W1700kBind.ToString() == "10.77.0.10:7700" && o.W1700kFlatten && o.W1700kRemoveDc,
               "an empty launch profile passes nothing: the sidecar's defaults, never ones invented by the spawner");
-        Check(o.W1700kTxServe == null && !SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").Contains("--w1700k-tx-serve") &&
-              !SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch { W1700kTxServe = " None " }, "t").Contains("--w1700k-tx-serve"),
-              "TX4: no transmit service in the profile, or none, passes no --w1700k-tx-serve: the radio states no transmitter, as before");
+        Check(o.W1700kTxServe == "" && !o.W1700kTxServeSet && !SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").Contains("--w1700k-tx-serve"),
+              "D1: no transmit service in the profile passes no --w1700k-tx-serve: the sidecar's default, BUILT IN, stands");
+        var offArgs = SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch { W1700kTxServe = " None " }, "t").ToArray();
+        o = SidecarOptions.Parse(offArgs);
+        Check(offArgs.Contains("--w1700k-tx-serve") && o.W1700kTxServe == "none" && o.W1700kTxServeSet,
+              "D1: Off is PASSED as none (the sidecar's default is no longer none), and read back as none: " + string.Join(" ", offArgs));
         const string txCmd = @"python C:\Dev\SDRW1700K\tools\w1700k-tx-serve.py";
         o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k("attic"), new SidecarLaunch { W1700kTxServe = "  " + txCmd + " " }, "t").ToArray());
         Check(o.W1700kTxServe == txCmd,

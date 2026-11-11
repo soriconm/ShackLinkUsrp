@@ -214,7 +214,17 @@ internal sealed class W1700kTxServe : IDisposable
         var stdin = p.StandardInput.BaseStream;
         void Kill()
         {
-            try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+            // The PROCESS gone, not the kill sent: the controller started after it must find the router's claim released, and
+            // Windows drops a mutex at process exit (ShackLink docs/w1700k_support.md "The built-in transmit service", the claim).
+            try
+            {
+                if (!p.HasExited)
+                {
+                    p.Kill(entireProcessTree: true);
+                    if (!p.WaitForExit(3000)) log($"the transmit service (pid {p.Id}) was killed and had not exited 3 s later");
+                }
+            }
+            catch { }
         }
         return new W1700kTxServe(stdin, p.StandardOutput, () =>
         {

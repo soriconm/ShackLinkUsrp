@@ -63,6 +63,41 @@ internal sealed class W1700kServe : IDisposable
     /// (ShackLink Device Setup).</summary>
     public static string DefaultCommand => ShackLinkUsrp.Client.W1700kDefaults.ServeCommandIn(AppContext.BaseDirectory);
 
+    /// <summary>
+    /// The bundled controller's <c>--version</c> (one JSON line, no unit contact; ~110 ms on the station that measured it): what it
+    /// printed, or null when <paramref name="exe"/> is not there; anything else that stops it answering throws, in words. Its input is
+    /// closed at once (it reads none), no window, a hard cap - the doctor runner's rules (ShackLink docs/device_setup_support.md W15).
+    /// Asked only to learn whether it has a transmit service (ShackLink docs/w1700k_support.md D4).
+    /// </summary>
+    public static string? ReadVersion(string exe, int timeoutMs)
+    {
+        if (!File.Exists(exe)) return null;
+        var psi = new ProcessStartInfo(exe, "--version")
+        {
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false),
+        };
+        using var p = Process.Start(psi) ?? throw new InvalidOperationException($"{exe} --version did not start");
+        try { p.StandardInput.Close(); } catch { }
+        var output = p.StandardOutput.ReadToEndAsync();
+        var errors = p.StandardError.ReadToEndAsync();
+        if (!p.WaitForExit(Math.Max(1, timeoutMs)))
+        {
+            try { p.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException($"it did not answer within {timeoutMs} ms");
+        }
+        p.WaitForExit();
+        string text = output.Wait(2000) ? output.Result : "";
+        if (p.ExitCode != 0 && text.Trim().Length == 0)
+            throw new InvalidOperationException($"it exited {p.ExitCode}" + (errors.Wait(500) && errors.Result.Trim().Length > 0 ? ": " + errors.Result.Trim() : ""));
+        return text;
+    }
+
     /// <summary>Start <paramref name="commandLine"/> (its first word the program, the rest its arguments, as a shell would
     /// split them) with its standard streams redirected. Its stderr is the sidecar's log.</summary>
     public static W1700kServe Spawn(string commandLine, Action<string> log)

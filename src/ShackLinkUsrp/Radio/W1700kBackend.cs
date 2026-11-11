@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using ShackLinkUsrp.Client;
 using ShackLinkUsrp.Host;
 using ShackLinkUsrp.Server;
 using ShackLinkUsrp.Wire;
@@ -69,6 +70,25 @@ internal sealed class W1700kBackendOptions
 
     /// <summary>A gate's transmit service in place of <see cref="TxServeCommand"/>'s process.</summary>
     public Func<W1700kTxServe>? TxServeFactory;
+
+    /// <summary>The launch's transmit-service value as the operator gave it (ShackLink docs/w1700k_support.md "The built-in transmit
+    /// service", D1-D4): "" = BUILT IN, "none" = off, else a command - resolved at open by
+    /// <see cref="ShackLinkUsrp.Client.W1700kDefaults.ResolveTxServe"/> into the service started, or into <c>caps.tx_absent</c>.
+    /// Null = nothing is resolved here: <see cref="TxServeCommand"/> and <see cref="TxServeFactory"/> stand as given (a gate's).</summary>
+    public string? TxServeSetting;
+
+    /// <summary>The station's config (<c>--w1700k-config</c>), "" = none: the transmit service reads the router the controller reads.</summary>
+    public string ConfigFile = "";
+
+    /// <summary>The folder whose sibling <c>W1700K\</c> holds the bundled controller: this program's own.</summary>
+    public string HelperDirectory = AppContext.BaseDirectory;
+
+    /// <summary>A gate's reader of the bundled controller's <c>--version</c> in place of running it: its path in, what it printed
+    /// out (null = the file is not there).</summary>
+    public Func<string, string?>? ReadControllerVersion;
+
+    /// <summary>The bundled controller's <c>--version</c> (one JSON line, no unit contact: ~110 ms measured) is given this long.</summary>
+    public int VersionTimeoutMs = 5000;
 
     /// <summary>A transmit-service request that touches nothing slow (hello, caps, start).</summary>
     public int TxRequestTimeoutMs = 10_000;
@@ -153,6 +173,7 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
     {
         _opt = opt;
         _controlled = opt.ServeCommand != null || opt.ServeFactory != null;
+        _txCommand = opt.TxServeCommand;
         _band = BandFor(opt.LoHz, -1, TuneReach) ?? 0;
         _condRateHz = opt.WideRateHz;
         _cond.Flatten = opt.Flatten;
@@ -285,6 +306,9 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
 
     private void OpenRadioCore()
     {
+        // Which transmit service, or why none, is settled BEFORE the controller starts: its --version is the one question asked of
+        // the bundled controller, and it touches nothing on the unit (ShackLink docs/w1700k_support.md D4).
+        ResolveTransmitter();
         OpenSocket();
         _worker = new Thread(ConditionLoop) { IsBackground = true, Name = "W1700kCondition", Priority = ThreadPriority.AboveNormal };
         _worker.Start();
@@ -1100,19 +1124,66 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
     private double _unitTxRateHz;
 
     /// <summary>A transmitter needs BOTH children: the service that keys the unit, and the controller this sidecar stops for it
-    /// and starts again after it. Without <c>--w1700k-tx-serve</c> this radio states none, as it always did.</summary>
-    private bool TxConfigured => _controlled && (_opt.TxServeCommand != null || _opt.TxServeFactory != null);
+    /// and starts again after it. With no service resolved this radio states none, and says why in <c>caps.tx_absent</c>.</summary>
+    /// A gate's fake service stands in for the PROCESS only: once a launch value is resolved (TxServeSetting set), the resolution
+    /// decides whether there is a service at all.
+    private bool TxConfigured => _controlled && (_txCommand != null || (_opt.TxServeSetting == null && _opt.TxServeFactory != null));
+
+    /// <summary>The transmit service's command line: <see cref="W1700kBackendOptions.TxServeCommand"/>, or what the open resolved.</summary>
+    private string? _txCommand;
+    /// <summary>What the sidecar was started with (<c>ShackLinkUsrp.Client.W1700kTxSettings</c>), for <c>caps.tx_absent.setting</c>; "" = a gate's.</summary>
+    private string _txSetting = "";
 
     /// <summary>The radio is a transmitter now: its receiver is stopped until the transmitter is released.</summary>
     internal bool Taken => _taken;
 
+    /// <summary>
+    /// The transmit service this open starts, or why none (ShackLink docs/w1700k_support.md D4): <see cref="W1700kDefaults.ResolveTxServe"/>
+    /// over the launch's value, the controller, the station's config and - only for Built in on the bundled controller - that
+    /// controller's <c>--version</c>. Whatever it answers, the receiver opens as before.
+    /// </summary>
+    private void ResolveTransmitter()
+    {
+        if (_opt.TxServeSetting == null) return;
+        var choice = ResolveFor(_opt);
+        _txSetting = choice.Setting;
+        _txCommand = choice.Command;
+        if (choice.HasService)
+        {
+            StateTxAbsent(null);
+            Log($"transmit service ({choice.Setting}): {choice.Command}");
+        }
+        else
+        {
+            StateTxAbsent(new TxAbsence { Reason = choice.Reason, Text = choice.Text, Setting = choice.Setting });
+            Log("no transmitter: " + choice.Text);
+        }
+    }
+
+    internal static W1700kTxChoice ResolveFor(W1700kBackendOptions opt) =>
+        W1700kDefaults.ResolveTxServe(opt.TxServeSetting ?? W1700kDefaults.NoController,
+            // A gate's controller stands for the bundled one of ITS helper folder.
+            opt.ServeFactory != null ? W1700kDefaults.ServeCommandIn(opt.HelperDirectory) : opt.ServeCommand ?? W1700kDefaults.NoController,
+            opt.ConfigFile, opt.HelperDirectory,
+            exe => opt.ReadControllerVersion != null ? opt.ReadControllerVersion(exe) : W1700kServe.ReadVersion(exe, opt.VersionTimeoutMs));
+
+    /// <summary><c>caps.tx_absent</c>: why this radio states no transmitter, or null once it states one. Read by every hello and
+    /// <c>wait_ready</c> after the open (the server never sends it beside <c>caps.tx</c>).</summary>
+    private void StateTxAbsent(TxAbsence? why) => Caps.TxAbsent = why;
+
     private W1700kTxServe NewTxServe()
     {
-        var s = _opt.TxServeFactory != null ? _opt.TxServeFactory() : W1700kTxServe.Spawn(_opt.TxServeCommand!, Log);
+        var s = _opt.TxServeFactory != null ? _opt.TxServeFactory() : W1700kTxServe.Spawn(_txCommand!, Log);
+        return HelloOf(s, _opt.TxRequestTimeoutMs, out _);
+    }
+
+    /// <summary>The service started and its <c>hello</c> asked: the wire checked, the service handed back (disposed on a failure).</summary>
+    private static W1700kTxServe HelloOf(W1700kTxServe s, int timeoutMs, out JsonObject hello)
+    {
         try
         {
             s.Start();
-            var hello = s.Request(Req("hello"), _opt.TxRequestTimeoutMs);
+            hello = s.Request(Req("hello"), timeoutMs);
             int wire = (int)hello.GetLong("wire", 0);
             if (wire != W1700kTxCapsInfo.WireVersion)
                 throw new InvalidDataException($"the transmit service speaks wire {wire}; this sidecar speaks wire {W1700kTxCapsInfo.WireVersion}");
@@ -1125,8 +1196,56 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         }
     }
 
+    /// <summary>
+    /// The instrument <c>--w1700k-tx-check</c> (ShackLink docs/w1700k_support.md D5, Device Setup's Transmitter line): resolved as
+    /// an open resolves it, and where a service resolves, that service asked <c>hello</c> and <c>caps</c> through this sidecar's ONE
+    /// client of it, its input then closed - the caps-only start, which touches nothing on the unit. No socket is bound and no
+    /// controller started. One JSON object: <c>transmitter</c>, <c>setting</c>, then either <c>command</c>, <c>service</c> (the
+    /// hello) and <c>tx</c> (caps.tx as the wire would carry it), or <c>tx_absent</c>.
+    /// </summary>
+    internal static JsonObject CheckTransmitter(W1700kBackendOptions opt, Action<string> log)
+    {
+        var o = new JsonObject();
+        var choice = ResolveFor(opt);
+        o.Set("setting", choice.Setting);
+        if (!choice.HasService)
+        {
+            o.Set("transmitter", false);
+            o.Set("tx_absent", new TxAbsence { Reason = choice.Reason, Text = choice.Text, Setting = choice.Setting }.ToJson());
+            return o;
+        }
+        o.Set("command", choice.Command);
+        W1700kTxServe? s = null;
+        try
+        {
+            s = HelloOf(opt.TxServeFactory != null ? opt.TxServeFactory() : W1700kTxServe.Spawn(choice.Command!, log), opt.TxRequestTimeoutMs, out var hello);
+            var info = W1700kTxCapsInfo.Parse(s.Request(Req("caps"), opt.TxRequestTimeoutMs));
+            o.Set("transmitter", true);
+            hello.Remove("id");
+            hello.Remove("ok");
+            o.Set("service", hello);
+            o.Set("tx", TxCapsFrom(info).ToJson());
+        }
+        catch (Exception ex)
+        {
+            o.Set("transmitter", false);
+            o.Set("tx_absent", new TxAbsence
+            {
+                Reason = W1700kTxAbsentReasons.Failed,
+                Text = "the transmit service could not state a transmitter: " + (ex is W1700kTxRefusal r ? r.Said : ex.Message),
+                Setting = choice.Setting,
+            }.ToJson());
+        }
+        finally
+        {
+            s?.Dispose();
+        }
+        return o;
+    }
+
     /// <summary>At open: ask the service what the transmitter is - its <c>caps</c>, which touch nothing on the unit - and let it
-    /// go again. A service that cannot state one is no transmitter, said in the log; the receiver is unaffected.</summary>
+    /// go again. A service that cannot state one is no transmitter, said in the log and in <c>caps.tx_absent</c>; the receiver is
+    /// unaffected.</summary>
     private void LearnTransmitter()
     {
         if (!TxConfigured) return;
@@ -1138,6 +1257,7 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
             var caps = TxCapsFrom(info);
             _txInfo = info;
             _txCapsWire = caps;
+            StateTxAbsent(null);
             InitTxState(st =>
             {
                 st.RateHz = info.InputRateHz;
@@ -1151,7 +1271,14 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         }
         catch (Exception ex)
         {
-            Log("no transmitter: the transmit service could not state one - " + (ex is W1700kTxRefusal r ? r.Said : ex.Message));
+            string said = ex is W1700kTxRefusal r ? r.Said : ex.Message;
+            Log("no transmitter: the transmit service could not state one - " + said);
+            StateTxAbsent(new TxAbsence
+            {
+                Reason = W1700kTxAbsentReasons.Failed,
+                Text = "the transmit service could not state a transmitter: " + said,
+                Setting = _txSetting,
+            });
         }
         finally
         {
