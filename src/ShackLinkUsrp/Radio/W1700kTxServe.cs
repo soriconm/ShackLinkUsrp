@@ -42,6 +42,14 @@ internal sealed class W1700kTxBand
     /// <summary>How long the carrier settles after a preparation that RELOADED the unit (<c>costs.settle.load.settle_ms</c>,
     /// keyed by this band's name). -1 = not stated.</summary>
     public long LoadSettleMs = -1;
+    /// <summary><c>key_down_max_ms</c> on the service's own LEVEL axis, as it states it (ShackLink docs/w1700k_support.md
+    /// "TX5-0"): read with <see cref="TxKeyDownLimits.MsAt"/>, the service's rule. Empty = not stated.</summary>
+    public TxKeyDownLimit[] KeyDownMaxMs = Array.Empty<TxKeyDownLimit>();
+    /// <summary>The list was present and not whole: not stated, and said in the log rather than half read.</summary>
+    public bool KeyDownMaxMsUnreadable;
+    /// <summary>How many PA indices the band states (<c>pa_indices</c>), and for how many a calibration file of THIS unit is
+    /// present (their <c>calibrated</c>). -1 = not stated; the second also where any index does not say.</summary>
+    public int PaIndexCount = -1, CalibratedPaIndexCount = -1;
 }
 
 /// <summary>
@@ -104,6 +112,14 @@ internal sealed class W1700kTxCapsInfo
                 throw new InvalidDataException($"the transmit service's band \"{band.Name}\" states no frequency range");
             if (double.IsNaN(band.LevelMinDb) || double.IsNaN(band.LevelMaxDb) || !(band.LevelMaxDb > band.LevelMinDb) || !(band.LevelStepDb > 0))
                 throw new InvalidDataException($"the transmit service's band \"{band.Name}\" states no level range and step");
+            band.KeyDownMaxMsUnreadable = !TxKeyDownLimits.TryParse(b.GetArray("key_down_max_ms"), out band.KeyDownMaxMs);
+            if (b.GetArray("pa_indices") is { } pas)
+            {
+                var indices = pas.OfType<JsonObject>().ToList();
+                band.PaIndexCount = indices.Count;
+                // Counted only where EVERY index says: an index that does not is no evidence that this unit is uncalibrated.
+                band.CalibratedPaIndexCount = indices.All(p => p["calibrated"] is bool) ? indices.Count(p => p.GetBool("calibrated")) : -1;
+            }
             bands.Add(band);
         }
         if (bands.Count == 0) throw new InvalidDataException("the transmit service's caps state no band");
@@ -131,8 +147,23 @@ internal sealed class W1700kTxCapsInfo
         if (loadSettle != null)
             foreach (var b in c.Bands)
                 if (loadSettle.TryGetLong(b.Name, out long ms) && ms >= 0) b.LoadSettleMs = ms;
+        // X2: what the level figures were measured on, and whether a calibration is per unit and shipped - passed through.
+        c.Tables = TxTables.Parse(o.GetObject("tables"));
+        c.Calibration = TxCalibration.Parse(o.GetObject("calibration"));
         return c;
     }
+
+    /// <summary>The service's <c>tables</c> and <c>calibration</c>, as it states them; null = not stated.</summary>
+    public TxTables? Tables;
+    public TxCalibration? Calibration;
+
+    /// <summary>The longest key-down by level, per band, in the service's own figures - what the log says in place of the
+    /// overall <c>max_ms</c>, which is the longest at ANY level and false at a level whose own figure is shorter (TX5-0 K7).</summary>
+    public string KeyDownWords() => string.Join("; ", Bands.Select(b =>
+        b.KeyDownMaxMs.Length > 0
+            ? b.Name + " " + string.Join(", ", b.KeyDownMaxMs.Select(e =>
+                $"{(e.Ms / 1000.0).ToString("0.#", CultureInfo.InvariantCulture)} s to {e.TopDb.ToString("0.#", CultureInfo.InvariantCulture)} dB"))
+            : $"{b.Name} {(b.KeyDownMaxMsUnreadable ? "unreadable" : "not stated")} by level ({MaxMs} ms at most)"));
 
     public W1700kTxBand? BandAt(long hz) => Bands.FirstOrDefault(b => hz >= b.CenterMinHz && hz <= b.CenterMaxHz);
 

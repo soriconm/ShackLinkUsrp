@@ -72,6 +72,8 @@ internal static partial class Program
         public volatile bool Alive = true, Killed, Closed, SilentOnStop;
         /// <summary>The unit's feeder never confirms what it played: a drain ends, unacknowledged.</summary>
         public volatile bool NoAck;
+        /// <summary>The service never ends a key-down at its max_ms itself: only the sidecar's own cap can (TX5-0 K2's proof).</summary>
+        public volatile bool NoOwnCap;
         public (string Op, string Reason, string Error)? Refuse;
         /// <summary>Fields a refusal carries beside its reason and words.</summary>
         public JsonObject? RefuseWith;
@@ -192,10 +194,14 @@ internal static partial class Program
                             Send(No(r, "nonlinear_level", $"an arbitrary envelope is linear only at {F(linear, "0.#")} dB or less on this band").Set("linear_max_level_db", linear));
                             break;
                         }
+                        // The service's rule (w1700k-tx-serve.py op_start, T25+): the band's key_down_max_ms at the ASKED level, the
+                        // first entry whose top is at or above it within 1e-9, else caps.max_ms; more is REFUSED with the figure -
+                        // never granted shorter.
                         long maxMs = r.GetLong("max_ms");
-                        if (maxMs < 1 || maxMs > _rig.Caps.GetLong("max_ms"))
+                        long most = MostAt(level);
+                        if (maxMs < 1 || maxMs > most)
                         {
-                            Send(No(r, "max_ms", "a key-down is at most " + _rig.Caps.GetLong("max_ms") + " ms"));
+                            Send(No(r, "max_ms", $"max_ms is 1 .. {most} at {F(level, "+0.0")} dB on this band (the longest key-down measured there)").Set("max_ms", most));
                             break;
                         }
                         lock (_lock)
@@ -250,6 +256,21 @@ internal static partial class Program
                     Send(No(r, "unknown_op", $"unknown op '{op}'"));
                     break;
             }
+        }
+
+        /// <summary>The longest key-down the service allows at <paramref name="level"/> on the prepared band, its own way.</summary>
+        private long MostAt(double level)
+        {
+            long overall = _rig.Caps.GetLong("max_ms");
+            foreach (var item in (IEnumerable<object>?)_rig.Caps.GetArray("bands") ?? Array.Empty<object>())
+            {
+                if (item is not JsonObject b || CenterHz < b.GetLong("center_min_hz") || CenterHz > b.GetLong("center_max_hz")) continue;
+                if (b.GetArray("key_down_max_ms") is not { } list) return overall;
+                foreach (var e in list)
+                    if (e is JsonArray pair && level <= ((JsonNumber)pair[0]).AsDouble() + 1e-9) return ((JsonNumber)pair[1]).TryAsLong(out long ms) ? ms : overall;
+                return overall;
+            }
+            return overall;
         }
 
         public void OnSamples(byte[] sc16)
@@ -326,7 +347,7 @@ internal static partial class Program
                         _short = true;
                     }
                     else _short = false;
-                    if (_on.ElapsedMilliseconds > _maxMs) cap = $"the key-down reached its {_maxMs} ms";
+                    if (!NoOwnCap && _on.ElapsedMilliseconds > _maxMs) cap = $"the key-down reached its {_maxMs} ms";
                     Monitor.PulseAll(_lock);
                 }
                 if (cap != null) EndNow("cap", cap);
@@ -337,14 +358,28 @@ internal static partial class Program
             .Set("wire", 1)
             .Set("input", new JsonObject().Set("rate_hz", Rate).Set("format", "sc16le").Set("max_block_samples", 960))
             .Set("queue_ms", 375).Set("prebuffer_ms", 100).Set("starve_ms", 300).Set("resampler_delay_ms", 4).Set("unit_rate_hz", 15886)
-            .Set("max_ms", 15000)
+            // T25+: max_ms is the longest at ANY level; each band's key_down_max_ms has it by level (T26's figures, eb 2026-11-11).
+            .Set("max_ms", 1_800_000)
             .Set("envelope", new JsonObject().Set("on", 0.85).Set("off", 0.03).Set("window_ms", 200).Set("max_between", 0.25))
             .Set("bands", new JsonArray()
                 .Add(new JsonObject().Set("name", "13cm").Set("band", 0).Set("center_min_hz", 2_391_000_000).Set("center_max_hz", 2_449_000_000)
                     .Set("groups", new JsonArray().Add(new JsonArray().Add(2_391_000_000).Add(2_449_000_000)))
-                    .Set("level_min_db", -40.0).Set("level_max_db", 0.0).Set("level_step_db", 0.1).Set("linear_max_level_db", -17.1))
+                    .Set("level_min_db", -40.0).Set("level_max_db", 0.0).Set("level_step_db", 0.1).Set("linear_max_level_db", -17.1)
+                    .Set("key_down_max_ms", new JsonArray().Add(new JsonArray().Add(-17.1).Add(1_800_000)).Add(new JsonArray().Add(0.0).Add(300_000)))
+                    .Set("pa_indices", new JsonArray()
+                        .Add(new JsonObject().Set("pa_index", 35).Set("full_scale_level_db", -20.0).Set("calibrated", false))
+                        .Add(new JsonObject().Set("pa_index", 50).Set("full_scale_level_db", -5.0).Set("calibrated", false))))
                 .Add(new JsonObject().Set("name", "6cm").Set("band", 1).Set("center_min_hz", 5_651_000_000).Set("center_max_hz", 5_849_000_000)
-                    .Set("level_min_db", -40.0).Set("level_max_db", 0.0).Set("level_step_db", 0.1).Set("linear_max_level_db", 0.0)))
+                    .Set("level_min_db", -40.0).Set("level_max_db", 0.0).Set("level_step_db", 0.1).Set("linear_max_level_db", 0.0)
+                    .Set("key_down_max_ms", new JsonArray().Add(new JsonArray().Add(-12.0).Add(1_800_000)).Add(new JsonArray().Add(0.0).Add(15_000)))
+                    .Set("pa_indices", new JsonArray()
+                        .Add(new JsonObject().Set("pa_index", 24).Set("full_scale_level_db", -17.7).Set("calibrated", true))
+                        .Add(new JsonObject().Set("pa_index", 38).Set("full_scale_level_db", -3.0).Set("calibrated", false))
+                        .Add(new JsonObject().Set("pa_index", 44).Set("full_scale_level_db", 0.0).Set("calibrated", true)))))
+            .Set("tables", new JsonObject().Set("measured_on", "one unit (a W1700K2, hardware 2.1)").Set("measured", "2026-11-10")
+                .Set("other_units_measured", false).Set("note", "measured on one unit"))
+            .Set("calibration", new JsonObject().Set("per_unit", true).Set("shipped", false).Set("dir", @"C:\cal")
+                .Set("files", new JsonArray().Add("iq-cal-5cm.json")).Set("note", "one unit's own"))
             .Set("passbands", new JsonArray().Add(new JsonObject().Set("name", "voice").Set("half_width_hz", 3400)
                 .Set("occupied", new JsonArray().Add(new JsonObject().Set("down_db", 25).Set("half_width_hz", 16000))).Set("constant_ok", false)))
             .Set("costs", new JsonObject().Set("prepare", new JsonObject().Set("tune_ms", 1000).Set("setup_ms", 4000).Set("load_ms", 11000)).Set("close_ms", 1000));
@@ -480,9 +515,9 @@ internal static partial class Program
         var caps = W1700kBackend.TxCapsFrom(info);
         Check(info.Bands.Length == 2 && info.BandAt(2_392_000_000)?.Name == "13cm" && info.BandAt(5_760_000_000)?.Name == "6cm" && info.BandAt(3_400_000_000) == null,
               "the service's bands: 13cm and 6cm, and nothing between them");
-        Check(caps.FreqMinHz == 2_391_000_000 && caps.FreqMaxHz == 5_849_000_000 && caps.RatesHz.SequenceEqual(new[] { 48000.0 }) && caps.MaxMs == 15000 &&
+        Check(caps.FreqMinHz == 2_391_000_000 && caps.FreqMaxHz == 5_849_000_000 && caps.RatesHz.SequenceEqual(new[] { 48000.0 }) && caps.MaxMs == 1_800_000 &&
               caps.GainMinDb == 0 && caps.GainMaxDb == 40 && caps.GainStepDb == 0.1 && caps.QuantumSamples == 960,
-              $"caps.tx is the service's statement: 48 kS/s in, 15 s, gain 0..40 dB = level -40..0 ({caps.GainMinDb}..{caps.GainMaxDb} step {caps.GainStepDb})");
+              $"caps.tx is the service's statement: 48 kS/s in, 30 min at the most at any level, gain 0..40 dB = level -40..0 ({caps.GainMinDb}..{caps.GainMaxDb} step {caps.GainStepDb})");
         Check(caps.TakesRadio && caps.TakeMs == 11000 && caps.GiveMs == 12000 && caps.Timebase == TxTimebases.Host &&
               caps.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }) && caps.MaxLoOffsetHz == 0,
               "...it takes the radio (11 s to take, 12 s to give back), stamps on the host's clock, and builds iq and tone only");
@@ -514,6 +549,37 @@ internal static partial class Program
         ((JsonObject)noLinear.GetArray("bands")[0]).Remove("linear_max_level_db");
         Check(double.IsNaN(TxCaps.Parse(W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(noLinear)).ToJson()).Bands[0].LinearMaxGainDb),
               "a band whose linear limit the service does not state has none on the wire - NaN, never 0 or the top");
+
+        // TX5-0: the longest key-down by level, moved onto the gain axis as the linear limit is (K4), and X2's facts passed through.
+        var i6 = info.BandAt(5_760_000_000)!;
+        Check(i6.KeyDownMaxMs.Length == 2 && i6.KeyDownMaxMs[0].TopDb == -12.0 && i6.KeyDownMaxMs[1].Ms == 15_000 && !i6.KeyDownMaxMsUnreadable &&
+              TxKeyDownLimits.MsAt(i6.KeyDownMaxMs, -12.0) == 1_800_000 && TxKeyDownLimits.MsAt(i6.KeyDownMaxMs, -11.9) == 15_000,
+              "the service's key_down_max_ms is read on ITS level axis, in its order, and looked up its way (-12.0 is the lower entry)");
+        var wire = TxCaps.Parse(caps.ToJson());
+        var w13 = wire.BandAt(2_392_000_000)!;
+        var w6 = wire.BandAt(5_760_000_000)!;
+        Check(w6.KeyDownMaxMs.Length == 2 && Math.Abs(w6.KeyDownMaxMs[0].TopDb - 28) < 1e-9 && w6.KeyDownMaxMs[0].Ms == 1_800_000 &&
+              Math.Abs(w6.KeyDownMaxMs[1].TopDb - 40) < 1e-9 && w6.KeyDownMaxMsAt(28) == 1_800_000 && w6.KeyDownMaxMsAt(28.1) == 15_000 &&
+              Math.Abs(w13.KeyDownMaxMs[0].TopDb - 22.9) < 1e-9 && w13.KeyDownMaxMsAt(22.9) == 1_800_000 && w13.KeyDownMaxMsAt(23) == 300_000,
+              $"...and on the wire's GAIN axis (level + 40): 6cm 30 min to 28 dB, 15 s to 40; 13cm 30 min to {F(w13.KeyDownMaxMs[0].TopDb, "0.######")}, 5 min to 40");
+        Check(w13.PaIndexCount == 2 && w13.CalibratedPaIndexCount == 0 && w6.PaIndexCount == 3 && w6.CalibratedPaIndexCount == 2 &&
+              wire.Tables?.MeasuredOn == "one unit (a W1700K2, hardware 2.1)" && wire.Tables.Measured == "2026-11-10" && !wire.Tables.OtherUnitsMeasured &&
+              wire.Calibration?.PerUnit == true && wire.Calibration.Shipped == false && !caps.ToJson().ToString().Contains("iq-cal-5cm"),
+              "X2: each band's PA indices and how many are calibrated for this unit, the tables' unit, and the calibration's shape reach the wire - " +
+              "never the station's file names");
+        var torn = FakeTxService.DefaultCaps();
+        ((JsonObject)torn.GetArray("bands")[1]).Set("key_down_max_ms", new JsonArray().Add(new JsonArray().Add(-12.0).Add(1_800_000)).Add(new JsonArray().Add(0.0)));
+        ((JsonObject)((JsonObject)torn.GetArray("bands")[0]).GetArray("pa_indices")[1]).Remove("calibrated");
+        ((JsonObject)torn.GetArray("bands")[0]).Remove("key_down_max_ms");
+        var tornInfo = W1700kTxCapsInfo.Parse(torn);
+        var tornWire = TxCaps.Parse(W1700kBackend.TxCapsFrom(tornInfo).ToJson());
+        Check(tornInfo.Bands[1].KeyDownMaxMsUnreadable && tornInfo.Bands[1].KeyDownMaxMs.Length == 0 && tornWire.Bands[1].KeyDownMaxMs.Length == 0 &&
+              !tornInfo.Bands[0].KeyDownMaxMsUnreadable && tornWire.Bands[0].KeyDownMaxMs.Length == 0 && tornWire.Bands[0].CalibratedPaIndexCount == -1 &&
+              tornWire.Bands[0].PaIndexCount == 2 && tornInfo.KeyDownWords().Contains("6cm unreadable by level") && tornInfo.KeyDownWords().Contains("13cm not stated by level"),
+              "a list that is not whole is NOT STATED (and said unreadable in the log), an absent one is not stated, and an index that does not say " +
+              "whether it is calibrated makes the band's count unstated - never 'uncalibrated': " + tornInfo.KeyDownWords());
+        Check(info.KeyDownWords() == "13cm 1800 s to -17.1 dB, 300 s to 0 dB; 6cm 1800 s to -12 dB, 15 s to 0 dB",
+              "the log's key-down words are the service's list, per band, never the overall max_ms as THE limit (K7): " + info.KeyDownWords());
         var prep = TxState.Parse(new TxState { Taken = true, Prepared = new TxPrepared { Path = "adopt", TookMs = 1100, SettleMs = 0, SettleMeasured = true } }.ToJson()).Prepared;
         Check(prep != null && prep.Path == "adopt" && prep.TookMs == 1100 && prep.SettleMs == 0 && prep.SettleMeasured &&
               TxState.Parse(new TxState { Prepared = new TxPrepared() }.ToJson()).Prepared.TookMs == -1,
@@ -542,7 +608,7 @@ internal static partial class Program
         using var s = rig.Connect("w1700k-tx");
         Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
         var tx = s.Caps.Tx;
-        Check(tx != null && tx.TakesRadio && tx.RatesHz.SequenceEqual(new[] { 48000.0 }) && tx.MaxMs == 15000 && tx.GainMaxDb == 40,
+        Check(tx != null && tx.TakesRadio && tx.RatesHz.SequenceEqual(new[] { 48000.0 }) && tx.MaxMs == 1_800_000 && tx.GainMaxDb == 40,
               "caps.tx is stated at open, from the service's caps");
         Check(rig.ServiceCount == 1 && rig.Service.Closed && rig.Service.Taken("prepare").Count == 0 && rig.Violations.Count == 0,
               "...asked of a service that touched nothing on the unit and was let go again, while the controller ran");
@@ -676,6 +742,93 @@ internal static partial class Program
               st.Readiness == RadioStates.Ready, $"it receives again where it was: {after.Count} rows, the tone back at its level, 40 MS/s");
         Check(RefusalOf(() => s.SetLo(2_440_000_000)) == "", "...and the receiver takes a retune again");
         ev.Dispose();
+    }
+
+    /// <summary>TX5-0 (ShackLink docs/w1700k_support.md "TX5-0"): the unit's limit at the level in force SHORTENS a key-down and never
+    /// refuses it (K1), the server honours the shorter grant and caps at it (K2), a service with no list is asked as before (K4), and a
+    /// max_ms refusal that still arrives is said and never retried (K5). Through the real backend and server; nothing keyed.</summary>
+    private static void W1700kTxKeyDownLimit()
+    {
+        long SentMaxMs(W1700kTxRig r) => r.Service.Taken("start")[^1].GetLong("max_ms");
+
+        using (var rig = new W1700kTxRig("txkeydown"))
+        using (var s = rig.Connect("w1700k-tx"))
+        {
+            Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = 5_760_000_000, GainDb = 30 });
+            // TX Settings' default 180 s timeout: the engine asks 190 000 ms (UsrpKind.KeyUpAskMs).
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 190_000 });
+            Check(SentMaxMs(rig) == 15_000 && t.Grant.MaxMs == 15_000 && Math.Abs(rig.Service.LastLevelDb + 10) < 1e-6,
+                  $"K1: 6cm at level -10 asking 190 000 ms - REFUSED before TX5-0 - is asked of the service as its figure, {SentMaxMs(rig)} ms, " +
+                  $"and the grant says {t.Grant.MaxMs}");
+            t.Stop(drain: false);
+            s.SetTx(new TxSettings { GainDb = 28 });
+            var edge = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 190_000 });
+            Check(SentMaxMs(rig) == 190_000 && edge.Grant.MaxMs == 190_000 && Math.Abs(rig.Service.LastLevelDb + 12) < 1e-6,
+                  $"...exactly at -12.0 dB (gain 28: 280 x 0.1 is exactly 28) the LOWER entry applies, its 30 min: 190 000 is asked as is ({SentMaxMs(rig)})");
+            edge.Stop(drain: false);
+            // 13cm's edge is where the service's 1e-9 matters: gain 22.9 is 229 x 0.1 = 22.900000000000002, so the level sent is
+            // -17.099999999999998, ABOVE the -17.1 top by 2e-15. Read the service's way it is the 30 min entry; read without the
+            // tolerance it would be the 5 min one. 600 000 ms sits between the two.
+            s.SetTx(new TxSettings { CenterHz = 2_392_000_000, GainDb = 22.9 });
+            var lin = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 600_000 });
+            Check(SentMaxMs(rig) == 600_000 && lin.Grant.MaxMs == 600_000 && rig.Service.LastLevelDb > -17.1,
+                  $"13cm at its linear limit (level {rig.Service.LastLevelDb:R}, a hair above -17.1): the 30 min entry, the service's own reading, so 600 000 is asked as is ({SentMaxMs(rig)})");
+            lin.Stop(drain: false);
+
+            s.SetTx(new TxSettings { CenterHz = 5_760_000_000, GainDb = 30 });
+            int starts = rig.Service.Taken("start").Count;
+            rig.Service.Refuse = ("start", "max_ms", "max_ms is 1 .. 15000 at -10.0 dB on this band (the longest key-down measured there)");
+            rig.Service.RefuseWith = new JsonObject().Set("max_ms", 15000);
+            var no = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 190_000 }));
+            rig.Service.Refuse = null;
+            rig.Service.RefuseWith = null;
+            Check(no != null && no.Message.Contains("(max_ms)") && no.Message.Contains("15000") && rig.Service.Taken("start").Count == starts + 1 && !s.GetState().Tx!.Keyed,
+                  "K5: a max_ms refusal that still arrives is said in the service's words and NEVER retried with its figure: " + no?.Message);
+            s.ReleaseTx();
+        }
+
+        // K2 end to end: the server's cap timer runs at the GRANT. A figure of 700 ms at 6cm's top, a tone (an IQ stream with no block is
+        // ended as starved first, rightly), and a service that never caps by itself: only the SERVER's timer can end it.
+        var shortCaps = FakeTxService.DefaultCaps();
+        ((JsonObject)shortCaps.GetArray("bands")[1]).Set("key_down_max_ms", new JsonArray().Add(new JsonArray().Add(-12.0).Add(1_800_000)).Add(new JsonArray().Add(0.0).Add(700)));
+        using (var rig = new W1700kTxRig("txkeydowncap", caps: shortCaps) { Arm = svc => svc.NoOwnCap = true })
+        using (var s = rig.Connect("w1700k-tx"))
+        {
+            Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = 5_760_000_000, GainDb = 30 });
+            var events = TxEvents(s, out var ev);
+            var sw = Stopwatch.StartNew();
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 190_000, OffsetHz = 1000, LevelDbfs = -6 });
+            Check(t.Grant.MaxMs == 700 && SentMaxMs(rig) == 700 && rig.Service.NoOwnCap, $"a 700 ms figure is asked and granted ({t.Grant.MaxMs})");
+            bool capped = WaitFor(() => { lock (events) return events.Any(e => e.name == EventNames.Tx && e.body.GetString("state") == TxStates.Idle &&
+                e.body.GetString("reason") == EndReasons.Cap && (e.body.GetString("text") ?? "").Contains("max_ms of 700 ms and the sidecar ended it")); }, 4000);
+            long ms = sw.ElapsedMilliseconds;
+            string seen;
+            lock (events) seen = string.Join(" | ", events.Where(e => e.name == EventNames.Tx).Select(e => $"{e.body.GetString("state")}/{e.body.GetString("reason")}"));
+            Check(capped && ms >= 600 && ms < 2500, $"K2: the sidecar's cap ends it at the GRANT, reason cap, after {ms} ms - never the 190 s asked (tx events: {seen})");
+            ev.Dispose();
+            s.ReleaseTx();
+        }
+
+        // K4: a service that states no list is asked exactly what the engine asked.
+        var noList = FakeTxService.DefaultCaps();
+        foreach (var b in noList.GetArray("bands").OfType<JsonObject>()) b.Remove("key_down_max_ms");
+        using (var rig = new W1700kTxRig("txkeydownnone", caps: noList))
+        using (var s = rig.Connect("w1700k-tx"))
+        {
+            Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+            Check(s.Caps.Tx?.BandAt(5_760_000_000)?.KeyDownMaxMs.Length == 0 && !s.Caps.Tx.ToJson().ToString().Contains("key_down_max_ms"),
+                  "a service with no list: none on the wire");
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = 5_760_000_000, GainDb = 30 });
+            var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 10_000 });
+            Check(SentMaxMs(rig) == 10_000 && t.Grant.MaxMs == 10_000, $"...is asked exactly what the engine asked ({SentMaxMs(rig)})");
+            t.Stop(drain: false);
+            s.ReleaseTx();
+        }
     }
 
     private static void W1700kTxFaults()
@@ -879,6 +1032,12 @@ internal static partial class Program
               r13.LoadSettleMs > 0 && r6.LoadSettleMs > 0,
               $"TX4: the REAL service's bands reach the wire - 13cm linear to gain {F(r13?.LinearMaxGainDb ?? double.NaN, "0.#")} of {F(r13?.GainMaxDb ?? double.NaN, "0.#")}, " +
               $"6cm to {F(r6?.LinearMaxGainDb ?? double.NaN, "0.#")}; after a load the carrier settles {r13?.LoadSettleMs} / {r6?.LoadSettleMs} ms (13cm / 6cm)");
+        // TX5-0: the REAL service's key-down lists and X2's facts reach the wire. Presence only: the figures are the service's.
+        Check(r13!.KeyDownMaxMs.Length > 0 && r6!.KeyDownMaxMs.Length > 0 && tx.Tables != null && tx.Tables.MeasuredOn.Length > 0 && tx.Calibration != null &&
+              r13.PaIndexCount > 0 && r13.CalibratedPaIndexCount >= 0 && r6.PaIndexCount > 0 && r6.CalibratedPaIndexCount >= 0,
+              $"TX5-0: the REAL service's key_down_max_ms reaches the wire on the gain axis (6cm: {string.Join(", ", r6?.KeyDownMaxMs.Select(e => $"{e.Ms} ms to {F(e.TopDb, "0.#")} dB") ?? Array.Empty<string>())}), " +
+              $"its tables ({tx.Tables?.MeasuredOn}) and calibration (per unit {tx.Calibration?.PerUnit}, shipped {tx.Calibration?.Shipped}; " +
+              $"{r13?.CalibratedPaIndexCount}/{r13?.PaIndexCount} and {r6?.CalibratedPaIndexCount}/{r6?.PaIndexCount} PA indices calibrated on this PC)");
         s.ClaimTx();
         var took = s.SetTx(new TxSettings { CenterHz = 2_392_000_000, GainDb = 20 });
         Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 2_392_000_000 && rig.Units[0].Closed && rig.Units[0].Taken("stop").Count == 1,
@@ -928,6 +1087,13 @@ internal static partial class Program
         var rtop = top.Stop(drain: true);
         Check(moved.State.Tx?.CenterHz == 5_680_000_000 && top.Grant.GainDb == 40 && rtop.Acked,
               $"a move to 5680 MHz by the same service, and its top level (gain 40 = level 0) keys there ({rtop})");
+        // TX5-0 K1 against the REAL service: TX Settings' default timeout asks 190 000 ms, which the service refused at 6cm's top
+        // before TX5-0; now the sidecar asks the figure the service states there and the grant says it.
+        long at40 = r6.KeyDownMaxMsAt(40);
+        var long6 = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 190_000 });
+        long6.Stop(drain: false);
+        Check(at40 > 0 && long6.Grant.MaxMs == Math.Min(at40, 190_000),
+              $"K1: a 190 000 ms key-up at 6cm's top is granted the REAL service's figure there ({long6.Grant.MaxMs} ms of its stated {at40}), not refused");
         var outside = Refused(() => s.SetTx(new TxSettings { CenterHz = 2_450_000_000 }));
         Check(outside != null && s.GetState().Tx?.Taken == true, "2450 MHz, inside this sidecar's stated range and outside the service's band, is refused and the radio stays taken: " + outside?.Message);
 

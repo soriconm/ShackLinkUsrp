@@ -1266,8 +1266,8 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
                 st.LoHz = 0;
                 st.Taken = false;
             }, info.InputRateHz);
-            Log($"transmitter: {info.BandsWords()}; {info.InputRateHz:0} S/s in, at most {info.MaxMs} ms a key-down; taking it stops this radio's " +
-                $"reception (about {caps.TakeMs} ms to take, {caps.GiveMs} ms to give back). Level is dB under each band's most, never dBm");
+            Log($"transmitter: {info.BandsWords()}; {info.InputRateHz:0} S/s in; the longest key-down by level: {info.KeyDownWords()}; taking it stops " +
+                $"this radio's reception (about {caps.TakeMs} ms to take, {caps.GiveMs} ms to give back). Level is dB under each band's most, never dBm");
         }
         catch (Exception ex)
         {
@@ -1317,7 +1317,14 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
             GainStepDb = b.LevelStepDb,
             LinearMaxGainDb = double.IsNaN(b.LinearMaxLevelDb) ? double.NaN : Math.Round(b.LinearMaxLevelDb - b.LevelMinDb, 6),
             LoadSettleMs = b.LoadSettleMs,
+            // TX5-0 K4: the longest key-down by level, moved onto the gain axis as the linear limit is; the order and the figures
+            // are the service's. A list the service does not state (or states unreadably) is not stated here either.
+            KeyDownMaxMs = b.KeyDownMaxMs.Select(e => new TxKeyDownLimit(Math.Round(e.TopDb - b.LevelMinDb, 6), e.Ms)).ToArray(),
+            PaIndexCount = b.PaIndexCount,
+            CalibratedPaIndexCount = b.CalibratedPaIndexCount,
         }).ToArray(),
+        Tables = info.Tables?.Clone(),
+        Calibration = info.Calibration?.Clone(),
     }, TxSourceKinds.Iq, TxSourceKinds.Tone);
 
     protected override TxCaps? RadioTxCaps() => _txCapsWire?.Clone();
@@ -1585,7 +1592,12 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
                 $"a carrier {request.OffsetHz} Hz from the centre is outside this transmitter's passband of +-{info.PassbandHalfWidthHz:0} Hz: " +
                 "it would be filtered away and the unit would key on nothing - prepare the unit at the frequency itself");
         double level = Math.Min(band.LevelMaxDb, band.LevelMinDb + gain);
-        var start = Req("start").Set("max_ms", request.MaxMs).Set("level_db", level).Set("envelope", "any");
+        // TX5-0 K1: the unit's own limit at this level SHORTENS the key-down and never refuses it. The service refuses a start that
+        // asks more than its figure (it never grants less by itself), so this side asks the figure, read the service's way on its
+        // own level axis with the very level sent. A band that states none is asked exactly what the engine asked (K4).
+        long limitMs = TxKeyDownLimits.MsAt(band.KeyDownMaxMs, level);
+        long askMs = limitMs > 0 && limitMs < request.MaxMs ? limitMs : request.MaxMs;
+        var start = Req("start").Set("max_ms", askMs).Set("level_db", level).Set("envelope", "any");
         JsonObject r;
         try
         {
@@ -1602,10 +1614,16 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         double realised = r.GetDouble("level_db", level);
         grant.GainDb = realised - band.LevelMinDb;
         UpdateTxState(s => s.GainDb = grant.GainDb);
+        // K2: the grant states what was granted - the service's echo where it gives one no longer than was asked, else the ask -
+        // and the server honours it where it is shorter than the request (its cap timer, and the client's own cap under it).
+        long grantedMs = r.TryGetLong("max_ms", out long echoed) && echoed > 0 && echoed <= askMs ? echoed : askMs;
+        grant.MaxMs = grantedMs;
         grant.MaxBlockSamples = info.MaxBlockSamples;
         if (!request.IsGenerated) grant.QueueSamples = Math.Max(info.MaxBlockSamples * 2, (int)Math.Ceiling(info.InputRateHz * 0.05));
         Log($"the unit's transmitter is armed at level {realised.ToString("0.#", CultureInfo.InvariantCulture)} dB under {band.Name}'s most" +
-            (r.TryGetDouble("leakage_dbc", out double leak) ? $", its carrier leakage about {leak.ToString("0.#", CultureInfo.InvariantCulture)} dBc" : ""));
+            (r.TryGetDouble("leakage_dbc", out double leak) ? $", its carrier leakage about {leak.ToString("0.#", CultureInfo.InvariantCulture)} dBc" : "") +
+            $", for at most {(grantedMs / 1000.0).ToString("0.#", CultureInfo.InvariantCulture)} s" +
+            (grantedMs < request.MaxMs ? $" - the longest key-down the unit was measured to hold at that level ({request.MaxMs} ms was asked)" : ""));
         return new W1700kTransmission(this, tx, info.MaxBlockSamples, request, grant, signal);
     }
 }

@@ -121,6 +121,7 @@ internal static partial class Program
         Run("W1700K: closing stops the unit's stream", W1700kClose);
         Run("W1700K TX: the service's caps and the wire's takes_radio / taken, absent for every other radio", W1700kTxWireCases);
         Run("W1700K TX: take, key IQ and a tone, drain on the unit's word, the service's refusals, give back and receive again", W1700kTxEndToEnd);
+        Run("W1700K TX5-0: the unit's limit at the level SHORTENS a key-down (K1), the server honours the grant and caps at it (K2), no list, no retry", W1700kTxKeyDownLimit);
         Run("W1700K TX: a service that ends a transmission, dies, or does not answer a stop; an owner that disconnects; a prepare refused", W1700kTxFaults);
         Run("W1700K TX: the SDRW1700K session's own service in its no-unit mode, where it is on this machine", W1700kTxRealService);
         Run("W1700K built-in TX: the one resolver - Built in / Off / a command, every answer a bundled controller's --version can give, the config placed", W1700kBuiltInResolveCases);
