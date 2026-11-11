@@ -1322,12 +1322,18 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
             KeyDownMaxMs = b.KeyDownMaxMs.Select(e => new TxKeyDownLimit(Math.Round(e.TopDb - b.LevelMinDb, 6), e.Ms)).ToArray(),
             PaIndexCount = b.PaIndexCount,
             CalibratedPaIndexCount = b.CalibratedPaIndexCount,
+            // TX5-2 (T28): the amateur allocation inside the band, passed through; ShackLink WARNS outside it (the owner's rule).
+            AmateurLowHz = b.AmateurLowHz,
+            AmateurHighHz = b.AmateurHighHz,
+            AmateurPlan = b.AmateurPlan,
         }).ToArray(),
         Tables = info.Tables?.Clone(),
         Calibration = info.Calibration?.Clone(),
         // TX5-1: the claims the service honours and its passbands, as it states them.
         Envelope = info.Envelope?.Clone(),
         Passbands = info.PassbandList.Select(p => p.Clone()).ToArray(),
+        BandMarginHz = info.BandMarginHz,
+        MeasuredInside = info.MeasuredInside,
     }, TxSourceKinds.Iq, TxSourceKinds.Tone);
 
     protected override TxCaps? RadioTxCaps() => _txCapsWire?.Clone();
@@ -1418,6 +1424,13 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
                 (path.Length > 0 ? $", by {path}" : "") +
                 (r.TryGetLong("took_ms", out long took) ? $" in {took} ms" : "") +
                 (r.TryGetLong("settle_ms", out long settle) ? $"; its carrier settles for about {settle} ms" : ""));
+            // TX5-2 (T28): the service says whether the centre is inside the band's amateur allocation; outside it, this side SAYS so
+            // and refuses nothing (the owner's rule) - the client warns its operator too.
+            if (r["amateur"] is bool amateur && !amateur)
+                Log($"the transmitter is prepared OUTSIDE {_txBand.Name}'s amateur allocation" +
+                    (_txBand.AmateurHighHz > _txBand.AmateurLowHz ? $" ({Mhz(_txBand.AmateurLowHz)}-{Mhz(_txBand.AmateurHighHz)} MHz" +
+                                                                    (_txBand.AmateurPlan.Length > 0 ? $", {_txBand.AmateurPlan})" : ")") : "") +
+                    ": a transmission there must follow the laws where its operator is");
             return (eff, lo);
         }
     }

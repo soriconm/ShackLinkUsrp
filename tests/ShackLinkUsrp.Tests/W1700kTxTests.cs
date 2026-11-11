@@ -160,10 +160,18 @@ internal static partial class Program
                 case "prepare":
                     {
                         long hz = r.GetLong("center_hz");
-                        if (!((hz >= 2_391_000_000 && hz <= 2_449_000_000) || (hz >= 5_651_000_000 && hz <= 5_849_000_000)))
+                        var inBand = (_rig.Caps.GetArray("bands") ?? new JsonArray()).OfType<JsonObject>()
+                            .FirstOrDefault(q => hz >= q.GetLong("center_min_hz") && hz <= q.GetLong("center_max_hz"));
+                        if (inBand == null)
                         {
-                            Send(No(r, "out_of_band", $"{hz / 1e6:0.000} MHz is outside 2391-2449 and 5651-5849 MHz"));
+                            Send(No(r, "out_of_band", $"{hz / 1e6:0.000} MHz is outside every band this unit tunes"));
                             break;
+                        }
+                        bool? amateur = null;
+                        if (inBand.GetArray("amateur_hz") is { Count: 2 } am)
+                        {
+                            long margin = _rig.Caps.GetObject("occupied_basis")?.GetLong("band_margin_hz", 0) ?? 0;
+                            amateur = hz >= ((JsonNumber)am[0]).AsDouble() + margin && hz <= ((JsonNumber)am[1]).AsDouble() - margin;
                         }
                         lock (_lock)
                             if (_open)
@@ -176,8 +184,10 @@ internal static partial class Program
                         _rig.CaptureBroken = true;          // the preparation disconnects the capture: only a load restores reception
                         State = "prepared";
                         CenterHz = hz;
-                        Send(Ok(r).Set("center_hz", hz).Set("lo_hz", hz).Set("band", hz < 3_000_000_000 ? 0 : 1).Set("path", "load")
-                            .Set("took_ms", 30).Set("settle_ms", 2000).Set("settle_measured", false));
+                        var prepared = Ok(r).Set("center_hz", hz).Set("lo_hz", hz).Set("band", hz < 3_000_000_000 ? 0 : 1).Set("path", "load")
+                            .Set("took_ms", 30).Set("settle_ms", 2000).Set("settle_measured", false);
+                        if (amateur.HasValue) prepared.Set("amateur", amateur.Value);
+                        Send(prepared);
                         break;
                     }
                 case "start":
@@ -397,6 +407,24 @@ internal static partial class Program
                 .Set("occupied", new JsonArray().Add(new JsonObject().Set("down_db", 25).Set("half_width_hz", 16000))).Set("constant_ok", false))
                 .Add(new JsonObject().Set("name", "wide").Set("half_width_hz", 6500).Set("constant_ok", true)))
             .Set("costs", new JsonObject().Set("prepare", new JsonObject().Set("tune_ms", 1000).Set("setup_ms", 4000).Set("load_ms", 11000)).Set("close_ms", 1000));
+    }
+
+    /// <summary>T28's caps as the service states them (eb, 2026-11-11, app 1.1.2): each band's centre over the synthesizer's whole lock
+    /// range, the amateur allocation inside it with its plan, the margin a carrier keeps from a band's edges, and where every figure
+    /// was measured. ShackLink WARNS outside amateur_hz and refuses nothing (TX5-2, the owner's rule).</summary>
+    private static JsonObject T28Caps()
+    {
+        var c = FakeTxService.DefaultCaps();
+        var b13 = (JsonObject)c.GetArray("bands")[0];
+        var b6 = (JsonObject)c.GetArray("bands")[1];
+        b13.Set("center_min_hz", 2_071_000_000).Set("center_max_hz", 2_749_000_000)
+           .Set("amateur_hz", new JsonArray().Add(2_390_000_000).Add(2_450_000_000)).Set("amateur_plan", "US, 47 CFR 97.301");
+        b6.Set("center_min_hz", 4_641_000_000).Set("center_max_hz", 7_999_000_000)
+          .Set("amateur_hz", new JsonArray().Add(5_650_000_000).Add(5_850_000_000)).Set("amateur_plan", "US, 47 CFR 97.301");
+        c.Set("occupied_basis", new JsonObject().Set("band_margin_hz", 1_000_000).Set("measured", "2026-11-10"));
+        c.Set("frequency", new JsonObject().Set("centre", "any the radio band's synthesizer locks on")
+            .Set("amateur", "bands[].amateur_hz: the amateur allocation inside each band").Set("measured_inside", "amateur_hz only"));
+        return c;
     }
 
     /// <summary>The real backend and server over a fake unit, a fake transmit service, and a record of what ran while what else did.</summary>
@@ -909,6 +937,49 @@ internal static partial class Program
         }
     }
 
+    /// <summary>TX5-2 (ShackLink docs/w1700k_support.md "TX5-2"): T28's amateur allocation reaches the wire, and a take OUTSIDE it is
+    /// done - the owner's rule is a warning, never a refusal - and said in the sidecar's log in the service's own verdict.</summary>
+    private static void W1700kTxAmateur()
+    {
+        // The wire, from the service's T28 statement.
+        var info = W1700kTxCapsInfo.Parse(T28Caps());
+        var wire = TxCaps.Parse(W1700kBackend.TxCapsFrom(info).ToJson());
+        var w13 = wire.BandAt(2_460_000_000);
+        var w6 = wire.BandAt(5_660_000_000);
+        Check(w13?.Name == "13cm" && w13.AmateurLowHz == 2_390_000_000 && w13.AmateurHighHz == 2_450_000_000 && w13.AmateurPlan == "US, 47 CFR 97.301" &&
+              w6?.AmateurLowHz == 5_650_000_000 && wire.BandMarginHz == 1_000_000 && wire.MeasuredInside == "amateur_hz only" &&
+              wire.FreqMinHz == 2_071_000_000 && wire.FreqMaxHz == 7_999_000_000,
+              "T28's caps reach the wire: each band's amateur allocation and plan inside its widened centre range, the margin, and where the figures were measured");
+        Check(wire.OutsideAmateur(2_392_000_000) == null && wire.OutsideAmateur(2_391_000_000) == null && wire.OutsideAmateur(2_449_000_000) == null &&
+              wire.OutsideAmateur(2_390_500_000)?.Name == "13cm" && wire.OutsideAmateur(2_460_000_000)?.Name == "13cm" &&
+              wire.OutsideAmateur(5_660_000_000) == null && wire.OutsideAmateur(6_000_000_000)?.Name == "6cm" && wire.OutsideAmateur(3_400_000_000) == null,
+              "...and OutsideAmateur reads it the service's way: inside is low + 1 MHz .. high - 1 MHz; a frequency in no band is not this rule's question");
+        var t27 = TxCaps.Parse(W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(FakeTxService.DefaultCaps())).ToJson());
+        Check(t27.BandMarginHz == 0 && t27.MeasuredInside == "" && t27.Bands.All(b => b.AmateurHighHz == 0 && b.AmateurPlan == "") &&
+              t27.OutsideAmateur(2_392_000_000) == null && !t27.ToJson().ToString().Contains("amateur"),
+              "a service before T28 states no allocation: none on the wire, and nothing is ever outside it");
+
+        using var rig = new W1700kTxRig("txamateur", caps: T28Caps());
+        using var s = rig.Connect("w1700k-tx");
+        Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+        s.ClaimTx();
+        var took = s.SetTx(new TxSettings { CenterHz = 2_460_000_000, GainDb = 20 });
+        Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 2_460_000_000 && s.Caps.Tx!.OutsideAmateur(2_460_000_000)?.Name == "13cm",
+              "2460 MHz - inside the radio's range, OUTSIDE 13cm's amateur allocation - is TAKEN, never refused (the owner's rule: warn)");
+        var said = rig.Log.Tail(400);
+        Check(said.Any(l => l.Contains("OUTSIDE 13cm's amateur allocation") && l.Contains("2390.000-2450.000 MHz") && l.Contains("47 CFR 97.301") && l.Contains("laws")),
+              "...and the sidecar SAYS so, from the service's own verdict (prepare's amateur: false): " + said.LastOrDefault(l => l.Contains("OUTSIDE")));
+        var t = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000 });
+        Check(t.Stream != null && t.Grant.CenterHz == 2_460_000_000, "...and a key-up there is granted like any other");
+        t.Stop(drain: false);
+        int outsideLines = rig.Log.Tail(400).Count(l => l.Contains("OUTSIDE"));
+        var moved = s.SetTx(new TxSettings { CenterHz = 2_392_000_000 });
+        Check(moved.State.Tx?.CenterHz == 2_392_000_000 && rig.Log.Tail(400).Count(l => l.Contains("OUTSIDE")) == outsideLines,
+              "a move back inside the allocation says nothing of it");
+        Check(Refused(() => s.SetTx(new TxSettings { CenterHz = 3_400_000_000 })) != null, "a centre outside the radio's own range is still refused (out_of_band)");
+        s.ReleaseTx();
+    }
+
     private static void W1700kTxFaults()
     {
         // ---- a manual gain and a filter are stated again after the load
@@ -1099,9 +1170,16 @@ internal static partial class Program
         }
         // The longest key-down is the SERVICE's figure and moves with its measurements (T24: 15 s by policy; T25, 2026-11-10: 30 min
         // measured): only its presence is asserted, never a number this file would have to chase.
+        // T28 (TX5-2): the centre range is the SYNTHESIZER's, wider than the amateur allocation each band states inside it; only the
+        // allocation's presence inside the range is asserted, never the service's figures.
+        var a13 = tx.BandAt(2_392_000_000);
+        var a6 = tx.BandAt(5_680_000_000);
         Check(tx.TakesRadio && tx.RatesHz.SequenceEqual(new[] { 48000.0 }) && tx.MaxMs > 0 && tx.GainMinDb == 0 && tx.GainMaxDb == 40 &&
-              tx.FreqMinHz == 2_391_000_000 && tx.FreqMaxHz == 5_849_000_000 && tx.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }),
-              $"the REAL service's caps are read: 48 kS/s, at most {tx.MaxMs} ms a key-down, gain 0..{tx.GainMaxDb} dB, 2391-5849 MHz, taking the radio ({tx.TakeMs} ms to take)");
+              tx.FreqMinHz > 0 && tx.FreqMaxHz > tx.FreqMinHz && tx.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }) &&
+              a13 != null && a13.AmateurHighHz > a13.AmateurLowHz && a13.AmateurLowHz >= a13.FreqMinHz && a13.AmateurHighHz <= a13.FreqMaxHz + tx.BandMarginHz &&
+              a6 != null && a6.AmateurHighHz > a6.AmateurLowHz && tx.BandMarginHz > 0 && tx.MeasuredInside.Length > 0 && a13.AmateurPlan.Length > 0,
+              $"the REAL service's caps are read: 48 kS/s, at most {tx.MaxMs} ms a key-down, gain 0..{tx.GainMaxDb} dB, {tx.FreqMinHz / 1e6:0}-{tx.FreqMaxHz / 1e6:0} MHz, " +
+              $"13cm's amateur allocation {a13?.AmateurLowHz / 1e6:0}-{a13?.AmateurHighHz / 1e6:0} MHz ({a13?.AmateurPlan}), margin {tx.BandMarginHz} Hz, taking the radio ({tx.TakeMs} ms to take)");
         // TX4: the REAL service's own band facts reach the wire - the fake's shape is not evidence of the service's (names, the linear
         // limit, the settle after a load keyed by band name). The figures are the service's and only their presence is asserted.
         var r13 = tx.BandAt(2_392_000_000);
@@ -1183,8 +1261,14 @@ internal static partial class Program
         long6.Stop(drain: false);
         Check(at40 > 0 && long6.Grant.MaxMs == Math.Min(at40, 190_000),
               $"K1: a 190 000 ms key-up at 6cm's top is granted the REAL service's figure there ({long6.Grant.MaxMs} ms of its stated {at40}), not refused");
-        var outside = Refused(() => s.SetTx(new TxSettings { CenterHz = 2_450_000_000 }));
-        Check(outside != null && s.GetState().Tx?.Taken == true, "2450 MHz, inside this sidecar's stated range and outside the service's band, is refused and the radio stays taken: " + outside?.Message);
+        // T28 (TX5-2): a centre OUTSIDE the amateur allocation but inside the radio's range is prepared - the owner's rule is a warning,
+        // never a refusal - and a centre between the bands is still the radio's refusal.
+        var outAm = s.SetTx(new TxSettings { CenterHz = 2_460_000_000 });
+        Check(outAm.State.Tx?.Taken == true && outAm.State.Tx.CenterHz == 2_460_000_000 && tx.OutsideAmateur(2_460_000_000) != null &&
+              rig.Log.Tail(400).Any(l => l.Contains("OUTSIDE 13cm's amateur allocation")),
+              "2460 MHz, outside 13cm's amateur allocation, is PREPARED by the REAL service, and the sidecar says so from the service's own verdict");
+        var outside = Refused(() => s.SetTx(new TxSettings { CenterHz = 3_400_000_000 }));
+        Check(outside != null && s.GetState().Tx?.Taken == true, "3400 MHz, between the bands, is refused and the radio stays taken: " + outside?.Message);
 
         var back = s.ReleaseTx();
         Check(back.Tx?.Taken == false && rig.UnitCount == 2 && rig.Unit.Taken("start").Count == 1 && s.GetState().Readiness == RadioStates.Ready,

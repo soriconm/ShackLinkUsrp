@@ -50,6 +50,10 @@ internal sealed class W1700kTxBand
     /// <summary>How many PA indices the band states (<c>pa_indices</c>), and for how many a calibration file of THIS unit is
     /// present (their <c>calibrated</c>). -1 = not stated; the second also where any index does not say.</summary>
     public int PaIndexCount = -1, CalibratedPaIndexCount = -1;
+    /// <summary>T28: the amateur allocation inside the band (<c>amateur_hz</c>) and whose plan it is (<c>amateur_plan</c>). 0 / "" = not
+    /// stated (a service before T28, whose centre range WAS the allocation).</summary>
+    public long AmateurLowHz, AmateurHighHz;
+    public string AmateurPlan = "";
 }
 
 /// <summary>
@@ -113,6 +117,8 @@ internal sealed class W1700kTxCapsInfo
             if (double.IsNaN(band.LevelMinDb) || double.IsNaN(band.LevelMaxDb) || !(band.LevelMaxDb > band.LevelMinDb) || !(band.LevelStepDb > 0))
                 throw new InvalidDataException($"the transmit service's band \"{band.Name}\" states no level range and step");
             band.KeyDownMaxMsUnreadable = !TxKeyDownLimits.TryParse(b.GetArray("key_down_max_ms"), out band.KeyDownMaxMs);
+            TxBand.TryParseAmateur(b.GetArray("amateur_hz"), out band.AmateurLowHz, out band.AmateurHighHz);
+            band.AmateurPlan = b.GetString("amateur_plan", "") ?? "";
             if (b.GetArray("pa_indices") is { } pas)
             {
                 var indices = pas.OfType<JsonObject>().ToList();
@@ -138,6 +144,10 @@ internal sealed class W1700kTxCapsInfo
         c.PassbandList = TxPassband.ParseAll(o.GetArray("passbands"));
         var env = TxEnvelopeCaps.Parse(o.GetObject("envelope"));
         c.Envelope = env != null && env.Modes.Length > 0 ? env : null;
+        // TX5-2 (T28): the margin a carrier keeps from a band's edges by the service's rule, and its words for where its figures
+        // were measured - so a client judges "outside the amateur band" exactly as the service's own `amateur` does.
+        c.BandMarginHz = Math.Max(0, o.GetObject("occupied_basis")?.GetLong("band_margin_hz", 0) ?? 0);
+        c.MeasuredInside = o.GetObject("frequency")?.GetString("measured_inside", "") ?? "";
 
         var costs = o.GetObject("costs");
         var prepare = costs?.GetObject("prepare");
@@ -164,6 +174,9 @@ internal sealed class W1700kTxCapsInfo
     /// <summary>The service's passbands in its order, and the envelope claims it honours (null = none stated): TX5-1.</summary>
     public TxPassband[] PassbandList = Array.Empty<TxPassband>();
     public TxEnvelopeCaps? Envelope;
+    /// <summary>T28's <c>occupied_basis.band_margin_hz</c> and <c>frequency.measured_inside</c>; 0 / "" = not stated (TX5-2).</summary>
+    public long BandMarginHz;
+    public string MeasuredInside = "";
 
     /// <summary>The longest key-down by level, per band, in the service's own figures - what the log says in place of the
     /// overall <c>max_ms</c>, which is the longest at ANY level and false at a level whose own figure is shorter (TX5-0 K7).</summary>
