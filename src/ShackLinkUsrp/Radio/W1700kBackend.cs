@@ -1179,6 +1179,18 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         // service states one, else a load. The give-back is its close and this sidecar's own load: no figure but the load's.
         TakeMs = info.AdoptMs > 0 ? info.AdoptMs : info.LoadMs,
         GiveMs = info.CloseMs + info.LoadMs,
+        // Each band's facts on the wire's gain axis (0 = the band's lowest level), passed through and never invented: a linear
+        // limit or a settle the service does not state is not stated here (ShackLink TX4).
+        Bands = info.Bands.Select(b => new TxBand
+        {
+            Name = b.Name,
+            FreqMinHz = b.CenterMinHz,
+            FreqMaxHz = b.CenterMaxHz,
+            GainMaxDb = b.LevelMaxDb - b.LevelMinDb,
+            GainStepDb = b.LevelStepDb,
+            LinearMaxGainDb = double.IsNaN(b.LinearMaxLevelDb) ? double.NaN : Math.Round(b.LinearMaxLevelDb - b.LevelMinDb, 6),
+            LoadSettleMs = b.LoadSettleMs,
+        }).ToArray(),
     }, TxSourceKinds.Iq, TxSourceKinds.Tone);
 
     protected override TxCaps? RadioTxCaps() => _txCapsWire?.Clone();
@@ -1255,8 +1267,16 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
             long eff = r.GetLong("center_hz", centerHz);
             long lo = r.GetLong("lo_hz", eff);
             _txBand = info.BandAt(eff) ?? band;
-            UpdateTxState(s => s.Taken = true);
             string path = r.GetString("path", "") ?? "";
+            // How it was prepared, as the service said (ShackLink TX4: the operator is told whether the carrier is settling).
+            var prepared = new TxPrepared
+            {
+                Path = path,
+                TookMs = r.TryGetLong("took_ms", out long tookMs) && tookMs >= 0 ? tookMs : -1,
+                SettleMs = r.TryGetLong("settle_ms", out long settleMs) && settleMs >= 0 ? settleMs : -1,
+                SettleMeasured = r.GetBool("settle_measured"),
+            };
+            UpdateTxState(s => { s.Taken = true; s.Prepared = prepared; });
             Log($"the transmitter is prepared at {Mhz(eff)} MHz ({_txBand.Name}), LO {Mhz(lo)} MHz" +
                 (path.Length > 0 ? $", by {path}" : "") +
                 (r.TryGetLong("took_ms", out long took) ? $" in {took} ms" : "") +
@@ -1352,6 +1372,7 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         UpdateTxState(s =>
         {
             s.Taken = false;
+            s.Prepared = null;
             s.CenterHz = 0;
             s.LoHz = 0;
         });

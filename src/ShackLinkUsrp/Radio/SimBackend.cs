@@ -237,8 +237,13 @@ internal sealed class SimBackend : RadioBackendBase, ShackLinkUsrp.Server.ITxHan
             // THE TAKE: a centre from the TX owner, and it costs what the radio says it costs.
             Thread.Sleep(TakeMs);
             _taken = true;
-            UpdateTxState(s => s.Taken = true);
+            // How it was prepared, as a W1700K says it (state.tx.prepared): a path of the MODEL's own name, never one of the unit's.
+            UpdateTxState(s => { s.Taken = true; s.Prepared = new TxPrepared { Path = "sim", TookMs = TakeMs, SettleMs = 0 }; });
             Log($"the synthetic radio is TAKEN for its transmitter at {centerHz} Hz (--sim-takes-radio)");
+        }
+        else if (TakesRadio)
+        {
+            UpdateTxState(s => s.Prepared = new TxPrepared { Path = "sim", TookMs = 0, SettleMs = 0 });
         }
         return (centerHz, centerHz + loOffsetHz);
     }
@@ -252,6 +257,7 @@ internal sealed class SimBackend : RadioBackendBase, ShackLinkUsrp.Server.ITxHan
         UpdateTxState(s =>
         {
             s.Taken = false;
+            s.Prepared = null;
             s.CenterHz = 0;
             s.LoHz = 0;
         });

@@ -490,6 +490,32 @@ internal static partial class Program
         Check(adoptCaps.TakeMs == 1300 && adoptCaps.GiveMs == 12000,
               "a service that adopts the radio the receiver left states its take as the adopt's 1.3 s; the give-back is still a load");
 
+        // TX4: each band's facts and how the radio was prepared, ABSENT for every radio that does not state them.
+        Check(!plain.ToJson().Has("bands") && TxCaps.Parse(plain.ToJson()).Bands.Length == 0 && !new TxState { Taken = true }.ToJson().Has("prepared") &&
+              TxState.Parse(new TxState { Taken = true }.ToJson()).Prepared == null,
+              "caps.tx.bands and state.tx.prepared are absent - not empty - where a radio states neither, and parse as none");
+        var b13 = caps.BandAt(2_392_000_000);
+        var b6 = caps.BandAt(5_760_000_000);
+        Check(caps.Bands.Length == 2 && b13?.Name == "13cm" && b6?.Name == "6cm" && caps.BandAt(3_400_000_000) == null &&
+              Math.Abs(b13.GainMaxDb - 40) < 1e-9 && Math.Abs(b13.GainStepDb - 0.1) < 1e-9 && Math.Abs(b13.LinearMaxGainDb - 22.9) < 1e-9 &&
+              Math.Abs(b6.LinearMaxGainDb - 40) < 1e-9 && b13.LoadSettleMs == -1 && b6.LoadSettleMs == -1,
+              $"caps.tx.bands is the service's, on the wire's gain axis: 13cm linear to gain {F(b13?.LinearMaxGainDb ?? double.NaN, "0.#")} (level -17.1), 6cm to its top; a settle it does not state is not stated");
+        var settling = FakeTxService.DefaultCaps();
+        settling.GetObject("costs").Set("settle", new JsonObject().Set("load", new JsonObject().Set("measured", true)
+            .Set("settle_ms", new JsonObject().Set("13cm", 30000).Set("6cm", 60000))));
+        var settleCaps = TxCaps.Parse(W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(settling)).ToJson());
+        Check(settleCaps.BandAt(2_392_000_000)?.LoadSettleMs == 30000 && settleCaps.BandAt(5_760_000_000)?.LoadSettleMs == 60000 &&
+              settleCaps.Clone().Bands.Length == 2 && !ReferenceEquals(settleCaps.Clone().Bands[0], settleCaps.Bands[0]),
+              "the settle after a load is the service's own, per band by name (30 s on 13cm, 60 s on 6cm here), across the wire, and Clone copies the bands");
+        var noLinear = FakeTxService.DefaultCaps();
+        ((JsonObject)noLinear.GetArray("bands")[0]).Remove("linear_max_level_db");
+        Check(double.IsNaN(TxCaps.Parse(W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(noLinear)).ToJson()).Bands[0].LinearMaxGainDb),
+              "a band whose linear limit the service does not state has none on the wire - NaN, never 0 or the top");
+        var prep = TxState.Parse(new TxState { Taken = true, Prepared = new TxPrepared { Path = "adopt", TookMs = 1100, SettleMs = 0, SettleMeasured = true } }.ToJson()).Prepared;
+        Check(prep != null && prep.Path == "adopt" && prep.TookMs == 1100 && prep.SettleMs == 0 && prep.SettleMeasured &&
+              TxState.Parse(new TxState { Prepared = new TxPrepared() }.ToJson()).Prepared.TookMs == -1,
+              "state.tx.prepared round-trips path, took, settle (0 is a figure) and whether it was measured; an unsaid figure stays unsaid");
+
         string Why(Action<JsonObject> breakIt)
         {
             var c = FakeTxService.DefaultCaps();
@@ -539,6 +565,9 @@ internal static partial class Program
         var took = s.SetTx(new TxSettings { CenterHz = 2_392_000_000 });
         Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 2_392_000_000 && took.State.Tx.LoHz == 2_392_000_000,
               $"set_tx's centre TAKES the radio: taken, prepared at 2392 MHz ({sw.ElapsedMilliseconds} ms against the fake)");
+        var tookPrep = took.State.Tx?.Prepared;
+        Check(tookPrep != null && tookPrep.Path == "load" && tookPrep.TookMs == 30 && tookPrep.SettleMs == 2000 && !tookPrep.SettleMeasured,
+              $"...and state.tx.prepared says how, in the service's words: path {tookPrep?.Path}, {tookPrep?.TookMs} ms, its carrier settling {tookPrep?.SettleMs} ms, not measured");
         Check(rig.Violations.Count == 0 && rig.Units[0].Taken("stop").Count == 1 && rig.Units[0].Closed && rig.ServiceCount == 2 &&
               rig.Service.Taken("prepare").Count == 1, "the receive stream was stopped and the controller had EXITED before the unit was prepared: " + string.Join("; ", rig.Violations));
         // The rows already on their way arrive first (how many is this machine's load); then none.
@@ -630,6 +659,7 @@ internal static partial class Program
         var back = s.ReleaseTx();
         Check(back.Tx?.Taken == false && back.Tx.CenterHz == 0 && rig.Services[1].Closed && !rig.Services[1].Killed,
               $"release_tx gives the radio back: not taken, the service's input closed ({sw.ElapsedMilliseconds} ms against the fake)");
+        Check(back.Tx?.Prepared == null, "...and nothing is prepared any more: state.tx.prepared is gone");
         Check(rig.Violations.Count == 0 && rig.UnitCount == 2, "the service had gone before the controller was started again: " + string.Join("; ", rig.Violations));
         var u2 = rig.Unit;
         int iLoad = u2.Requests.FindIndex(q => q.GetString("op") == "load"), iCfg = u2.Requests.FindIndex(q => q.GetString("op") == "configure"),
@@ -836,10 +866,22 @@ internal static partial class Program
         Check(tx.TakesRadio && tx.RatesHz.SequenceEqual(new[] { 48000.0 }) && tx.MaxMs == 15000 && tx.GainMinDb == 0 && tx.GainMaxDb == 40 &&
               tx.FreqMinHz == 2_391_000_000 && tx.FreqMaxHz == 5_849_000_000 && tx.Sources.SequenceEqual(new[] { TxSourceKinds.Iq, TxSourceKinds.Tone }),
               $"the REAL service's caps are read: 48 kS/s, 15 s, gain 0..{tx.GainMaxDb} dB, 2391-5849 MHz, taking the radio ({tx.TakeMs} ms to take)");
+        // TX4: the REAL service's own band facts reach the wire - the fake's shape is not evidence of the service's (names, the linear
+        // limit, the settle after a load keyed by band name). The figures are the service's and only their presence is asserted.
+        var r13 = tx.BandAt(2_392_000_000);
+        var r6 = tx.BandAt(5_680_000_000);
+        Check(r13?.Name == "13cm" && r6?.Name == "6cm" && !double.IsNaN(r13.LinearMaxGainDb) && r13.LinearMaxGainDb > 0 && r13.LinearMaxGainDb < r13.GainMaxDb &&
+              r13.LoadSettleMs > 0 && r6.LoadSettleMs > 0,
+              $"TX4: the REAL service's bands reach the wire - 13cm linear to gain {F(r13?.LinearMaxGainDb ?? double.NaN, "0.#")} of {F(r13?.GainMaxDb ?? double.NaN, "0.#")}, " +
+              $"6cm to {F(r6?.LinearMaxGainDb ?? double.NaN, "0.#")}; after a load the carrier settles {r13?.LoadSettleMs} / {r6?.LoadSettleMs} ms (13cm / 6cm)");
         s.ClaimTx();
         var took = s.SetTx(new TxSettings { CenterHz = 2_392_000_000, GainDb = 20 });
         Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 2_392_000_000 && rig.Units[0].Closed && rig.Units[0].Taken("stop").Count == 1,
               "it is taken and prepared at 2392 MHz, the controller gone first");
+        var realPrep = took.State.Tx?.Prepared;
+        Check(realPrep != null && realPrep.Path.Length > 0 && realPrep.TookMs >= 0,
+              $"TX4: ...and state.tx.prepared says how, in the REAL service's words: path {realPrep?.Path}, {realPrep?.TookMs} ms, settle {realPrep?.SettleMs} ms" +
+              (realPrep?.SettleMeasured == true ? " (measured)" : ""));
         Check(rig.Units[0].Taken("load").Count == 0 && rig.Units[0].Requests.All(q => q.GetString("op") != "unload"),
               "...and left LOADED: the controller was stopped and closed, never unloaded, which is what the service's adopt relies on");
 

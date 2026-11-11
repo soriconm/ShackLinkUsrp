@@ -39,6 +39,9 @@ internal sealed class W1700kTxBand
     public double LevelMinDb, LevelMaxDb, LevelStepDb;
     /// <summary>The highest level an arbitrary envelope stays linear at. NaN = not stated.</summary>
     public double LinearMaxLevelDb = double.NaN;
+    /// <summary>How long the carrier settles after a preparation that RELOADED the unit (<c>costs.settle.load.settle_ms</c>,
+    /// keyed by this band's name). -1 = not stated.</summary>
+    public long LoadSettleMs = -1;
 }
 
 /// <summary>
@@ -122,6 +125,12 @@ internal sealed class W1700kTxCapsInfo
         c.SetupMs = Math.Max(0, prepare?.GetLong("setup_ms", 0) ?? 0);
         c.AdoptMs = Math.Max(0, prepare?.GetLong("adopt_ms", 0) ?? 0);
         c.CloseMs = Math.Max(0, costs?.GetLong("close_ms", 0) ?? 0);
+        // The settle after a LOAD, per band by name (ShackLink TX4: the operator is told before the take what a reload costs
+        // the carrier). Absent, or a band the table does not name, is not stated.
+        var loadSettle = costs?.GetObject("settle")?.GetObject("load")?.GetObject("settle_ms");
+        if (loadSettle != null)
+            foreach (var b in c.Bands)
+                if (loadSettle.TryGetLong(b.Name, out long ms) && ms >= 0) b.LoadSettleMs = ms;
         return c;
     }
 

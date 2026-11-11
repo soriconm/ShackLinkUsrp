@@ -1723,6 +1723,15 @@ internal static partial class Program
         o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").ToArray());
         Check(o.W1700k && o.W1700kServe == W1700kServe.DefaultCommand && o.W1700kBind.ToString() == "10.77.0.10:7700" && o.W1700kFlatten && o.W1700kRemoveDc,
               "an empty launch profile passes nothing: the sidecar's defaults, never ones invented by the spawner");
+        Check(o.W1700kTxServe == null && !SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch(), "t").Contains("--w1700k-tx-serve") &&
+              !SidecarLocator.Arguments(UsrpAddress.W1700k(), new SidecarLaunch { W1700kTxServe = " None " }, "t").Contains("--w1700k-tx-serve"),
+              "TX4: no transmit service in the profile, or none, passes no --w1700k-tx-serve: the radio states no transmitter, as before");
+        const string txCmd = @"python C:\Dev\SDRW1700K\tools\w1700k-tx-serve.py";
+        o = SidecarOptions.Parse(SidecarLocator.Arguments(UsrpAddress.W1700k("attic"), new SidecarLaunch { W1700kTxServe = "  " + txCmd + " " }, "t").ToArray());
+        Check(o.W1700kTxServe == txCmd,
+              "TX4: the launch profile's transmit service reaches the sidecar as --w1700k-tx-serve, trimmed, read back as written: " + o.W1700kTxServe);
+        Check(!SidecarLocator.Arguments(UsrpAddress.Sim("x"), new SidecarLaunch { W1700kTxServe = txCmd }, "t").Contains("--w1700k-tx-serve"),
+              "...and only for a W1700K: no other family is ever spawned with it");
     }
 
     /// <summary>U1: ShackLink's way in - the library spawns the sidecar for usrp:w1700k:&lt;name&gt;, and a second open JOINS it.</summary>
