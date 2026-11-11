@@ -1325,6 +1325,9 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         }).ToArray(),
         Tables = info.Tables?.Clone(),
         Calibration = info.Calibration?.Clone(),
+        // TX5-1: the claims the service honours and its passbands, as it states them.
+        Envelope = info.Envelope?.Clone(),
+        Passbands = info.PassbandList.Select(p => p.Clone()).ToArray(),
     }, TxSourceKinds.Iq, TxSourceKinds.Tone);
 
     protected override TxCaps? RadioTxCaps() => _txCapsWire?.Clone();
@@ -1568,8 +1571,9 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
     protected override (long CenterHz, long LoHz) ApplyTxStepTune(long carrierHz, long loHz, bool moveLo) =>
         throw new RadioRefusal(ErrorCodes.Unsupported, "this transmitter runs no stepped sweep: every step would be a new preparation of the unit");
 
-    /// <summary>The service's <c>start</c>, then the sender. An IQ transmission states envelope <c>any</c> - ShackLink scales and
-    /// shapes its samples - so above a band's linear limit the SERVICE refuses it, in its words (T9).</summary>
+    /// <summary>The service's <c>start</c>, then the sender. An IQ transmission states envelope <c>any</c> unless its client claims
+    /// one (TX5-1: ShackLink's own never does), so above a band's linear limit the SERVICE refuses it, in its words (T9); a tone ON
+    /// by the service's threshold states <c>constant</c> and goes through the passband that lets one through.</summary>
     protected override RadioTransmission OpenTransmission(TxStartRequest request, TxGrant grant, TxStepPlan? plan, TxSignal? signal)
     {
         var info = TxInfo();
@@ -1587,17 +1591,25 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         }
         if (double.IsNaN(gain))
             throw new RadioRefusal(ErrorCodes.BadRequest, "the TX gain was never set (set_tx gain_db): a transmission keys at a stated level");
-        if (request.IsGenerated && info.PassbandHalfWidthHz > 0 && Math.Abs((double)request.OffsetHz) > info.PassbandHalfWidthHz)
+        // TX5-1 E4/E5: the claim stated to the service is the ONE rule's (a client's own, or constant for a tone that is ON by the
+        // service's threshold), and the passband is the one the service will pick for it - so a tone's offset is judged by THAT one.
+        var capsWire = _txCapsWire ?? TxCapsFrom(info);
+        string envelope = TxRules.EnvelopeFor(request, capsWire);
+        string sent = envelope.Length > 0 ? envelope : TxEnvelopes.Any;
+        var passband = capsWire.PassbandFor(sent);
+        double halfWidth = passband?.HalfWidthHz ?? info.PassbandHalfWidthHz;
+        if (request.IsGenerated && halfWidth > 0 && Math.Abs((double)request.OffsetHz) > halfWidth)
             throw new RadioRefusal(ErrorCodes.OutOfRange,
-                $"a carrier {request.OffsetHz} Hz from the centre is outside this transmitter's passband of +-{info.PassbandHalfWidthHz:0} Hz: " +
-                "it would be filtered away and the unit would key on nothing - prepare the unit at the frequency itself");
+                $"a carrier {request.OffsetHz} Hz from the centre is outside this transmitter's passband of +-{halfWidth:0} Hz" +
+                (passband != null ? $" ({passband.Name}, for envelope {sent})" : "") +
+                ": it would be filtered away and the unit would key on nothing - prepare the unit at the frequency itself");
         double level = Math.Min(band.LevelMaxDb, band.LevelMinDb + gain);
         // TX5-0 K1: the unit's own limit at this level SHORTENS the key-down and never refuses it. The service refuses a start that
         // asks more than its figure (it never grants less by itself), so this side asks the figure, read the service's way on its
         // own level axis with the very level sent. A band that states none is asked exactly what the engine asked (K4).
         long limitMs = TxKeyDownLimits.MsAt(band.KeyDownMaxMs, level);
         long askMs = limitMs > 0 && limitMs < request.MaxMs ? limitMs : request.MaxMs;
-        var start = Req("start").Set("max_ms", askMs).Set("level_db", level).Set("envelope", "any");
+        var start = Req("start").Set("max_ms", askMs).Set("level_db", level).Set("envelope", sent);
         JsonObject r;
         try
         {
@@ -1618,9 +1630,13 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
         // and the server honours it where it is shorter than the request (its cap timer, and the client's own cap under it).
         long grantedMs = r.TryGetLong("max_ms", out long echoed) && echoed > 0 && echoed <= askMs ? echoed : askMs;
         grant.MaxMs = grantedMs;
+        // TX5-1: the claim and the passband the SERVICE granted, in its words (its echo; what was sent where it echoes none).
+        grant.Envelope = r.GetString("envelope", sent) ?? sent;
+        grant.Passband = r.GetString("passband", passband?.Name ?? "") ?? "";
         grant.MaxBlockSamples = info.MaxBlockSamples;
         if (!request.IsGenerated) grant.QueueSamples = Math.Max(info.MaxBlockSamples * 2, (int)Math.Ceiling(info.InputRateHz * 0.05));
-        Log($"the unit's transmitter is armed at level {realised.ToString("0.#", CultureInfo.InvariantCulture)} dB under {band.Name}'s most" +
+        Log($"the unit's transmitter is armed at level {realised.ToString("0.#", CultureInfo.InvariantCulture)} dB under {band.Name}'s most, " +
+            $"envelope {grant.Envelope}{(grant.Passband.Length > 0 ? " through passband " + grant.Passband : "")}" +
             (r.TryGetDouble("leakage_dbc", out double leak) ? $", its carrier leakage about {leak.ToString("0.#", CultureInfo.InvariantCulture)} dBc" : "") +
             $", for at most {(grantedMs / 1000.0).ToString("0.#", CultureInfo.InvariantCulture)} s" +
             (grantedMs < request.MaxMs ? $" - the longest key-down the unit was measured to hold at that level ({request.MaxMs} ms was asked)" : ""));

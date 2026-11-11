@@ -133,6 +133,11 @@ internal sealed class W1700kTxCapsInfo
             names.Add(p.GetString("name", "")!);
         }
         c.Passbands = names.ToArray();
+        // TX5-1: every passband with its width and whether a constant envelope may go through it, and the envelope claims the
+        // service honours with its own thresholds - passed through. An envelope object naming no mode states no claim.
+        c.PassbandList = TxPassband.ParseAll(o.GetArray("passbands"));
+        var env = TxEnvelopeCaps.Parse(o.GetObject("envelope"));
+        c.Envelope = env != null && env.Modes.Length > 0 ? env : null;
 
         var costs = o.GetObject("costs");
         var prepare = costs?.GetObject("prepare");
@@ -156,6 +161,9 @@ internal sealed class W1700kTxCapsInfo
     /// <summary>The service's <c>tables</c> and <c>calibration</c>, as it states them; null = not stated.</summary>
     public TxTables? Tables;
     public TxCalibration? Calibration;
+    /// <summary>The service's passbands in its order, and the envelope claims it honours (null = none stated): TX5-1.</summary>
+    public TxPassband[] PassbandList = Array.Empty<TxPassband>();
+    public TxEnvelopeCaps? Envelope;
 
     /// <summary>The longest key-down by level, per band, in the service's own figures - what the log says in place of the
     /// overall <c>max_ms</c>, which is the longest at ANY level and false at a level whose own figure is shorter (TX5-0 K7).</summary>

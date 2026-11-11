@@ -83,6 +83,7 @@ internal static partial class Program
         public readonly List<short> Heard = new();
         public double LastLevelDb = double.NaN;
         public string LastEnvelope = "";
+        public string LastPassband = "";
         private bool _open, _keyed, _draining, _short;
         private long _queued, _maxMs, _playedThisTx;
         private double _debt;
@@ -187,7 +188,17 @@ internal static partial class Program
                             break;
                         }
                         double level = r.GetDouble("level_db");
-                        string envelope = r.GetString("envelope", "") ?? "";
+                        string envelope = r.GetString("envelope", "any") ?? "any";
+                        // The service's passband rule (op_start): the one asked, else the first a constant envelope may go through
+                        // for "constant", the first for "any"; a constant envelope through one that cuts its sidebands is refused.
+                        var pbs = (_rig.Caps.GetArray("passbands") ?? new JsonArray()).OfType<JsonObject>().ToList();
+                        var pb = r.GetString("passband", "") is { Length: > 0 } askedPb ? pbs.FirstOrDefault(q => q.GetString("name") == askedPb)
+                               : pbs.FirstOrDefault(q => envelope == "any" || q.GetBool("constant_ok"));
+                        if (pb == null || (envelope == "constant" && !pb.GetBool("constant_ok")))
+                        {
+                            Send(No(r, "passband", $"envelope '{envelope}' does not go with that passband"));
+                            break;
+                        }
                         double linear = CenterHz < 3_000_000_000 ? -17.1 : 0;
                         if (envelope != "constant" && level > linear + 1e-9)
                         {
@@ -214,11 +225,12 @@ internal static partial class Program
                             Starts++;
                             LastLevelDb = level;
                             LastEnvelope = envelope;
+                            LastPassband = pb.GetString("name", "") ?? "";
                         }
                         // What a level is REALISED as: the unit's own half-dB steps here, so the read-back is not the echo of the ask.
                         double realised = Math.Floor(level * 2 + 1e-9) / 2;
                         Send(Ok(r).Set("level_db", realised).Set("pa_index", 32).Set("digital_db", realised).Set("leakage_dbc", -47.0)
-                            .Set("queue_samples", QueueCap).Set("max_ms", maxMs));
+                            .Set("queue_samples", QueueCap).Set("max_ms", maxMs).Set("envelope", envelope).Set("passband", LastPassband));
                         break;
                     }
                 case "stop":
@@ -360,7 +372,8 @@ internal static partial class Program
             .Set("queue_ms", 375).Set("prebuffer_ms", 100).Set("starve_ms", 300).Set("resampler_delay_ms", 4).Set("unit_rate_hz", 15886)
             // T25+: max_ms is the longest at ANY level; each band's key_down_max_ms has it by level (T26's figures, eb 2026-11-11).
             .Set("max_ms", 1_800_000)
-            .Set("envelope", new JsonObject().Set("on", 0.85).Set("off", 0.03).Set("window_ms", 200).Set("max_between", 0.25))
+            .Set("envelope", new JsonObject().Set("modes", new JsonArray().Add("any").Add("constant")).Set("on", 0.85).Set("off", 0.03).Set("window_ms", 200)
+                .Set("max_between", 0.25).Set("any_above_linear", "refused"))
             .Set("bands", new JsonArray()
                 .Add(new JsonObject().Set("name", "13cm").Set("band", 0).Set("center_min_hz", 2_391_000_000).Set("center_max_hz", 2_449_000_000)
                     .Set("groups", new JsonArray().Add(new JsonArray().Add(2_391_000_000).Add(2_449_000_000)))
@@ -381,7 +394,8 @@ internal static partial class Program
             .Set("calibration", new JsonObject().Set("per_unit", true).Set("shipped", false).Set("dir", @"C:\cal")
                 .Set("files", new JsonArray().Add("iq-cal-5cm.json")).Set("note", "one unit's own"))
             .Set("passbands", new JsonArray().Add(new JsonObject().Set("name", "voice").Set("half_width_hz", 3400)
-                .Set("occupied", new JsonArray().Add(new JsonObject().Set("down_db", 25).Set("half_width_hz", 16000))).Set("constant_ok", false)))
+                .Set("occupied", new JsonArray().Add(new JsonObject().Set("down_db", 25).Set("half_width_hz", 16000))).Set("constant_ok", false))
+                .Add(new JsonObject().Set("name", "wide").Set("half_width_hz", 6500).Set("constant_ok", true)))
             .Set("costs", new JsonObject().Set("prepare", new JsonObject().Set("tune_ms", 1000).Set("setup_ms", 4000).Set("load_ms", 11000)).Set("close_ms", 1000));
     }
 
@@ -831,6 +845,70 @@ internal static partial class Program
         }
     }
 
+    /// <summary>TX5-1 (ShackLink docs/w1700k_support.md "TX5-1"): the envelope claim through the real backend and server against the
+    /// fake service - a client's own constant, a tone that is ON by the service's threshold, the passband the service picks for it,
+    /// and every refusal in words. Nothing keyed.</summary>
+    private static void W1700kTxEnvelope()
+    {
+        using (var rig = new W1700kTxRig("txenvelope"))
+        using (var s = rig.Connect("w1700k-tx"))
+        {
+            Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+            var tx = s.Caps.Tx!;
+            Check(tx.Envelope != null && tx.Envelope.Offers(TxEnvelopes.Constant) && tx.Envelope.On == 0.85 && tx.Passbands.Length == 2 &&
+                  tx.PassbandFor(TxEnvelopes.Constant)?.Name == "wide" && tx.PassbandFor(TxEnvelopes.Any)?.Name == "voice",
+                  "caps.tx states the service's envelope claims with its thresholds, and its passbands in its order");
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = 2_392_000_000, GainDb = 30 });     // 13cm, level -10: ABOVE its linear limit (-17.1)
+            var plain = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000 }));
+            Check(plain != null && plain.Message.Contains("(nonlinear_level)") && rig.Service.LastEnvelope != TxEnvelopes.Constant,
+                  "13cm above its linear limit: an iq start that claims nothing is the service's refusal, as before - " + plain?.Message);
+            var iq = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000, Envelope = TxEnvelopes.Constant });
+            Check(rig.Service.LastEnvelope == TxEnvelopes.Constant && rig.Service.LastPassband == "wide" && iq.Grant.Envelope == TxEnvelopes.Constant &&
+                  iq.Grant.Passband == "wide",
+                  "E2: an iq client's own constant is passed to the service, which puts it through the wide passband - and the grant says both");
+            iq.Stop(drain: false);
+            var on = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 5000, LevelDbfs = -1 });
+            Check(rig.Service.LastEnvelope == TxEnvelopes.Constant && rig.Service.LastPassband == "wide" && on.Grant.Envelope == TxEnvelopes.Constant,
+                  "E1/E4: a tone at -1 dBFS (ON by the service's 0.85) states constant by itself and keys above the linear limit, 5 kHz out (inside wide's 6500)");
+            on.Stop(drain: false);
+            var under = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 1000, LevelDbfs = -6 }));
+            Check(under != null && under.Message.Contains("(nonlinear_level)"),
+                  "a tone at -6 dBFS is NOT on by the service's measure, so it claims nothing - and above the linear limit the service refuses it: " + under?.Message);
+            int before = rig.Service.Taken("start").Count;
+            var stated = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 1000, LevelDbfs = -6, Envelope = TxEnvelopes.Constant }));
+            Check(stated != null && stated.Code == ErrorCodes.OutOfRange && stated.Message.Contains("-1.41 dBFS") && rig.Service.Taken("start").Count == before,
+                  "a tone at -6 dBFS that CLAIMS constant is refused by the rules, naming the threshold, before the service: " + stated?.Message);
+            var far = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 7000, LevelDbfs = -1 }));
+            Check(far != null && far.Message.Contains("6500") && far.Message.Contains("wide") && rig.Service.Taken("start").Count == before,
+                  "a constant tone 7 kHz out is judged by the passband it would go through (wide, +-6500) and refused before the service: " + far?.Message);
+            var anyTone = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 1000, LevelDbfs = -1, Envelope = TxEnvelopes.Any }));
+            Check(anyTone != null && anyTone.Message.Contains("(nonlinear_level)"), "a client's own any wins over the tone's constant: the service's refusal - " + anyTone?.Message);
+            s.ReleaseTx();
+        }
+
+        // A service whose envelope names no mode (an older one) takes no claim: none on the wire, and a claim is refused in words.
+        var older = FakeTxService.DefaultCaps();
+        older.GetObject("envelope").Remove("modes");
+        using (var rig = new W1700kTxRig("txenvelopeold", caps: older))
+        using (var s = rig.Connect("w1700k-tx"))
+        {
+            Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+            Check(s.Caps.Tx?.Envelope == null && !s.Caps.Tx!.ToJson().ToString().Contains("\"envelope\""), "a service stating no envelope mode: caps.tx.envelope ABSENT");
+            s.ClaimTx();
+            s.SetTx(new TxSettings { CenterHz = 2_392_000_000, GainDb = 20 });
+            int starts = rig.Service.Taken("start").Count;
+            var claim = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000, Envelope = TxEnvelopes.Constant }));
+            Check(claim != null && claim.Message.Contains("takes no envelope claim") && rig.Service.Taken("start").Count == starts,
+                  "...a claim is refused in words, never ignored, and nothing reaches the service: " + claim?.Message);
+            var tone = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 1000, LevelDbfs = -1 });
+            Check(rig.Service.LastEnvelope == TxEnvelopes.Any && rig.Service.LastPassband == "voice" && tone.Grant.Envelope == TxEnvelopes.Any,
+                  "...and a full-scale tone there states any, through the first passband, as before TX5-1");
+            tone.Stop(drain: false);
+            s.ReleaseTx();
+        }
+    }
+
     private static void W1700kTxFaults()
     {
         // ---- a manual gain and a filter are stated again after the load
@@ -1074,6 +1152,17 @@ internal static partial class Program
         s.SetTx(new TxSettings { GainDb = 30 });
         var hot = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000 }));
         Check(hot != null && hot.Message.Contains("(nonlinear_level)"), "level -10 dB on 13 cm with an arbitrary envelope is the service's own refusal: " + hot?.Message);
+        // TX5-1 against the REAL service, which ENFORCES the claim by measuring the samples: a full-scale tone above the linear limit
+        // states constant, goes through the passband that lets one through, runs, and stops on OUR word - never ended `envelope`.
+        Check(tx.Envelope != null && tx.Envelope.Offers(TxEnvelopes.Constant) && tx.PassbandFor(TxEnvelopes.Constant) != null,
+              $"TX5-1: the REAL service states its envelope claims (on {tx.Envelope?.On}) and a passband for a constant one ({tx.PassbandFor(TxEnvelopes.Constant)?.Name})");
+        var constTone = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 1000, LevelDbfs = -1 });
+        Thread.Sleep(900);
+        var rconst = constTone.Stop(drain: false);
+        Check(constTone.Grant.Envelope == TxEnvelopes.Constant && constTone.Grant.Passband == tx.PassbandFor(TxEnvelopes.Constant)?.Name &&
+              rconst.Reason == EndReasons.Stopped && !rconst.Text.Contains("envelope") && rconst.Samples > 30_000,
+              $"TX5-1: a -1 dBFS tone at level -10 on 13 cm keys as {constTone.Grant.Envelope} through {constTone.Grant.Passband} and the REAL service, " +
+              $"measuring it, lets it run until it is stopped ({rconst})");
 
         s.SetTx(new TxSettings { GainDb = 20 });
         var tone = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Tone, MaxMs = 5000, OffsetHz = 1000, LevelDbfs = -6 });
