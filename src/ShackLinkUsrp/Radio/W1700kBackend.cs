@@ -1326,6 +1326,17 @@ internal sealed class W1700kBackend : RadioBackendBase, W1700kReorder.ISink, ITx
             AmateurLowHz = b.AmateurLowHz,
             AmateurHighHz = b.AmateurHighHz,
             AmateurPlan = b.AmateurPlan,
+            // TX5-3 (T30, C7): passed through, each absent where the service does not state it; the default level moves onto the gain
+            // axis as the linear limit does. linear_measured false is what makes a NaN linear limit read "never measured".
+            AmateurInCentres = b.AmateurInCentres,
+            LinearMeasured = b.LinearMeasured,
+            DriftAfterLoadHz = b.DriftAfterLoadHz,
+            DriftAfterLoadS = b.DriftAfterLoadS,
+            DriftKeyDownHz = b.DriftKeyDownHz,
+            DriftKeyDownS = b.DriftKeyDownS,
+            MeasuredLowHz = b.MeasuredLowHz,
+            MeasuredHighHz = b.MeasuredHighHz,
+            DefaultGainDb = double.IsNaN(b.DefaultLevelDb) ? double.NaN : Math.Round(b.DefaultLevelDb - b.LevelMinDb, 6),
         }).ToArray(),
         Tables = info.Tables?.Clone(),
         Calibration = info.Calibration?.Clone(),

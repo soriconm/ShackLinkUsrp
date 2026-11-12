@@ -124,6 +124,7 @@ internal static partial class Program
         Run("W1700K TX5-0: the unit's limit at the level SHORTENS a key-down (K1), the server honours the grant and caps at it (K2), no list, no retry", W1700kTxKeyDownLimit);
         Run("W1700K TX5-1: the envelope claim - a client's own constant, a tone ON by the service's threshold, the passband it goes through, refusals in words", W1700kTxEnvelope);
         Run("W1700K TX5-2: T28's amateur allocation on the wire, and a take outside it DONE and said, never refused (the owner's rule)", W1700kTxAmateur);
+        Run("W1700K TX5-3: T30's third band - its facts on the wire, a take there done, an unclaimed key-up the SERVICE's refusal, a constant claim keyed", W1700kTxThirdBand);
         Run("W1700K TX: a service that ends a transmission, dies, or does not answer a stop; an owner that disconnects; a prepare refused", W1700kTxFaults);
         Run("W1700K TX: the SDRW1700K session's own service in its no-unit mode, where it is on this machine", W1700kTxRealService);
         Run("W1700K built-in TX: the one resolver - Built in / Off / a command, every answer a bundled controller's --version can give, the config placed", W1700kBuiltInResolveCases);

@@ -54,6 +54,14 @@ internal sealed class W1700kTxBand
     /// stated (a service before T28, whose centre range WAS the allocation).</summary>
     public long AmateurLowHz, AmateurHighHz;
     public string AmateurPlan = "";
+    /// <summary>T30 (ShackLink docs/w1700k_support.md "TX5-3", C7), each as the service states it and null / NaN / 0 where it does not:
+    /// whether <c>amateur_hz</c> lies in the band's own centres, whether its linearity was MEASURED (false: <c>any</c> is refused at every
+    /// level), the carrier's drift after a load and through a key-down, where the band's figures were measured, and its default level on
+    /// the service's LEVEL axis.</summary>
+    public bool? AmateurInCentres, LinearMeasured;
+    public double DriftAfterLoadHz = double.NaN, DriftAfterLoadS = double.NaN, DriftKeyDownHz = double.NaN, DriftKeyDownS = double.NaN;
+    public long MeasuredLowHz, MeasuredHighHz;
+    public double DefaultLevelDb = double.NaN;
 }
 
 /// <summary>
@@ -119,6 +127,21 @@ internal sealed class W1700kTxCapsInfo
             band.KeyDownMaxMsUnreadable = !TxKeyDownLimits.TryParse(b.GetArray("key_down_max_ms"), out band.KeyDownMaxMs);
             TxBand.TryParseAmateur(b.GetArray("amateur_hz"), out band.AmateurLowHz, out band.AmateurHighHz);
             band.AmateurPlan = b.GetString("amateur_plan", "") ?? "";
+            // T30 (TX5-3, C7): read through the protocol's own band parser, so the sidecar and every client read one shape the one way
+            // (a null figure is not measured, a torn range is not stated, a non-boolean flag is not stated).
+            var t30 = TxBand.Parse(new JsonObject()
+                .Set("amateur_in_centres", b["amateur_in_centres"]).Set("linear_measured", b["linear_measured"])
+                .Set("drift", b.GetObject("drift")).Set("measured_hz", b.GetArray("measured_hz")));
+            band.AmateurInCentres = t30.AmateurInCentres;
+            band.LinearMeasured = t30.LinearMeasured;
+            band.DriftAfterLoadHz = t30.DriftAfterLoadHz;
+            band.DriftAfterLoadS = t30.DriftAfterLoadS;
+            band.DriftKeyDownHz = t30.DriftKeyDownHz;
+            band.DriftKeyDownS = t30.DriftKeyDownS;
+            band.MeasuredLowHz = t30.MeasuredLowHz;
+            band.MeasuredHighHz = t30.MeasuredHighHz;
+            double def = b.GetDouble("default_level_db");
+            band.DefaultLevelDb = double.IsInfinity(def) ? double.NaN : def;
             if (b.GetArray("pa_indices") is { } pas)
             {
                 var indices = pas.OfType<JsonObject>().ToList();

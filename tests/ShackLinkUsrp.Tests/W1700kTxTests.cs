@@ -184,7 +184,7 @@ internal static partial class Program
                         _rig.CaptureBroken = true;          // the preparation disconnects the capture: only a load restores reception
                         State = "prepared";
                         CenterHz = hz;
-                        var prepared = Ok(r).Set("center_hz", hz).Set("lo_hz", hz).Set("band", hz < 3_000_000_000 ? 0 : 1).Set("path", "load")
+                        var prepared = Ok(r).Set("center_hz", hz).Set("lo_hz", hz).Set("band", inBand.GetLong("band", hz < 3_000_000_000 ? 0 : 1)).Set("path", "load")
                             .Set("took_ms", 30).Set("settle_ms", 2000).Set("settle_measured", false);
                         if (amateur.HasValue) prepared.Set("amateur", amateur.Value);
                         Send(prepared);
@@ -209,7 +209,16 @@ internal static partial class Program
                             Send(No(r, "passband", $"envelope '{envelope}' does not go with that passband"));
                             break;
                         }
-                        double linear = CenterHz < 3_000_000_000 ? -17.1 : 0;
+                        // The service's rule, from the PREPARED band's own statement (T30: a band whose linearity was never measured
+                        // states null and refuses "any" at every level).
+                        var prepBand = BandAtCenter();
+                        double linear = prepBand == null ? 0 : prepBand.GetDouble("linear_max_level_db");
+                        if (envelope != "constant" && double.IsNaN(linear))
+                        {
+                            Send(No(r, "nonlinear_level", "no linearity has been measured on this band: only envelope \"constant\" at any level")
+                                .Set("linear_max_level_db", null));
+                            break;
+                        }
                         if (envelope != "constant" && level > linear + 1e-9)
                         {
                             Send(No(r, "nonlinear_level", $"an arbitrary envelope is linear only at {F(linear, "0.#")} dB or less on this band").Set("linear_max_level_db", linear));
@@ -279,6 +288,11 @@ internal static partial class Program
                     break;
             }
         }
+
+        /// <summary>The band the prepared centre is in, as the caps state it; null = none.</summary>
+        private JsonObject? BandAtCenter() =>
+            ((IEnumerable<object>?)_rig.Caps.GetArray("bands") ?? Array.Empty<object>()).OfType<JsonObject>()
+            .FirstOrDefault(b => CenterHz >= b.GetLong("center_min_hz") && CenterHz <= b.GetLong("center_max_hz"));
 
         /// <summary>The longest key-down the service allows at <paramref name="level"/> on the prepared band, its own way.</summary>
         private long MostAt(double level)
@@ -424,6 +438,38 @@ internal static partial class Program
         c.Set("occupied_basis", new JsonObject().Set("band_margin_hz", 1_000_000).Set("measured", "2026-11-10"));
         c.Set("frequency", new JsonObject().Set("centre", "any the radio band's synthesizer locks on")
             .Set("amateur", "bands[].amateur_hz: the amateur allocation inside each band").Set("measured_inside", "amateur_hz only"));
+        return c;
+    }
+
+    /// <summary>T30's caps as the service states them (eb, 2026-11-11, app 1.1.4/1.1.5): a third band, "6GHz" (band 2, 5925-7999 MHz),
+    /// whose linearity was never measured (linear_max_level_db null, linear_measured false: "any" refused at every level), whose stated
+    /// allocation is 6cm's and lies UNDER its centres (amateur_in_centres false), whose figures were measured there (measured_hz), and
+    /// each band's drift and default level. 6cm now ends where 6GHz begins.</summary>
+    private static JsonObject T30Caps()
+    {
+        var c = T28Caps();
+        var bands = c.GetArray("bands");
+        var b13 = (JsonObject)bands[0];
+        var b6 = (JsonObject)bands[1];
+        b13.Set("amateur_in_centres", true).Set("linear_measured", true).Set("default_level_db", -17.1)
+           .Set("drift", new JsonObject().Set("after_load_hz", 90).Set("after_load_s", 30).Set("keydown_hz", null).Set("keydown_s", null))
+           .Set("measured_hz", new JsonArray().Add(2_390_000_000).Add(2_450_000_000));
+        b6.Set("center_max_hz", 5_924_999_999).Set("amateur_in_centres", true).Set("linear_measured", true).Set("default_level_db", -12.0)
+          .Set("drift", new JsonObject().Set("after_load_hz", 420).Set("after_load_s", 60).Set("keydown_hz", 21).Set("keydown_s", 10))
+          .Set("measured_hz", new JsonArray().Add(5_650_000_000).Add(5_850_000_000));
+        bands.Add(new JsonObject().Set("name", "6GHz").Set("band", 2).Set("center_min_hz", 5_925_000_000).Set("center_max_hz", 7_999_000_000)
+            .Set("amateur_hz", new JsonArray().Add(5_650_000_000).Add(5_850_000_000)).Set("amateur_plan", "US, 47 CFR 97.301")
+            .Set("amateur_in_centres", false)
+            .Set("level_min_db", -40.0).Set("level_max_db", 0.0).Set("level_step_db", 0.1).Set("linear_max_level_db", null).Set("linear_measured", false)
+            .Set("default_level_db", -13.1)
+            .Set("drift", new JsonObject().Set("after_load_hz", 4900).Set("after_load_s", 100).Set("keydown_hz", 975).Set("keydown_s", 10))
+            .Set("measured_hz", new JsonArray().Add(5_650_000_000).Add(5_850_000_000))
+            .Set("key_down_max_ms", new JsonArray().Add(new JsonArray().Add(0.0).Add(300_000)))
+            .Set("pa_indices", new JsonArray()
+                .Add(new JsonObject().Set("pa_index", 0x18).Set("full_scale_level_db", -18.5).Set("calibrated", false))
+                .Add(new JsonObject().Set("pa_index", 0x20).Set("full_scale_level_db", -13.1).Set("calibrated", false))
+                .Add(new JsonObject().Set("pa_index", 0x28).Set("full_scale_level_db", -7.6).Set("calibrated", false))
+                .Add(new JsonObject().Set("pa_index", 0x30).Set("full_scale_level_db", 0.0).Set("calibrated", false))));
         return c;
     }
 
@@ -937,6 +983,60 @@ internal static partial class Program
         }
     }
 
+    /// <summary>TX5-3 (ShackLink docs/w1700k_support.md "TX5-3", C4/C5/C7): T30's third band. Its facts reach the wire, absent for a service
+    /// before T30; a take there is DONE (outside the amateur band: warned, never refused); a key-up that claims nothing is the SERVICE's
+    /// refusal in its words before anything is fed; a constant claim keys through the wide passband and the grant says so. Nothing keyed.</summary>
+    private static void W1700kTxThirdBand()
+    {
+        var wire = TxCaps.Parse(W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(T30Caps())).ToJson());
+        var g6 = wire.BandAt(6_000_000_000);
+        var w6 = wire.BandAt(5_900_000_000);
+        var w13 = wire.BandAt(2_392_000_000);
+        Check(g6?.Name == "6GHz" && w6?.Name == "6cm" && w6.FreqMaxHz == 5_924_999_999 && wire.FreqMaxHz == 7_999_000_000,
+              "T30's three bands reach the wire: 6cm ends where 6GHz begins");
+        Check(g6!.LinearMeasured == false && double.IsNaN(g6.LinearMaxGainDb) && g6.AmateurInCentres == false && g6.AmateurLowHz == 5_650_000_000 &&
+              g6.DriftKeyDownHz == 975 && g6.DriftKeyDownS == 10 && g6.DriftAfterLoadHz == 4900 && g6.DriftAfterLoadS == 100 &&
+              g6.MeasuredLowHz == 5_650_000_000 && g6.MeasuredHighHz == 5_850_000_000 && g6.MeasuredOutsideCentres && Math.Abs(g6.DefaultGainDb - 26.9) < 1e-9 &&
+              g6.KeyDownMaxMsAt(40) == 300_000 && g6.PaIndexCount == 4 && g6.CalibratedPaIndexCount == 0,
+              $"6GHz's facts: linearity NOT measured (and no limit), no allocation in its centres, its drift, measured outside its centres, default gain {F(g6.DefaultGainDb, "0.0")} (level -13.1)");
+        Check(w13!.LinearMeasured == true && w13.AmateurInCentres == true && w13.DriftAfterLoadHz == 90 && double.IsNaN(w13.DriftKeyDownHz) &&
+              !w13.MeasuredOutsideCentres && Math.Abs(w13.DefaultGainDb - 22.9) < 1e-9 && w6.DriftKeyDownHz == 21,
+              "13cm's and 6cm's: measured, inside their centres; a drift the service states null stays NaN");
+        var t28 = TxCaps.Parse(W1700kBackend.TxCapsFrom(W1700kTxCapsInfo.Parse(T28Caps())).ToJson());
+        string t28j = t28.ToJson().ToString();
+        Check(t28.Bands.All(b => b.LinearMeasured == null && b.AmateurInCentres == null && !b.DriftStated && b.MeasuredHighHz == 0 && double.IsNaN(b.DefaultGainDb)) &&
+              !t28j.Contains("linear_measured") && !t28j.Contains("drift") && !t28j.Contains("measured_hz") && !t28j.Contains("default_gain_db"),
+              "a service before T30 states none of them: none on the wire");
+
+        using var rig = new W1700kTxRig("txthirdband", caps: T30Caps());
+        using var s = rig.Connect("w1700k-tx");
+        Check(s.WaitReady(10000) == RadioStates.Ready, "the radio opens: " + s.GetState().FaultText);
+        s.ClaimTx();
+        var took = s.SetTx(new TxSettings { CenterHz = 6_000_000_000, GainDb = 26.9 });
+        Check(took.State.Tx?.Taken == true && took.State.Tx.CenterHz == 6_000_000_000 && s.Caps.Tx!.OutsideAmateur(6_000_000_000)?.Name == "6GHz",
+              "6000 MHz on 6GHz is TAKEN - outside every amateur allocation, warned and never refused (the owner's rule)");
+        int starts = rig.Service.Taken("start").Count;
+        var plain = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000 }));
+        Check(plain != null && plain.Message.Contains("(nonlinear_level)") && plain.Message.Contains("no linearity has been measured") &&
+              rig.Service.Taken("start").Count == starts + 1 && !s.GetState().Tx!.Keyed,
+              "C5: a key-up that claims nothing is REFUSED BY THE SERVICE at its start, in its words - nothing of ShackLink's: " + plain?.Message);
+        var iq = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000, Envelope = TxEnvelopes.Constant });
+        Check(iq.Grant.Envelope == TxEnvelopes.Constant && iq.Grant.Passband == "wide" && rig.Service.LastEnvelope == TxEnvelopes.Constant &&
+              Math.Abs(rig.Service.LastLevelDb - (-13.1)) < 1e-9,
+              $"C4: a constant claim keys there at level -13.1 through {iq.Grant.Passband}, and the grant echoes the claim ({iq.Grant.Envelope})");
+        var full = new short[2 * 4800];
+        for (int i = 0; i < 4800; i++)
+        {
+            double a = 2 * Math.PI * 1500 * i / 48000.0;
+            full[2 * i] = (short)(0.92 * 32767 * Math.Cos(a));
+            full[2 * i + 1] = (short)(0.92 * 32767 * Math.Sin(a));
+        }
+        iq.Stream!.Write(full, 0, 4800);
+        var r = iq.Stop(drain: true);
+        Check(r.Acked && r.Samples == 4800, $"...and 100 ms at 0.92 of full scale drains on the service's word ({r})");
+        s.ReleaseTx();
+    }
+
     /// <summary>TX5-2 (ShackLink docs/w1700k_support.md "TX5-2"): T28's amateur allocation reaches the wire, and a take OUTSIDE it is
     /// done - the owner's rule is a warning, never a refusal - and said in the sidecar's log in the service's own verdict.</summary>
     private static void W1700kTxAmateur()
@@ -1261,6 +1361,38 @@ internal static partial class Program
         long6.Stop(drain: false);
         Check(at40 > 0 && long6.Grant.MaxMs == Math.Min(at40, 190_000),
               $"K1: a 190 000 ms key-up at 6cm's top is granted the REAL service's figure there ({long6.Grant.MaxMs} ms of its stated {at40}), not refused");
+        // TX5-3 (T30): the REAL service's third band and its facts reach the wire (presence and the flags; the figures are the service's),
+        // an unclaimed key-up there is ITS refusal, and a constant claim at ShackLink's drive (0.92 of full scale) runs through ITS envelope
+        // measurement - after ITS resampler - until it drains: the proof that C3's target is the service's rule, not a guess at it.
+        var r6g = tx.BandAt(6_000_000_000);
+        if (r6g == null)
+            Console.WriteLine("  NOTE  this service states no band at 6000 MHz (before T30): TX5-3's real-service checks skipped");
+        else
+        {
+            Check(r6g.Name == "6GHz" && r6g.LinearMeasured == false && double.IsNaN(r6g.LinearMaxGainDb) && r6g.AmateurInCentres == false &&
+                  r6g.DriftStated && r6g.MeasuredOutsideCentres && !double.IsNaN(r6g.DefaultGainDb) && r13.LinearMeasured == true &&
+                  r13.AmateurInCentres == true && !r13.MeasuredOutsideCentres && r6!.FreqMaxHz < r6g.FreqMinHz,
+                  $"TX5-3: the REAL service's 6GHz reaches the wire - linearity not measured, no allocation in its centres, drift {F(r6g.DriftKeyDownHz, "0")} Hz in " +
+                  $"{F(r6g.DriftKeyDownS, "0")} s of a key-down, measured at {r6g.MeasuredLowHz / 1e6:0}-{r6g.MeasuredHighHz / 1e6:0} MHz, default gain {F(r6g.DefaultGainDb, "0.0")}");
+            var to6g = s.SetTx(new TxSettings { CenterHz = 6_000_000_000, GainDb = r6g.DefaultGainDb });
+            var any6g = Refused(() => s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 5000 }));
+            Check(to6g.State.Tx?.CenterHz == 6_000_000_000 && any6g != null && any6g.Message.Contains("(nonlinear_level)"),
+                  "C5: on 6GHz an iq key-up that claims nothing is the REAL service's refusal, in its words: " + any6g?.Message);
+            var c6g = s.StartTx(new TxStartRequest { Source = TxSourceKinds.Iq, MaxMs = 10_000, Envelope = TxEnvelopes.Constant });
+            const int n6 = 96_000;        // 2 s
+            var full = new short[2 * n6];
+            for (int i = 0; i < n6; i++)
+            {
+                double a = 2 * Math.PI * 1500 * i / 48000.0;
+                full[2 * i] = (short)Math.Round(0.92 * 32767 * Math.Cos(a));
+                full[2 * i + 1] = (short)Math.Round(0.92 * 32767 * Math.Sin(a));
+            }
+            c6g.Stream!.Write(full, 0, n6);
+            var rc6 = c6g.Stop(drain: true);
+            Check(c6g.Grant.Envelope == TxEnvelopes.Constant && c6g.Grant.Passband == tx.PassbandFor(TxEnvelopes.Constant)?.Name &&
+                  rc6.Acked && rc6.Reason == EndReasons.Drained && rc6.Samples == n6 && !rc6.Text.Contains("envelope"),
+                  $"C3/C4: 2 s at 0.92 of full scale, claimed constant on 6GHz, runs through the REAL service's envelope measurement and drains ({rc6})");
+        }
         // T28 (TX5-2): a centre OUTSIDE the amateur allocation but inside the radio's range is prepared - the owner's rule is a warning,
         // never a refusal - and a centre between the bands is still the radio's refusal.
         var outAm = s.SetTx(new TxSettings { CenterHz = 2_460_000_000 });
