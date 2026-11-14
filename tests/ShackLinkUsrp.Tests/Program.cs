@@ -1114,12 +1114,14 @@ internal static partial class Program
 
     private static string SidecarExe()
     {
-        // tests\ShackLinkUsrp.Tests\bin\<cfg>\net9.0\win-x64\ -> src\ShackLinkUsrp\bin\<cfg>\net9.0\win-x64\
+        // tests\ShackLinkUsrp.Tests\bin\<cfg>\<tfm>\win-x64\ -> src\ShackLinkUsrp\bin\<cfg>\<tfm>\win-x64\
+        // (the gate and the sidecar share Directory.Build.props' TargetFramework, so the gate's own folder names it)
         var here = new DirectoryInfo(AppContext.BaseDirectory);
         string cfg = here.Parent!.Parent!.Name;
+        string tfm = here.Parent!.Name;
         var root = here;
         while (root != null && !File.Exists(Path.Combine(root.FullName, "ShackLinkUsrp.sln"))) root = root.Parent;
-        return Path.Combine(root!.FullName, "src", "ShackLinkUsrp", "bin", cfg, "net9.0", "win-x64", "ShackLinkUsrp.exe");
+        return Path.Combine(root!.FullName, "src", "ShackLinkUsrp", "bin", cfg, tfm, "win-x64", "ShackLinkUsrp.exe");
     }
 
     private static void SpawnJoinExit()
@@ -1226,7 +1228,7 @@ internal static partial class Program
     private static void ProtocolLibraryConfiguration()
     {
         string exeDir = Path.GetDirectoryName(SidecarExe())!;
-        string cfg = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Parent!.Name; // bin\<cfg>\net9.0\win-x64\
+        string cfg = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Parent!.Name; // bin\<cfg>\<tfm>\win-x64\
         bool release = cfg.Equals("Release", StringComparison.OrdinalIgnoreCase);
         foreach (var (what, path) in new[]
                  {

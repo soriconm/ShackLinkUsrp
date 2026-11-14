@@ -32,7 +32,7 @@ separate program: clients talk to it over a socket and link none of it.
 
 ## Build
 
-Requires the .NET 9 SDK and a sibling checkout of ShackLink (`C:\Dev\ShackLink`), or
+Requires the .NET 10 SDK and a sibling checkout of ShackLink (`C:\Dev\ShackLink`), or
 `-p:ShackLinkDir=<path>\`.
 
 ```
