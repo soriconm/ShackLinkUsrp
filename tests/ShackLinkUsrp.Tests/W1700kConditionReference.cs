@@ -4,6 +4,8 @@
 // The W1700K conditioner as it ran on the unit before it was batched (ShackLinkUsrp 5c7f1fe, verified live 2026-10-20 and -27): one
 // slice at a time on one thread. FROZEN as the gate's reference - the batched, shared conditioner must give these samples bit for bit
 // (W1700kConditionBatchCases). Never optimise or "fix" this copy: it is the definition of right.
+//
+// Its filter is W1700kCondition's, ported from h0m3us3r/w1700k-sdr (MIT, Copyright (c) 2026 h0m3us3r; LICENSES/MIT-w1700k-sdr.txt).
 
 using System.Numerics;
 using System.Runtime.CompilerServices;

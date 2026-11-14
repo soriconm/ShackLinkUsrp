@@ -1,8 +1,9 @@
 // ShackLinkUsrp - USRP B2xx streaming server. Copyright (C) 2026 Sorin Marghitoiu.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later AND MIT
 //
 // The roll-off tables and the FIR design are ported from h0m3us3r/w1700k-sdr host/stream/src/flatten.cpp (MIT, Copyright (c)
-// the w1700k-sdr contributors), at upstream commit 0b0413e.
+// 2026 h0m3us3r), at upstream commit 0b0413e, and used under that licence: its text is LICENSES/MIT-w1700k-sdr.txt. The rest of
+// this file is GPL-3.0-or-later.
 
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;

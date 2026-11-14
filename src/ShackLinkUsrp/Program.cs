@@ -261,8 +261,9 @@ internal sealed class SidecarOptions
 {
     public const string Usage =
         "ShackLinkUsrp --serial <serial> | --serial <hw_serial> --iiod <host[:port]|mdns|usb:<hw_serial>> | --sim [--sim-name <name>] [--sim-fault-after <ms>] [--sim-settle-ms <ms>] [--sim-tx-coupling <dB>] | --w1700k [--w1700k-...] | --list [--json <file>]\n" +
-        "  --w1700k                    a Gemtek W1700K running h0m3us3r/w1700k-sdr: its UDP export received here, receive only (--rate default 40e6,\n" +
-        "                              --lo default 2442e6). Serve with --port and --persist, and join it from ShackLink as usrp://127.0.0.1:<port>\n" +
+        "  --w1700k                    a Gemtek W1700K running h0m3us3r/w1700k-sdr: its UDP export received here, and a transmitter when its\n" +
+        "                              transmit service is (--w1700k-tx-serve) (--rate default 40e6, --lo default 2442e6). Serve with --port\n" +
+        "                              and --persist, and join it from ShackLink as usrp://127.0.0.1:<port>\n" +
         "  --w1700k-name <name>        the radio's name in its serial (w1700k-<name>) and its log (default unit)\n" +
         "  --w1700k-bind <ip:port>     where the export arrives (default 10.77.0.10:7700, the unit's fixed destination)\n" +
         "  --w1700k-serve <cmd|none>   upstream's controller, spoken to as JSON lines (default: the bundled w1700k.exe beside this program, serve;\n" +
